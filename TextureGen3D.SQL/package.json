@@ -1,0 +1,13 @@
+{
+  "name": "texturegen3d.sql",
+  "version": "1.0.0",
+  "description": "PostgreSQL schema deployment generator for the TextureGen3D framework.",
+  "private": true,
+  "scripts": {
+    "update-deploy": "gulp update-deploy",
+    "watch": "gulp watch"
+  },
+  "devDependencies": {
+    "gulp": "^5.0.0"
+  }
+}

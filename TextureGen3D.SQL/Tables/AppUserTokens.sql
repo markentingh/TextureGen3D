@@ -1,0 +1,9 @@
+CREATE TABLE IF NOT EXISTS public."AppUserTokens" (
+    "Id" SERIAL PRIMARY KEY,
+    "AppUserId" UUID NULL,
+    "Token" VARCHAR(255) NOT NULL,
+    "Expiry" TIMESTAMP NOT NULL,
+    "Created" TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "IPAddress" VARCHAR(50) NOT NULL,
+    CONSTRAINT "FK_AppUserTokens_AppUsers" FOREIGN KEY ("AppUserId") REFERENCES public."AppUsers"("Id") ON DELETE CASCADE
+);

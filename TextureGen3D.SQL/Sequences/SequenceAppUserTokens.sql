@@ -1,0 +1,1 @@
+CREATE SEQUENCE IF NOT EXISTS public."SeqAppUserTokens" START WITH 1;

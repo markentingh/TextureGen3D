@@ -1,0 +1,4 @@
+CREATE TABLE IF NOT EXISTS public."AppRoles" (
+    "Id" SERIAL PRIMARY KEY,
+    "Name" VARCHAR(50) NOT NULL
+);

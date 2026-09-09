@@ -1,0 +1,9 @@
+{
+  "name": "datasilk-framework",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Template scaffolding tools for the Datasilk framework.",
+  "devDependencies": {
+    "gulp": "^5.0.0"
+  }
+}

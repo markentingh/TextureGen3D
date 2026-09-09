@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.VisualStudio.JavaScript.Sdk/0.5.128-alpha">
+  <PropertyGroup>
+    <StartupCommand>npm run dev</StartupCommand>
+    <JavaScriptTestRoot>src\</JavaScriptTestRoot>
+    <BuildCommand>npm run build</BuildCommand>
+    <BuildOutputFolder>$(MSBuildProjectDirectory)\dist</BuildOutputFolder>
+  </PropertyGroup>
+  <ItemGroup>
+    <Folder Include="src\api\account\" />
+    <Folder Include="src\components\layout\" />
+    <Folder Include="src\context\" />
+    <Folder Include="src\pages\account\login\" />
+    <Folder Include="src\pages\dashboard\" />
+    <Folder Include="src\pages\home\" />
+  </ItemGroup>
+</Project>
