@@ -1,0 +1,9 @@
+CREATE TABLE IF NOT EXISTS public."Invoices" (
+    "Id" SERIAL PRIMARY KEY,
+    "AppUserId" UUID NOT NULL,
+    "SubscriptionId" INTEGER NOT NULL,
+    "ProductId" INTEGER NOT NULL,
+    "Price" INTEGER NOT NULL DEFAULT 0,
+    "DateCreated" TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT "FK_Invoices_AppUsers" FOREIGN KEY ("AppUserId") REFERENCES public."AppUsers"("Id") ON DELETE CASCADE
+);

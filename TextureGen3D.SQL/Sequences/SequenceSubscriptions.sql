@@ -1,0 +1,1 @@
+CREATE SEQUENCE IF NOT EXISTS public."SeqSubscriptions" START WITH 1;

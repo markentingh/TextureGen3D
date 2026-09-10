@@ -1,7 +1,9 @@
 using System.Data;
 using System.Reflection;
+using System.Text.Json;
 using TextureGen3D.API.Services;
 using TextureGen3D.Auth.Services;
+using TextureGen3D.Data.Interfaces;
 using Microsoft.AspNetCore.StaticFiles;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -97,6 +99,39 @@ try
 catch (Exception ex)
 {
     Console.WriteLine($"Warning: Failed to reset PostgreSQL sequences: {ex.Message}");
+}
+
+try
+{
+    using var scope = app.Services.CreateScope();
+    var llmRepo = scope.ServiceProvider.GetRequiredService<ILLMModelsRepository>();
+    var models = llmRepo.GetAll().Where(m => m.Enabled).ToList();
+    foreach (var model in models)
+    {
+        TextureGen3D.AI.OpenAI.AddModel(new TextureGen3D.AI.Models.LLMModel
+        {
+            ModelId = model.ModelId,
+            Name = model.Name,
+            Model = model.Model,
+            Endpoint = model.Endpoint,
+            PrivateKey = model.PrivateKey,
+            Type = model.Type,
+            Enabled = model.Enabled,
+            Preferred = model.Preferred,
+            ExtraBody = string.IsNullOrWhiteSpace(model.ExtraBody)
+                ? new Dictionary<string, object>()
+                : JsonSerializer.Deserialize<Dictionary<string, object>>(model.ExtraBody) ?? new Dictionary<string, object>()
+        });
+        if (model.Preferred)
+        {
+            TextureGen3D.AI.OpenAI.PreferredModel = model.ModelId;
+        }
+    }
+    Console.WriteLine($"Loaded {models.Count} enabled LLM model(s).");
+}
+catch (Exception ex)
+{
+    Console.WriteLine($"Warning: Failed to load LLM models: {ex.Message}");
 }
 
 var provider = new FileExtensionContentTypeProvider();

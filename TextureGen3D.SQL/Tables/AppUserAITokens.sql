@@ -1,0 +1,10 @@
+CREATE TABLE IF NOT EXISTS public."AppUserAITokens" (
+    "Id" SERIAL PRIMARY KEY,
+    "AppUserId" UUID NOT NULL,
+    "InvoiceId" INTEGER,
+    "BillingMonth" TIMESTAMP NOT NULL,
+    "Tokens" INTEGER NOT NULL DEFAULT 0,
+    "TokensUsed" INTEGER NOT NULL DEFAULT 0,
+    "DateCreated" TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT "FK_AppUserAITokens_AppUsers" FOREIGN KEY ("AppUserId") REFERENCES public."AppUsers"("Id") ON DELETE CASCADE
+);

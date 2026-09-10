@@ -9,15 +9,39 @@ SELECT 'CREATE DATABASE texturegen3d' WHERE NOT EXISTS (SELECT FROM pg_database 
 -- Tables
 \i Tables/AppRoles.sql
 \i Tables/AppUsers.sql
+\i Tables/AppUserAITokens.sql
 \i Tables/AppUserRoles.sql
+\i Tables/AppUserSubscriptions.sql
 \i Tables/AppUserTokens.sql
+\i Tables/ImageGeneration.sql
+\i Tables/Invoices.sql
+\i Tables/LLM_Models.sql
+\i Tables/Products.sql
+\i Tables/Projects.sql
+\i Tables/ProjectImageGenerations.sql
+\i Tables/ProjectImageUpscales.sql
+\i Tables/ProjectModels.sql
+\i Tables/Subscriptions.sql
 
 -- Sequences
 \i Sequences/SequenceAppRoles.sql
+\i Sequences/SequenceAppUserAITokens.sql
+\i Sequences/SequenceAppUserSubscriptions.sql
 \i Sequences/SequenceAppUserTokens.sql
+\i Sequences/SequenceImageGeneration.sql
+\i Sequences/SequenceInvoices.sql
+\i Sequences/SequenceLLM_Models.sql
+\i Sequences/SequenceProducts.sql
+\i Sequences/SequenceSubscriptions.sql
 
 -- Indexes
+\i Indexes/IndexAppUserAITokens.sql
+\i Indexes/IndexAppUserSubscriptions.sql
 \i Indexes/IndexAppUsersEmail.sql
+\i Indexes/IndexInvoices.sql
+\i Indexes/IndexProjectImageGenerations.sql
+\i Indexes/IndexProjectModels.sql
+\i Indexes/IndexProjects.sql
 
 -- Functions
 \i Functions/ResetSequences.sql

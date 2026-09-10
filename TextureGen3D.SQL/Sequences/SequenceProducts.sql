@@ -1,0 +1,1 @@
+CREATE SEQUENCE IF NOT EXISTS public."SeqProducts" START WITH 1;

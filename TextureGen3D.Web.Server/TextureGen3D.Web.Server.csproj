@@ -19,6 +19,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\TextureGen3D.API\TextureGen3D.API.csproj" />
+    <ProjectReference Include="..\TextureGen3D.AI\TextureGen3D.AI.csproj" />
     <ProjectReference Include="..\TextureGen3D.Auth\TextureGen3D.Auth.csproj" />
     <ProjectReference Include="..\TextureGen3D.Data\TextureGen3D.Data.csproj" />
     <ProjectReference Include="..\TextureGen3D.Web.Client\TextureGen3D.Web.Client.esproj">

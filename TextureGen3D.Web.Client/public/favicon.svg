@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <defs>
+    <linearGradient id="cubeGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#7c3aed"/>
+      <stop offset="100%" stop-color="#a855f7"/>
+    </linearGradient>
+    <linearGradient id="faceTop" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#a855f7"/>
+      <stop offset="100%" stop-color="#c084fc"/>
+    </linearGradient>
+    <linearGradient id="faceLeft" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#6d28d9"/>
+      <stop offset="100%" stop-color="#7c3aed"/>
+    </linearGradient>
+    <linearGradient id="faceRight" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#5b21b6"/>
+      <stop offset="100%" stop-color="#6d28d9"/>
+    </linearGradient>
+  </defs>
+  <!-- 3D cube isometric -->
+  <!-- Top face -->
+  <polygon points="32,6 56,18 32,30 8,18" fill="url(#faceTop)" stroke="#c084fc" stroke-width="0.5" stroke-linejoin="round"/>
+  <!-- Left face -->
+  <polygon points="8,18 32,30 32,58 8,46" fill="url(#faceLeft)" stroke="#7c3aed" stroke-width="0.5" stroke-linejoin="round"/>
+  <!-- Right face -->
+  <polygon points="56,18 32,30 32,58 56,46" fill="url(#faceRight)" stroke="#6d28d9" stroke-width="0.5" stroke-linejoin="round"/>
+  <!-- UV grid lines on top face -->
+  <g stroke="#d8b4fe" stroke-width="0.75" opacity="0.5" fill="none">
+    <line x1="20" y1="12" x2="20" y2="24"/>
+    <line x1="44" y1="12" x2="44" y2="24"/>
+    <line x1="14" y1="15" x2="38" y2="27"/>
+    <line x1="26" y1="9" x2="50" y2="21"/>
+  </g>
+  <!-- UV grid lines on left face -->
+  <g stroke="#a78bfa" stroke-width="0.75" opacity="0.4" fill="none">
+    <line x1="8" y1="32" x2="32" y2="44"/>
+    <line x1="8" y1="40" x2="32" y2="52"/>
+    <line x1="16" y1="24" x2="16" y2="52"/>
+    <line x1="24" y1="28" x2="24" y2="56"/>
+  </g>
+</svg>

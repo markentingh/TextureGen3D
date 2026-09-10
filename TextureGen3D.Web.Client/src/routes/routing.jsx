@@ -13,7 +13,7 @@ function ProtectedRoute({ children }) {
   return isAuthenticated ? children : <Navigate to="/login" replace />;
 }
 
-const RouteElement = ({ path, Element, layout: Layout }) => {
+const RouteElement = ({ path, Element, layout: Layout, fullScreen }) => {
   if (!Element) return null;
   const isDashboard = path.startsWith('/dashboard');
   const WrappedElement = isDashboard
@@ -24,15 +24,17 @@ const RouteElement = ({ path, Element, layout: Layout }) => {
       )
     : Element;
 
+  const EffectiveLayout = fullScreen ? RootLayout : (Layout || (isDashboard ? DashboardLayout : RootLayout));
+
   return (
     <Route
       key={path}
       path={path}
       element={
         <Suspense fallback={<div className="fixed inset-0 flex items-center justify-center"><Spinner className="text-4xl" /></div>}>
-          <Layout>
+          <EffectiveLayout>
             <WrappedElement />
-          </Layout>
+          </EffectiveLayout>
         </Suspense>
       }
     />
@@ -43,7 +45,7 @@ export default function Routing() {
   return (
     <Routes>
       {appRoutes.map((route) => RouteElement({ ...route, layout: RootLayout }))}
-      {dashboardRoutes.map((route) => RouteElement({ ...route, layout: DashboardLayout }))}
+      {dashboardRoutes.map((route) => RouteElement(route))}
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>
   );

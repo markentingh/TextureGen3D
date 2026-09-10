@@ -9,6 +9,9 @@ export default function Sidebar() {
 
   const navItems = [
     { path: '/dashboard', label: 'Dashboard' },
+    { path: '/dashboard/projects', label: 'Projects', match: ['/dashboard/projects'] },
+    { path: '/dashboard/openai', label: 'OpenAI' },
+    { path: '/dashboard/billing', label: 'Billing' },
     { path: '/dashboard/users', label: 'Users' },
   ];
 
@@ -23,7 +26,7 @@ export default function Sidebar() {
           {navItems.map((item) => {
             const isActive = item.match
               ? item.match.some((path) => location.pathname === path || location.pathname.startsWith(`${path}/`))
-              : location.pathname === item.path || location.pathname.startsWith(`${item.path}/`);
+              : location.pathname === item.path;
             return (
               <li key={item.path}>
                 <Link

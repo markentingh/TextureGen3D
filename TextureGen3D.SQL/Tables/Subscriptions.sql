@@ -1,0 +1,12 @@
+CREATE TABLE IF NOT EXISTS public."Subscriptions" (
+    "Id" SERIAL PRIMARY KEY,
+    "Title" VARCHAR(255) NOT NULL,
+    "MonthlyProductId" INTEGER,
+    "YearlyProductId" INTEGER,
+    "Archived" BOOLEAN NOT NULL DEFAULT FALSE,
+    "Status" INTEGER NOT NULL DEFAULT 1,
+    "FeaturesJson" TEXT,
+    "SortIndex" INTEGER NOT NULL DEFAULT 0,
+    "Featured" BOOLEAN NOT NULL DEFAULT FALSE,
+    "DateCreated" TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);

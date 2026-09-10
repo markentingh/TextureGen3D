@@ -12,6 +12,7 @@ appsettings.*.json
 .config/
 RECOVER_*
 *.jfm
+**/storage
 
 
 # Build results

@@ -1,0 +1,22 @@
+CREATE TABLE IF NOT EXISTS public."ProjectImageGenerations" (
+    "Id" UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    "ProjectId" UUID NOT NULL,
+    "AppUserId" UUID,
+    "ImageGenerationId" INTEGER,
+    "InputTextTokens" INTEGER NOT NULL DEFAULT 0,
+    "InputImageTokens" INTEGER NOT NULL DEFAULT 0,
+    "OutputTokens" INTEGER NOT NULL DEFAULT 0,
+    "Tokens" INTEGER NOT NULL DEFAULT 0,
+    "Prompt" TEXT NOT NULL DEFAULT '',
+    "Filename" VARCHAR(500) NOT NULL DEFAULT '',
+    "Resolution" VARCHAR(50) NOT NULL DEFAULT '',
+    "InputImages" INTEGER NOT NULL DEFAULT 0,
+    "InputImageJson" TEXT NOT NULL DEFAULT '[]',
+    "Type" INTEGER NOT NULL DEFAULT 0,
+    "Cost" INTEGER NOT NULL DEFAULT 0,
+    "DateYear" INTEGER NOT NULL,
+    "DateMonth" INTEGER NOT NULL,
+    "DateDay" INTEGER NOT NULL,
+    "DateCreated" TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT "FK_ProjectImageGenerations_Projects" FOREIGN KEY ("ProjectId") REFERENCES public."Projects"("Id") ON DELETE CASCADE
+);
