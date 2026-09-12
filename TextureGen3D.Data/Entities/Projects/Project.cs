@@ -10,5 +10,6 @@ namespace TextureGen3D.Data.Entities.Projects
         public string Color { get; set; } = "";
         public int Status { get; set; }
         public DateTime Created { get; set; }
+        public Guid? ImageModelId { get; set; }
     }
 }

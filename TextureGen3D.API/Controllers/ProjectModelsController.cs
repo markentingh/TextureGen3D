@@ -14,6 +14,8 @@ namespace TextureGen3D.API.Controllers
     {
         readonly IProjectRepository _projectRepo;
         readonly IProjectModelRepository _modelRepo;
+        readonly IProjectMeshRepository _meshRepo;
+        readonly IProjectCameraAngleRepository _angleRepo;
         readonly IImageService _imageService;
 
         static readonly HashSet<string> AllowedExtensions = new(StringComparer.OrdinalIgnoreCase)
@@ -24,10 +26,14 @@ namespace TextureGen3D.API.Controllers
         public ProjectModelsController(
             IProjectRepository projectRepo,
             IProjectModelRepository modelRepo,
+            IProjectMeshRepository meshRepo,
+            IProjectCameraAngleRepository angleRepo,
             IImageService imageService)
         {
             _projectRepo = projectRepo;
             _modelRepo = modelRepo;
+            _meshRepo = meshRepo;
+            _angleRepo = angleRepo;
             _imageService = imageService;
         }
 
@@ -145,6 +151,9 @@ namespace TextureGen3D.API.Controllers
                     return Json(new ApiResponse { success = false, message = "Model not found" });
 
                 await _imageService.DeleteProjectModelAsync(projectId, modelId, model.Extension);
+                // Cascade delete: camera angles first (FK → meshes), then meshes, then model
+                await _angleRepo.DeleteByModelIdAsync(modelId, projectId);
+                await _meshRepo.DeleteByModelIdAsync(modelId, projectId);
                 await _modelRepo.DeleteAsync(modelId, projectId);
 
                 return Json(new ApiResponse { success = true });

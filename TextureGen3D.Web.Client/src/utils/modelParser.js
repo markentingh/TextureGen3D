@@ -266,6 +266,108 @@ function extractMeshesFromObject(root, format) {
 // ─── Helpers ──────────────────────────────────────────────────────
 
 /**
+ * Serialize a Three.js mesh's geometry into a JSON-compatible string
+ * containing vertices (position array), faces (index array), and normals.
+ * This is the MeshData stored in the database.
+ * @param {THREE.Mesh} mesh
+ * @returns {string} JSON string
+ */
+export function serializeMeshData(mesh) {
+  const geometry = mesh.geometry;
+  if (!geometry) return JSON.stringify({});
+
+  const data = {};
+
+  // Positions (vertices)
+  if (geometry.attributes.position) {
+    data.positions = Array.from(geometry.attributes.position.array);
+  }
+
+  // Indices (faces)
+  if (geometry.index) {
+    data.indices = Array.from(geometry.index.array);
+  }
+
+  // Normals
+  if (geometry.attributes.normal) {
+    data.normals = Array.from(geometry.attributes.normal.array);
+  }
+
+  return JSON.stringify(data);
+}
+
+/**
+ * Serialize UV map data from a Three.js mesh's geometry.
+ * Returns a JSON string array of UV map objects.
+ * @param {THREE.Mesh} mesh
+ * @returns {string} JSON string
+ */
+export function serializeUVMapData(mesh) {
+  const geometry = mesh.geometry;
+  if (!geometry) return JSON.stringify([]);
+
+  const uvMaps = [];
+  const uvAttributes = ['uv', 'uv1', 'uv2', 'uv3', 'uv4'];
+  for (const uvName of uvAttributes) {
+    if (geometry.attributes[uvName]) {
+      uvMaps.push({
+        name: uvName === 'uv1' ? 'uv' : uvName,
+        data: Array.from(geometry.attributes[uvName].array),
+      });
+    }
+  }
+  // Also check for any custom UV attributes
+  for (const attrName of Object.keys(geometry.attributes)) {
+    if (attrName.startsWith('uv') && !uvAttributes.includes(attrName)) {
+      uvMaps.push({
+        name: attrName,
+        data: Array.from(geometry.attributes[attrName].array),
+      });
+    }
+  }
+
+  return JSON.stringify(uvMaps);
+}
+
+/**
+ * Deserialize mesh data JSON back into a Three.js BufferGeometry.
+ * @param {string} meshDataJson
+ * @returns {THREE.BufferGeometry}
+ */
+export function deserializeMeshData(meshDataJson) {
+  const data = JSON.parse(meshDataJson);
+  const geometry = new THREE.BufferGeometry();
+
+  if (data.positions) {
+    geometry.setAttribute('position', new THREE.Float32BufferAttribute(data.positions, 3));
+  }
+  if (data.indices) {
+    geometry.setIndex(data.indices);
+  }
+  if (data.normals) {
+    geometry.setAttribute('normal', new THREE.Float32BufferAttribute(data.normals, 3));
+  }
+
+  geometry.computeBoundingBox();
+  geometry.computeBoundingSphere();
+
+  return geometry;
+}
+
+/**
+ * Deserialize UV map data JSON back into an array of {name, data} objects.
+ * @param {string} uvMapDataJson
+ * @returns {Array<{name: string, data: number[]}>}
+ */
+export function deserializeUVMapData(uvMapDataJson) {
+  try {
+    return JSON.parse(uvMapDataJson);
+  } catch {
+    return [];
+  }
+}
+
+/**
  * Convert an ArrayBuffer to a UTF-8 string (for text-based formats like OBJ).
  * @param {ArrayBuffer} buffer
  * @returns {string}

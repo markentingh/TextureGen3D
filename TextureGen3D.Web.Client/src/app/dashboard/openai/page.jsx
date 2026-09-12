@@ -1,894 +1,451 @@
-import React, { useEffect, useState, useCallback } from 'react';
-import { useSession } from '@/context/session';
-import { OpenAI } from '@/api/admin/openai';
-import Tabs from '@/components/ui/tabs';
+import React, { useState, useEffect, useMemo } from 'react';
 import Modal from '@/components/ui/modal';
-import Spinner from '@/components/ui/spinner';
 import Icon from '@/components/ui/icon';
-import Button from '@/components/ui/button';
 import ButtonOutline from '@/components/ui/button-outline';
+import Button from '@/components/ui/button';
+import ButtonIcon from '@/components/ui/button-icon';
 import Input from '@/components/forms/input';
+import Select from '@/components/forms/select';
+import TextArea from '@/components/forms/textarea';
 import Checkbox from '@/components/forms/checkbox';
 import Message from '@/components/ui/message';
+import Tabs from '@/components/ui/tabs';
+import Checked from '@/components/ui/checked';
+import ImageGenerationModal from './ImageGenerationModal';
+import ImageGenerationsTab from './ImageGenerationsTab';
+import { useSession } from '@/context/session';
+import { OpenAI } from '@/api/admin/openai';
 
-const formatDate = (value) => {
-  if (!value) return 'N/A';
-  const date = new Date(value);
-  return date.toLocaleString();
-};
+const LLM_TYPES = [
+    { value: 0, label: 'Local' },
+    { value: 1, label: 'Cloud' }
+];
 
-const formatDateShort = (value) => {
-  if (!value) return 'N/A';
-  const date = new Date(value);
-  return date.toLocaleDateString();
-};
+export default function AdminOpenAI() {
+    const session = useSession();
+    const { getAll, add, update, setEnabled, setPreferred, delete: deleteModel, getImageModels, saveImageModel, toggleImageModelActive, deleteImageModel } = OpenAI(session);
 
-const truncate = (text, length = 50) => {
-  if (!text) return '';
-  return text.length > length ? text.substring(0, length) + '...' : text;
-};
-
-const formatCost = (value) => {
-  if (value === null || value === undefined) return '$0.00';
-  return `$${Number(value).toFixed(4)}`;
-};
-
-const emptyLlmModel = () => ({
-  name: '',
-  model: '',
-  endpoint: '',
-  privateKey: '',
-  type: 0,
-  enabled: false,
-  preferred: false,
-});
-
-const emptyImageModel = () => ({
-  modelKey: '',
-  name: '',
-  model: '',
-  cpmitTokens: 0,
-  cpmiitTokens: 0,
-  cpmotTokens: 0,
-  type: 0,
-  cp1k: 0,
-  cp2k: 0,
-  cp4k: 0,
-  cp8k: 0,
-  active: false,
-});
-
-export default function DashboardOpenAI() {
-  const { token } = useSession();
-  const api = OpenAI({ token });
-
-  // LLM Endpoints state
-  const [llmModels, setLlmModels] = useState([]);
-  const [llmLoading, setLlmLoading] = useState(false);
-  const [llmMessage, setLlmMessage] = useState(null);
-  const [llmModalOpen, setLlmModalOpen] = useState(false);
-  const [llmEditing, setLlmEditing] = useState(null);
-  const [llmForm, setLlmForm] = useState(emptyLlmModel());
-  const [llmSaving, setLlmSaving] = useState(false);
-  const [llmDeleteId, setLlmDeleteId] = useState(null);
-  const [llmDeleting, setLlmDeleting] = useState(false);
-
-  // Image Endpoints state
-  const [imageModels, setImageModels] = useState([]);
-  const [imageLoading, setImageLoading] = useState(false);
-  const [imageMessage, setImageMessage] = useState(null);
-  const [imageModalOpen, setImageModalOpen] = useState(false);
-  const [imageEditing, setImageEditing] = useState(null);
-  const [imageForm, setImageForm] = useState(emptyImageModel());
-  const [imageSaving, setImageSaving] = useState(false);
-  const [imageDeleteId, setImageDeleteId] = useState(null);
-  const [imageDeleting, setImageDeleting] = useState(false);
-
-  // Image Generations state
-  const [generations, setGenerations] = useState([]);
-  const [generationsTotal, setGenerationsTotal] = useState(0);
-  const [generationsStart, setGenerationsStart] = useState(0);
-  const [generationsLength] = useState(25);
-  const [generationsLoading, setGenerationsLoading] = useState(false);
-  const [generationsMessage, setGenerationsMessage] = useState(null);
-  const [dailyCosts, setDailyCosts] = useState([]);
-  const [dailyCostsLoading, setDailyCostsLoading] = useState(false);
-  const [costRange, setCostRange] = useState('30days');
-
-  // ---------- LLM Endpoints ----------
-  const fetchLlmModels = useCallback(() => {
-    setLlmLoading(true);
-    api.getAll()
-      .then((res) => {
-        setLlmLoading(false);
-        if (res.data.success) {
-          setLlmModels(res.data.data || []);
-        } else {
-          setLlmMessage({ type: 'error', text: res.data.message || 'Failed to fetch LLM models' });
-        }
-      })
-      .catch((error) => {
-        setLlmLoading(false);
-        setLlmMessage({ type: 'error', text: error?.response?.data?.message || 'Failed to fetch LLM models' });
-      });
-  }, [api]);
-
-  const handleOpenAddLlm = () => {
-    setLlmEditing(null);
-    setLlmForm(emptyLlmModel());
-    setLlmMessage(null);
-    setLlmModalOpen(true);
-  };
-
-  const handleOpenEditLlm = (model) => {
-    setLlmEditing(model);
-    setLlmForm({
-      name: model.name || '',
-      model: model.model || '',
-      endpoint: model.endpoint || '',
-      privateKey: '',
-      type: model.type ?? 0,
-      enabled: model.enabled ?? false,
-      preferred: model.preferred ?? false,
+    const getEmptyForm = () => ({
+        modelId: 0,
+        name: '',
+        model: '',
+        endpoint: '',
+        privateKey: '',
+        type: 1,
+        enabled: false,
+        preferred: false,
+        extraBody: ''
     });
-    setLlmMessage(null);
-    setLlmModalOpen(true);
-  };
 
-  const handleSaveLlm = () => {
-    if (!llmForm.name || !llmForm.model) {
-      setLlmMessage({ type: 'error', text: 'Name and Model are required' });
-      return;
-    }
-    setLlmSaving(true);
-    const payload = { ...llmForm };
-    if (llmEditing) {
-      payload.id = llmEditing.id;
-    }
-    const request = llmEditing ? api.update(payload) : api.add(payload);
-    request
-      .then((res) => {
-        setLlmSaving(false);
-        if (res.data.success) {
-          setLlmModalOpen(false);
-          fetchLlmModels();
-        } else {
-          setLlmMessage({ type: 'error', text: res.data.message || 'Failed to save model' });
+    const [models, setModels] = useState([]);
+    const [showModal, setShowModal] = useState(false);
+    const [editingModel, setEditingModel] = useState(null);
+    const [form, setForm] = useState(getEmptyForm);
+    const [error, setError] = useState(null);
+    const [message, setMessage] = useState(null);
+
+    const [imageModels, setImageModels] = useState([]);
+    const [showImageModal, setShowImageModal] = useState(false);
+    const [editingImageModel, setEditingImageModel] = useState(null);
+    const [imageError, setImageError] = useState(null);
+
+    useEffect(() => {
+        fetchModels();
+        fetchImageModels();
+    }, []);
+
+    const fetchModels = () => {
+        getAll().then(response => {
+            if (response.data.success) {
+                setModels(response.data.data || []);
+            }
+        }).catch(error => {
+            console.error('Error fetching LLM models:', error);
+            setMessage({ type: 'error', text: 'Failed to fetch LLM models' });
+        });
+    };
+
+    const handleAdd = () => {
+        setEditingModel(null);
+        setForm(getEmptyForm());
+        setError(null);
+        setShowModal(true);
+    };
+
+    const handleEdit = (model) => {
+        setEditingModel(model);
+        setForm({
+            modelId: model.modelId,
+            name: model.name || '',
+            model: model.model || '',
+            endpoint: model.endpoint || '',
+            privateKey: model.privateKey || '',
+            type: model.type ?? 1,
+            enabled: !!model.enabled,
+            preferred: !!model.preferred,
+            extraBody: model.extraBody || ''
+        });
+        setError(null);
+        setShowModal(true);
+    };
+
+    const handleSave = () => {
+        if (!form.name || !form.model || !form.endpoint) {
+            setError('Name, Model, and Endpoint are required');
+            return;
         }
-      })
-      .catch((error) => {
-        setLlmSaving(false);
-        setLlmMessage({ type: 'error', text: error?.response?.data?.message || 'Failed to save model' });
-      });
-  };
 
-  const handleToggleLlmEnabled = (model) => {
-    api.setEnabled(model.id, !model.enabled)
-      .then((res) => {
-        if (res.data.success) {
-          fetchLlmModels();
-        } else {
-          setLlmMessage({ type: 'error', text: res.data.message || 'Failed to toggle enabled' });
-        }
-      })
-      .catch((error) => {
-        setLlmMessage({ type: 'error', text: error?.response?.data?.message || 'Failed to toggle enabled' });
-      });
-  };
+        setError(null);
+        const payload = { ...form };
+        const action = editingModel ? update : add;
+        action(payload).then(response => {
+            if (response.data.success) {
+                fetchModels();
+                setShowModal(false);
+            } else {
+                setError(response.data.message || 'Failed to save model');
+            }
+        }).catch(error => {
+            console.error('Error saving LLM model:', error);
+            setError('Failed to save model');
+        });
+    };
 
-  const handleSetPreferred = (model) => {
-    api.setPreferred(model.id)
-      .then((res) => {
-        if (res.data.success) {
-          fetchLlmModels();
-        } else {
-          setLlmMessage({ type: 'error', text: res.data.message || 'Failed to set preferred' });
-        }
-      })
-      .catch((error) => {
-        setLlmMessage({ type: 'error', text: error?.response?.data?.message || 'Failed to set preferred' });
-      });
-  };
+    const handleToggleEnabled = (model) => {
+        const newEnabled = !model.enabled;
+        setEnabled(model.modelId, newEnabled).then(response => {
+            if (response.data.success) {
+                fetchModels();
+            } else {
+                console.error('Failed to update enabled state:', response.data.message);
+            }
+        }).catch(error => {
+            console.error('Error updating enabled state:', error);
+        });
+    };
 
-  const handleConfirmDeleteLlm = () => {
-    if (!llmDeleteId) return;
-    setLlmDeleting(true);
-    api.delete(llmDeleteId)
-      .then((res) => {
-        setLlmDeleting(false);
-        if (res.data.success) {
-          setLlmDeleteId(null);
-          fetchLlmModels();
-        } else {
-          setLlmMessage({ type: 'error', text: res.data.message || 'Failed to delete model' });
-        }
-      })
-      .catch((error) => {
-        setLlmDeleting(false);
-        setLlmMessage({ type: 'error', text: error?.response?.data?.message || 'Failed to delete model' });
-      });
-  };
+    const handleTogglePreferred = (model) => {
+        if (model.preferred) return;
+        setPreferred(model.modelId).then(response => {
+            if (response.data.success) {
+                fetchModels();
+            } else {
+                console.error('Failed to update preferred state:', response.data.message);
+            }
+        }).catch(error => {
+            console.error('Error updating preferred state:', error);
+        });
+    };
 
-  // ---------- Image Endpoints ----------
-  const fetchImageModels = useCallback(() => {
-    setImageLoading(true);
-    api.getImageModels()
-      .then((res) => {
-        setImageLoading(false);
-        if (res.data.success) {
-          setImageModels(res.data.data || []);
-        } else {
-          setImageMessage({ type: 'error', text: res.data.message || 'Failed to fetch image models' });
-        }
-      })
-      .catch((error) => {
-        setImageLoading(false);
-        setImageMessage({ type: 'error', text: error?.response?.data?.message || 'Failed to fetch image models' });
-      });
-  }, [api]);
+    const handleDelete = (model) => {
+        if (!confirm(`Are you sure you want to delete the model "${model.name}"?`)) return;
+        deleteModel(model.modelId).then(response => {
+            if (response.data.success) {
+                fetchModels();
+            }
+        }).catch(error => {
+            console.error('Error deleting model:', error);
+        });
+    };
 
-  const handleOpenAddImage = () => {
-    setImageEditing(null);
-    setImageForm(emptyImageModel());
-    setImageMessage(null);
-    setImageModalOpen(true);
-  };
+    const handleFormChange = (field, value) => {
+        setForm(prev => ({ ...prev, [field]: value }));
+    };
 
-  const handleOpenEditImage = (model) => {
-    setImageEditing(model);
-    setImageForm({
-      modelKey: model.modelKey || '',
-      name: model.name || '',
-      model: model.model || '',
-      cpmitTokens: model.cpmitTokens ?? 0,
-      cpmiitTokens: model.cpmiitTokens ?? 0,
-      cpmotTokens: model.cpmotTokens ?? 0,
-      type: model.type ?? 0,
-      cp1k: model.cp1k ?? 0,
-      cp2k: model.cp2k ?? 0,
-      cp4k: model.cp4k ?? 0,
-      cp8k: model.cp8k ?? 0,
-      active: model.active ?? false,
-    });
-    setImageMessage(null);
-    setImageModalOpen(true);
-  };
+    const fetchImageModels = () => {
+        getImageModels().then(response => {
+            if (response.data.success) {
+                // Only show type 0 (Image Generation) models in the admin modal
+                setImageModels((response.data.data || []).filter(m => m.type === 0));
+            }
+        }).catch(error => {
+            console.error('Error fetching image generation models:', error);
+            setMessage({ type: 'error', text: 'Failed to fetch image generation models' });
+        });
+    };
 
-  const handleSaveImage = () => {
-    if (!imageForm.modelKey || !imageForm.model) {
-      setImageMessage({ type: 'error', text: 'ModelKey and Model are required' });
-      return;
-    }
-    setImageSaving(true);
-    const payload = { ...imageForm };
-    if (imageEditing) {
-      payload.id = imageEditing.id;
-    }
-    api.saveImageModel(payload)
-      .then((res) => {
-        setImageSaving(false);
-        if (res.data.success) {
-          setImageModalOpen(false);
-          fetchImageModels();
-        } else {
-          setImageMessage({ type: 'error', text: res.data.message || 'Failed to save image model' });
-        }
-      })
-      .catch((error) => {
-        setImageSaving(false);
-        setImageMessage({ type: 'error', text: error?.response?.data?.message || 'Failed to save image model' });
-      });
-  };
+    const handleImageModelClick = (model) => {
+        setEditingImageModel(model);
+        setImageError(null);
+        setShowImageModal(true);
+    };
 
-  const handleToggleImageActive = (model) => {
-    api.toggleImageModelActive(model.id, !model.active)
-      .then((res) => {
-        if (res.data.success) {
-          fetchImageModels();
-        } else {
-          setImageMessage({ type: 'error', text: res.data.message || 'Failed to toggle active' });
-        }
-      })
-      .catch((error) => {
-        setImageMessage({ type: 'error', text: error?.response?.data?.message || 'Failed to toggle active' });
-      });
-  };
+    const handleAddImageModel = () => {
+        setEditingImageModel(null);
+        setImageError(null);
+        setShowImageModal(true);
+    };
 
-  const handleConfirmDeleteImage = () => {
-    if (!imageDeleteId) return;
-    setImageDeleting(true);
-    api.deleteImageModel(imageDeleteId)
-      .then((res) => {
-        setImageDeleting(false);
-        if (res.data.success) {
-          setImageDeleteId(null);
-          fetchImageModels();
-        } else {
-          setImageMessage({ type: 'error', text: res.data.message || 'Failed to delete image model' });
-        }
-      })
-      .catch((error) => {
-        setImageDeleting(false);
-        setImageMessage({ type: 'error', text: error?.response?.data?.message || 'Failed to delete image model' });
-      });
-  };
+    const handleImageModelSave = (payload) => {
+        saveImageModel(payload).then(response => {
+            if (response.data.success) {
+                fetchImageModels();
+                setShowImageModal(false);
+            } else {
+                setImageError(response.data.message || 'Failed to save image model');
+            }
+        }).catch(error => {
+            console.error('Error saving image model:', error);
+            setImageError('Failed to save image model');
+        });
+    };
 
-  // ---------- Image Generations ----------
-  const fetchGenerations = useCallback(() => {
-    setGenerationsLoading(true);
-    api.getImageGenerations(generationsStart, generationsLength)
-      .then((res) => {
-        setGenerationsLoading(false);
-        if (res.data.success) {
-          const data = res.data.data || {};
-          setGenerations(data.items || data.generations || data || []);
-          setGenerationsTotal(data.totalCount || data.total || 0);
-        } else {
-          setGenerationsMessage({ type: 'error', text: res.data.message || 'Failed to fetch generations' });
-        }
-      })
-      .catch((error) => {
-        setGenerationsLoading(false);
-        setGenerationsMessage({ type: 'error', text: error?.response?.data?.message || 'Failed to fetch generations' });
-      });
-  }, [api, generationsStart, generationsLength]);
+    const handleImageModelDelete = (model) => {
+        if (!confirm(`Are you sure you want to delete the model "${model.name}"?`)) return;
+        deleteImageModel(model.id).then(response => {
+            if (response.data.success) {
+                fetchImageModels();
+            }
+        }).catch(error => {
+            console.error('Error deleting image model:', error);
+        });
+    };
 
-  const fetchDailyCosts = useCallback(() => {
-    setDailyCostsLoading(true);
-    api.getDailyCosts(costRange)
-      .then((res) => {
-        setDailyCostsLoading(false);
-        if (res.data.success) {
-          setDailyCosts(res.data.data || []);
-        } else {
-          setGenerationsMessage({ type: 'error', text: res.data.message || 'Failed to fetch daily costs' });
-        }
-      })
-      .catch((error) => {
-        setDailyCostsLoading(false);
-        setGenerationsMessage({ type: 'error', text: error?.response?.data?.message || 'Failed to fetch daily costs' });
-      });
-  }, [api, costRange]);
+    const handleToggleImageModelActive = (model) => {
+        toggleImageModelActive(model.id, !model.active).then(response => {
+            if (response.data.success) {
+                fetchImageModels();
+            }
+        }).catch(error => {
+            console.error('Error toggling image model active:', error);
+        });
+    };
 
-  useEffect(() => {
-    fetchLlmModels();
-  }, [fetchLlmModels]);
+    const llmEndpointsContent = (
+        <div>
+            <div className="flex justify-between items-center mb-6">
+                <h1 className="text-3xl">OpenAI Endpoints</h1>
+                <ButtonOutline onClick={handleAdd}>
+                    <Icon name="add" />
+                    <span className="ml-2">Add Model</span>
+                </ButtonOutline>
+            </div>
 
-  useEffect(() => {
-    fetchImageModels();
-  }, [fetchImageModels]);
-
-  useEffect(() => {
-    fetchGenerations();
-  }, [fetchGenerations]);
-
-  useEffect(() => {
-    fetchDailyCosts();
-  }, [fetchDailyCosts]);
-
-  // ---------- Render: LLM Endpoints Tab ----------
-  const renderLlmTab = () => (
-    <div>
-      {llmMessage && (
-        <Message type={llmMessage.type} onClose={() => setLlmMessage(null)}>
-          {llmMessage.text}
-        </Message>
-      )}
-      <div className="flex items-center justify-between mb-4">
-        <h2 className="text-xl font-bold">LLM Endpoints</h2>
-        <Button onClick={handleOpenAddLlm}>
-          <Icon name="add" className="mr-1" />
-          Add Model
-        </Button>
-      </div>
-      <div className="bg-white dark:bg-gray-800 rounded shadow overflow-hidden">
-        <table className="w-full text-left border-collapse">
-          <thead className="bg-gray-100 dark:bg-gray-700">
-            <tr>
-              <th className="px-4 py-3">Name</th>
-              <th className="px-4 py-3">Model</th>
-              <th className="px-4 py-3">Endpoint</th>
-              <th className="px-4 py-3">Enabled</th>
-              <th className="px-4 py-3">Preferred</th>
-              <th className="px-4 py-3">Actions</th>
-            </tr>
-          </thead>
-          <tbody>
-            {llmModels.map((model) => (
-              <tr key={model.id} className="border-t border-gray-200 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-700">
-                <td className="px-4 py-3 font-medium">{model.name}</td>
-                <td className="px-4 py-3">{model.model}</td>
-                <td className="px-4 py-3 text-sm text-gray-600 dark:text-gray-400">{model.endpoint}</td>
-                <td className="px-4 py-3">
-                  <span className={`inline-flex items-center px-2 py-0.5 rounded text-xs font-medium ${model.enabled ? 'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-200' : 'bg-gray-100 text-gray-600 dark:bg-gray-700 dark:text-gray-400'}`}>
-                    {model.enabled ? 'Yes' : 'No'}
-                  </span>
-                </td>
-                <td className="px-4 py-3">
-                  {model.preferred ? (
-                    <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-primary-100 text-primary-800 dark:bg-primary-900/30 dark:text-primary-200">
-                      Preferred
-                    </span>
-                  ) : (
-                    <span className="text-gray-400">—</span>
-                  )}
-                </td>
-                <td className="px-4 py-3">
-                  <div className="flex items-center gap-1 flex-wrap">
-                    <Button size="small" color="gray" onClick={() => handleOpenEditLlm(model)}>
-                      <Icon name="edit" className="mr-1" />
-                      Edit
-                    </Button>
-                    <Button size="small" color={model.enabled ? 'gray' : 'green'} onClick={() => handleToggleLlmEnabled(model)}>
-                      <Icon name={model.enabled ? 'block' : 'check'} className="mr-1" />
-                      {model.enabled ? 'Disable' : 'Enable'}
-                    </Button>
-                    {!model.preferred && (
-                      <ButtonOutline size="small" onClick={() => handleSetPreferred(model)}>
-                        <Icon name="star" className="mr-1" />
-                        Set Preferred
-                      </ButtonOutline>
-                    )}
-                    <Button size="small" color="red" onClick={() => setLlmDeleteId(model.id)}>
-                      <Icon name="delete" className="mr-1" />
-                      Delete
-                    </Button>
-                  </div>
-                </td>
-              </tr>
-            ))}
-            {llmModels.length === 0 && !llmLoading && (
-              <tr>
-                <td colSpan="6" className="px-4 py-6 text-center text-gray-500">
-                  No LLM models found.
-                </td>
-              </tr>
+            {message && (
+                <Message type={message.type} onClose={() => setMessage(null)}>
+                    {message.text}
+                </Message>
             )}
-            {llmLoading && (
-              <tr>
-                <td colSpan="6" className="px-4 py-6 text-center text-gray-500">
-                  <Spinner className="text-2xl" />
-                </td>
-              </tr>
+
+            {showModal && (
+                <Modal title={editingModel ? 'Edit LLM Model' : 'Add LLM Model'} onClose={() => setShowModal(false)}>
+                    {error && <div className="mb-4 p-3 rounded bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200">{error}</div>}
+                    <Input
+                        label="Name"
+                        name="name"
+                        value={form.name}
+                        onInput={(e) => handleFormChange('name', e.target.value)}
+                    />
+                    <Input
+                        label="Model"
+                        name="model"
+                        value={form.model}
+                        onInput={(e) => handleFormChange('model', e.target.value)}
+                    />
+                    <Input
+                        label="Endpoint"
+                        name="endpoint"
+                        value={form.endpoint}
+                        onInput={(e) => handleFormChange('endpoint', e.target.value)}
+                    />
+                    <Input
+                        label="Private Key"
+                        name="privateKey"
+                        type="password"
+                        value={form.privateKey}
+                        onInput={(e) => handleFormChange('privateKey', e.target.value)}
+                    />
+                    <Select
+                        label="Type"
+                        name="type"
+                        options={LLM_TYPES}
+                        value={form.type}
+                        onChange={(e) => handleFormChange('type', parseInt(e.target.value))}
+                    />
+                    <TextArea
+                        label="Extra Body (JSON)"
+                        name="extraBody"
+                        value={form.extraBody}
+                        rows={3}
+                        onInput={(e) => handleFormChange('extraBody', e.target.value)}
+                    />
+                    <Checkbox
+                        name="enabled"
+                        label="Enabled"
+                        checked={form.enabled}
+                        onChange={(e) => handleFormChange('enabled', e.target.checked)}
+                    />
+                    <Checkbox
+                        name="preferred"
+                        label="Preferred"
+                        checked={form.preferred}
+                        onChange={(e) => handleFormChange('preferred', e.target.checked)}
+                    />
+                    <div className="buttons flex gap-3">
+                        <Button onClick={handleSave}>Save</Button>
+                        <Button color="gray" className="cancel" onClick={() => setShowModal(false)}>Cancel</Button>
+                    </div>
+                </Modal>
             )}
-          </tbody>
-        </table>
-      </div>
 
-      {llmModalOpen && (
-        <Modal title={llmEditing ? 'Edit LLM Model' : 'Add LLM Model'} onClose={() => setLlmModalOpen(false)}>
-          {llmMessage && (
-            <Message type={llmMessage.type} onClose={() => setLlmMessage(null)}>
-              {llmMessage.text}
-            </Message>
-          )}
-          <Input
-            name="name"
-            label="Name"
-            value={llmForm.name}
-            onChange={(e) => setLlmForm((prev) => ({ ...prev, name: e.target.value }))}
-            required
-          />
-          <Input
-            name="model"
-            label="Model"
-            value={llmForm.model}
-            onChange={(e) => setLlmForm((prev) => ({ ...prev, model: e.target.value }))}
-            required
-          />
-          <Input
-            name="endpoint"
-            label="Endpoint"
-            value={llmForm.endpoint}
-            onChange={(e) => setLlmForm((prev) => ({ ...prev, endpoint: e.target.value }))}
-            placeholder="https://api.openai.com/v1"
-          />
-          <Input
-            name="privateKey"
-            label="Private Key"
-            type="password"
-            value={llmForm.privateKey}
-            onChange={(e) => setLlmForm((prev) => ({ ...prev, privateKey: e.target.value }))}
-            placeholder={llmEditing ? 'Leave blank to keep existing' : 'sk-...'}
-          />
-          <Input
-            name="type"
-            label="Type"
-            type="number"
-            value={llmForm.type}
-            onChange={(e) => setLlmForm((prev) => ({ ...prev, type: parseInt(e.target.value, 10) || 0 }))}
-          />
-          <Checkbox
-            name="enabled"
-            label="Enabled"
-            checked={llmForm.enabled}
-            onChange={(e) => setLlmForm((prev) => ({ ...prev, enabled: e.target.checked }))}
-          />
-          <Checkbox
-            name="preferred"
-            label="Preferred"
-            checked={llmForm.preferred}
-            onChange={(e) => setLlmForm((prev) => ({ ...prev, preferred: e.target.checked }))}
-          />
-          <div className="flex flex-wrap gap-2 mt-2">
-            <Button onClick={handleSaveLlm} disabled={llmSaving}>
-              {llmSaving ? <Spinner className="mr-1" /> : <Icon name="save" className="mr-1" />}
-              {llmEditing ? 'Update' : 'Add'} Model
-            </Button>
-            <Button color="gray" onClick={() => setLlmModalOpen(false)}>
-              Cancel
-            </Button>
-          </div>
-        </Modal>
-      )}
+            <div className="bg-white dark:bg-gray-800 rounded-lg shadow overflow-hidden">
+                <table className="w-full text-left border-collapse">
+                    <thead className="bg-gray-100 dark:bg-gray-700">
+                        <tr>
+                            <th className="px-4 py-3 w-16 text-center"></th>
+                            <th className="px-4 py-3">Name</th>
+                            <th className="px-4 py-3">Model</th>
+                            <th className="px-4 py-3">Endpoint</th>
+                            <th className="px-4 py-3">Type</th>
+                            <th className="px-4 py-3 w-40"></th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {models.map(model => (
+                            <tr
+                                key={model.modelId}
+                                onClick={() => handleEdit(model)}
+                                className="border-b border-gray-200 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-700/50 cursor-pointer"
+                            >
+                                <td className="px-4 py-3 text-center cursor-default" onClick={(e) => e.stopPropagation()}>
+                                    <input
+                                        type="checkbox"
+                                        checked={model.enabled}
+                                        onChange={() => handleToggleEnabled(model)}
+                                        title={model.enabled ? 'Disable' : 'Enable'}
+                                        className="w-[18px] h-[18px] cursor-pointer"
+                                    />
+                                </td>
+                                <td className="px-4 py-3">{model.name}</td>
+                                <td className="px-4 py-3">{model.model}</td>
+                                <td className="px-4 py-3 truncate max-w-xs">{model.endpoint}</td>
+                                <td className="px-4 py-3">{model.type === 0 ? 'Local' : 'Cloud'}</td>
+                                <td className="px-4 py-3" onClick={(e) => e.stopPropagation()}>
+                                    <div className="flex items-center gap-2">
+                                        <button
+                                            type="button"
+                                            className={'icon ' + (model.preferred ? 'text-amber-400' : '')}
+                                            onClick={() => handleTogglePreferred(model)}
+                                            title={model.preferred ? 'Preferred' : 'Set as preferred'}
+                                        >
+                                            <Icon name={model.preferred ? 'star_shine' : 'star'} />
+                                        </button>
+                                        <ButtonIcon name="edit" onClick={() => handleEdit(model)} title="Edit model" />
+                                        <ButtonIcon name="delete" color="red" onClick={() => handleDelete(model)} title="Delete model" />
+                                    </div>
+                                </td>
+                            </tr>
+                        ))}
+                        {models.length === 0 && (
+                            <tr>
+                                <td colSpan="6" className="text-center py-8 text-gray-600 dark:text-gray-400">
+                                    No Open AI endpoints configured. Click "Add Model" to get started.
+                                </td>
+                            </tr>
+                        )}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    );
 
-      {llmDeleteId && (
-        <Modal title="Delete LLM Model" onClose={() => setLlmDeleteId(null)}>
-          <p className="mb-4">Are you sure you want to delete this LLM model? This action cannot be undone.</p>
-          <div className="flex gap-2">
-            <Button color="red" onClick={handleConfirmDeleteLlm} disabled={llmDeleting}>
-              {llmDeleting ? <Spinner className="mr-1" /> : <Icon name="delete" className="mr-1" />}
-              Delete
-            </Button>
-            <Button color="gray" onClick={() => setLlmDeleteId(null)}>
-              Cancel
-            </Button>
-          </div>
-        </Modal>
-      )}
-    </div>
-  );
+    const imageGenerationContent = (
+        <div>
+            <div className="flex justify-between items-center mb-6">
+                <h1 className="text-3xl">Image Generation</h1>
+                <ButtonOutline onClick={handleAddImageModel}>
+                    <Icon name="add" />
+                    <span className="ml-2">Add Model</span>
+                </ButtonOutline>
+            </div>
 
-  // ---------- Render: Image Endpoints Tab ----------
-  const renderImageTab = () => (
-    <div>
-      {imageMessage && (
-        <Message type={imageMessage.type} onClose={() => setImageMessage(null)}>
-          {imageMessage.text}
-        </Message>
-      )}
-      <div className="flex items-center justify-between mb-4">
-        <h2 className="text-xl font-bold">Image Endpoints</h2>
-        <Button onClick={handleOpenAddImage}>
-          <Icon name="add" className="mr-1" />
-          Add Model
-        </Button>
-      </div>
-      <div className="bg-white dark:bg-gray-800 rounded shadow overflow-hidden">
-        <table className="w-full text-left border-collapse">
-          <thead className="bg-gray-100 dark:bg-gray-700">
-            <tr>
-              <th className="px-4 py-3">Name</th>
-              <th className="px-4 py-3">Model Key</th>
-              <th className="px-4 py-3">Model</th>
-              <th className="px-4 py-3">Type</th>
-              <th className="px-4 py-3">Active</th>
-              <th className="px-4 py-3">Actions</th>
-            </tr>
-          </thead>
-          <tbody>
-            {imageModels.map((model) => (
-              <tr key={model.id} className="border-t border-gray-200 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-700">
-                <td className="px-4 py-3 font-medium">{model.name}</td>
-                <td className="px-4 py-3 text-sm text-gray-600 dark:text-gray-400">{model.modelKey}</td>
-                <td className="px-4 py-3">{model.model}</td>
-                <td className="px-4 py-3">{model.type}</td>
-                <td className="px-4 py-3">
-                  <span className={`inline-flex items-center px-2 py-0.5 rounded text-xs font-medium ${model.active ? 'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-200' : 'bg-gray-100 text-gray-600 dark:bg-gray-700 dark:text-gray-400'}`}>
-                    {model.active ? 'Yes' : 'No'}
-                  </span>
-                </td>
-                <td className="px-4 py-3">
-                  <div className="flex items-center gap-1 flex-wrap">
-                    <Button size="small" color="gray" onClick={() => handleOpenEditImage(model)}>
-                      <Icon name="edit" className="mr-1" />
-                      Edit
-                    </Button>
-                    <Button size="small" color={model.active ? 'gray' : 'green'} onClick={() => handleToggleImageActive(model)}>
-                      <Icon name={model.active ? 'block' : 'check'} className="mr-1" />
-                      {model.active ? 'Deactivate' : 'Activate'}
-                    </Button>
-                    <Button size="small" color="red" onClick={() => setImageDeleteId(model.id)}>
-                      <Icon name="delete" className="mr-1" />
-                      Delete
-                    </Button>
-                  </div>
-                </td>
-              </tr>
-            ))}
-            {imageModels.length === 0 && !imageLoading && (
-              <tr>
-                <td colSpan="6" className="px-4 py-6 text-center text-gray-500">
-                  No image models found.
-                </td>
-              </tr>
+            {message && (
+                <Message type={message.type} onClose={() => setMessage(null)}>
+                    {message.text}
+                </Message>
             )}
-            {imageLoading && (
-              <tr>
-                <td colSpan="6" className="px-4 py-6 text-center text-gray-500">
-                  <Spinner className="text-2xl" />
-                </td>
-              </tr>
+
+            <div className="bg-white dark:bg-gray-800 rounded-lg shadow overflow-hidden">
+                <table className="w-full text-left border-collapse">
+                    <thead className="bg-gray-100 dark:bg-gray-700">
+                        <tr>
+                            <th className="px-4 py-3 w-12"></th>
+                            <th className="px-4 py-3">Name</th>
+                            <th className="px-4 py-3">Model</th>
+                            <th className="px-4 py-3">Cost</th>
+                            <th className="px-4 py-3">CPM Text</th>
+                            <th className="px-4 py-3">CPM Image</th>
+                            <th className="px-4 py-3">CPM Output</th>
+                            <th className="px-4 py-3">CP 1K</th>
+                            <th className="px-4 py-3">CP 2K</th>
+                            <th className="px-4 py-3">CP 4K</th>
+                            <th className="px-4 py-3 w-24"></th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {imageModels.map(model => (
+                            <tr
+                                key={model.modelKey}
+                                onClick={() => handleImageModelClick(model)}
+                                className="border-b border-gray-200 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-700/50 cursor-pointer"
+                            >
+                                <td className="px-4 py-3" onClick={(e) => e.stopPropagation()}>
+                                    <div className="cursor-pointer" onClick={(e) => { e.stopPropagation(); handleToggleImageModelActive(model); }}>
+                                        <Checked checked={model.active !== false} />
+                                    </div>
+                                </td>
+                                <td className="px-4 py-3">{model.name || '(not configured)'}</td>
+                                <td className="px-4 py-3">{model.model || '-'}</td>
+                                <td className="px-4 py-3">{model.type === 1 ? 'Per Megapixel' : 'Per Million'}</td>
+                                <td className="px-4 py-3">{model.type === 1 ? '-' : `$${model.cpmitTokens}`}</td>
+                                <td className="px-4 py-3">{model.type === 1 ? '-' : `$${model.cpmiiTokens}`}</td>
+                                <td className="px-4 py-3">{model.type === 1 ? '-' : `$${model.cpmoTokens}`}</td>
+                                <td className="px-4 py-3">{model.type === 1 ? `$${model.cp1k}` : '-'}</td>
+                                <td className="px-4 py-3">{model.type === 1 ? `$${model.cp2k}` : '-'}</td>
+                                <td className="px-4 py-3">{model.type === 1 ? `$${model.cp4k}` : '-'}</td>
+                                <td className="px-4 py-3" onClick={(e) => e.stopPropagation()}>
+                                    <div className="flex items-center gap-2">
+                                        <ButtonIcon name="edit" onClick={() => handleImageModelClick(model)} title="Edit model" />
+                                        {model.id && (
+                                            <ButtonIcon name="delete" color="red" onClick={() => handleImageModelDelete(model)} title="Delete model" />
+                                        )}
+                                    </div>
+                                </td>
+                            </tr>
+                        ))}
+                        {imageModels.length === 0 && (
+                            <tr>
+                                <td colSpan="11" className="text-center py-8 text-gray-600 dark:text-gray-400">
+                                    No image generation models configured.
+                                </td>
+                            </tr>
+                        )}
+                    </tbody>
+                </table>
+            </div>
+
+            {showImageModal && (
+                <ImageGenerationModal
+                    show={showImageModal}
+                    model={editingImageModel}
+                    onClose={() => setShowImageModal(false)}
+                    onSave={handleImageModelSave}
+                />
             )}
-          </tbody>
-        </table>
-      </div>
+        </div>
+    );
 
-      {imageModalOpen && (
-        <Modal title={imageEditing ? 'Edit Image Model' : 'Add Image Model'} onClose={() => setImageModalOpen(false)} className="max-w-2xl">
-          {imageMessage && (
-            <Message type={imageMessage.type} onClose={() => setImageMessage(null)}>
-              {imageMessage.text}
-            </Message>
-          )}
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-4">
-            <Input
-              name="modelKey"
-              label="Model Key"
-              value={imageForm.modelKey}
-              onChange={(e) => setImageForm((prev) => ({ ...prev, modelKey: e.target.value }))}
-              required
-            />
-            <Input
-              name="name"
-              label="Name"
-              value={imageForm.name}
-              onChange={(e) => setImageForm((prev) => ({ ...prev, name: e.target.value }))}
-            />
-            <Input
-              name="model"
-              label="Model"
-              value={imageForm.model}
-              onChange={(e) => setImageForm((prev) => ({ ...prev, model: e.target.value }))}
-              required
-            />
-            <Input
-              name="type"
-              label="Type"
-              type="number"
-              value={imageForm.type}
-              onChange={(e) => setImageForm((prev) => ({ ...prev, type: parseInt(e.target.value, 10) || 0 }))}
-            />
-            <Input
-              name="cpmitTokens"
-              label="CPMIT Tokens"
-              type="number"
-              value={imageForm.cpmitTokens}
-              onChange={(e) => setImageForm((prev) => ({ ...prev, cpmitTokens: parseFloat(e.target.value) || 0 }))}
-            />
-            <Input
-              name="cpmiitTokens"
-              label="CPMIIT Tokens"
-              type="number"
-              value={imageForm.cpmiitTokens}
-              onChange={(e) => setImageForm((prev) => ({ ...prev, cpmiitTokens: parseFloat(e.target.value) || 0 }))}
-            />
-            <Input
-              name="cpmotTokens"
-              label="CPMOT Tokens"
-              type="number"
-              value={imageForm.cpmotTokens}
-              onChange={(e) => setImageForm((prev) => ({ ...prev, cpmotTokens: parseFloat(e.target.value) || 0 }))}
-            />
-            <Input
-              name="cp1k"
-              label="CP 1K"
-              type="number"
-              value={imageForm.cp1k}
-              onChange={(e) => setImageForm((prev) => ({ ...prev, cp1k: parseFloat(e.target.value) || 0 }))}
-            />
-            <Input
-              name="cp2k"
-              label="CP 2K"
-              type="number"
-              value={imageForm.cp2k}
-              onChange={(e) => setImageForm((prev) => ({ ...prev, cp2k: parseFloat(e.target.value) || 0 }))}
-            />
-            <Input
-              name="cp4k"
-              label="CP 4K"
-              type="number"
-              value={imageForm.cp4k}
-              onChange={(e) => setImageForm((prev) => ({ ...prev, cp4k: parseFloat(e.target.value) || 0 }))}
-            />
-            <Input
-              name="cp8k"
-              label="CP 8K"
-              type="number"
-              value={imageForm.cp8k}
-              onChange={(e) => setImageForm((prev) => ({ ...prev, cp8k: parseFloat(e.target.value) || 0 }))}
-            />
-          </div>
-          <Checkbox
-            name="active"
-            label="Active"
-            checked={imageForm.active}
-            onChange={(e) => setImageForm((prev) => ({ ...prev, active: e.target.checked }))}
-          />
-          <div className="flex flex-wrap gap-2 mt-2">
-            <Button onClick={handleSaveImage} disabled={imageSaving}>
-              {imageSaving ? <Spinner className="mr-1" /> : <Icon name="save" className="mr-1" />}
-              {imageEditing ? 'Update' : 'Add'} Model
-            </Button>
-            <Button color="gray" onClick={() => setImageModalOpen(false)}>
-              Cancel
-            </Button>
-          </div>
-        </Modal>
-      )}
+    const imageGenerationsContent = useMemo(() => <ImageGenerationsTab />, []);
 
-      {imageDeleteId && (
-        <Modal title="Delete Image Model" onClose={() => setImageDeleteId(null)}>
-          <p className="mb-4">Are you sure you want to delete this image model? This action cannot be undone.</p>
-          <div className="flex gap-2">
-            <Button color="red" onClick={handleConfirmDeleteImage} disabled={imageDeleting}>
-              {imageDeleting ? <Spinner className="mr-1" /> : <Icon name="delete" className="mr-1" />}
-              Delete
-            </Button>
-            <Button color="gray" onClick={() => setImageDeleteId(null)}>
-              Cancel
-            </Button>
-          </div>
-        </Modal>
-      )}
-    </div>
-  );
-
-  // ---------- Render: Image Generations Tab ----------
-  const renderGenerationsTab = () => {
-    const currentPage = Math.floor(generationsStart / generationsLength) + 1;
-    const totalPages = Math.ceil(generationsTotal / generationsLength);
+    const tabs = [
+        { id: 'endpoints', label: 'LLM Endpoints', content: llmEndpointsContent },
+        { id: 'image-gen', label: 'Image Endpoints', content: imageGenerationContent },
+        { id: 'image-generations', label: 'Image Generations', content: imageGenerationsContent },
+    ];
 
     return (
-      <div>
-        {generationsMessage && (
-          <Message type={generationsMessage.type} onClose={() => setGenerationsMessage(null)}>
-            {generationsMessage.text}
-          </Message>
-        )}
-        <h2 className="text-xl font-bold mb-4">Image Generations</h2>
-
-        {/* Daily Costs Summary */}
-        <div className="mb-6">
-          <div className="flex items-center justify-between mb-3">
-            <h3 className="text-lg font-semibold">Daily Costs</h3>
-            <select
-              value={costRange}
-              onChange={(e) => setCostRange(e.target.value)}
-              className="px-3 py-1.5 border border-gray-300 dark:border-gray-600 rounded bg-white dark:bg-gray-700 focus:outline-none focus:ring-2 focus:ring-primary-500 text-sm"
-            >
-              <option value="7days">Last 7 days</option>
-              <option value="30days">Last 30 days</option>
-              <option value="90days">Last 90 days</option>
-            </select>
-          </div>
-          <div className="bg-white dark:bg-gray-800 rounded shadow overflow-hidden">
-            <table className="w-full text-left border-collapse">
-              <thead className="bg-gray-100 dark:bg-gray-700">
-                <tr>
-                  <th className="px-4 py-3">Date</th>
-                  <th className="px-4 py-3">Total Cost</th>
-                  <th className="px-4 py-3">Total Tokens</th>
-                  <th className="px-4 py-3">Total Generations</th>
-                </tr>
-              </thead>
-              <tbody>
-                {dailyCosts.map((item, index) => (
-                  <tr key={index} className="border-t border-gray-200 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-700">
-                    <td className="px-4 py-3">{formatDateShort(item.date)}</td>
-                    <td className="px-4 py-3 font-medium">{formatCost(item.totalCost ?? item.cost)}</td>
-                    <td className="px-4 py-3">{item.totalTokens ?? item.tokens ?? 0}</td>
-                    <td className="px-4 py-3">{item.totalGenerations ?? item.generations ?? item.count ?? 0}</td>
-                  </tr>
-                ))}
-                {dailyCosts.length === 0 && !dailyCostsLoading && (
-                  <tr>
-                    <td colSpan="4" className="px-4 py-6 text-center text-gray-500">
-                      No daily cost data available.
-                    </td>
-                  </tr>
-                )}
-                {dailyCostsLoading && (
-                  <tr>
-                    <td colSpan="4" className="px-4 py-6 text-center text-gray-500">
-                      <Spinner className="text-2xl" />
-                    </td>
-                  </tr>
-                )}
-              </tbody>
-            </table>
-          </div>
+        <div className="admin-openai">
+            <Tabs tabs={tabs} defaultTab="endpoints" />
         </div>
-
-        {/* Generations Table */}
-        <div className="bg-white dark:bg-gray-800 rounded shadow overflow-hidden">
-          <table className="w-full text-left border-collapse">
-            <thead className="bg-gray-100 dark:bg-gray-700">
-              <tr>
-                <th className="px-4 py-3">Date</th>
-                <th className="px-4 py-3">User</th>
-                <th className="px-4 py-3">Project</th>
-                <th className="px-4 py-3">Model</th>
-                <th className="px-4 py-3">Prompt</th>
-                <th className="px-4 py-3">Tokens</th>
-                <th className="px-4 py-3">Cost</th>
-              </tr>
-            </thead>
-            <tbody>
-              {generations.map((gen, index) => (
-                <tr key={gen.id ?? index} className="border-t border-gray-200 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-700">
-                  <td className="px-4 py-3 text-sm">{formatDate(gen.date ?? gen.created ?? gen.createdAt)}</td>
-                  <td className="px-4 py-3 text-sm">{gen.user ?? gen.userName ?? gen.email ?? 'N/A'}</td>
-                  <td className="px-4 py-3 text-sm">{gen.project ?? gen.projectName ?? 'N/A'}</td>
-                  <td className="px-4 py-3 text-sm">{gen.model ?? gen.modelName ?? 'N/A'}</td>
-                  <td className="px-4 py-3 text-sm text-gray-600 dark:text-gray-400 max-w-xs" title={gen.prompt}>
-                    {truncate(gen.prompt)}
-                  </td>
-                  <td className="px-4 py-3 text-sm">{gen.tokens ?? gen.totalTokens ?? 0}</td>
-                  <td className="px-4 py-3 text-sm font-medium">{formatCost(gen.cost ?? gen.totalCost)}</td>
-                </tr>
-              ))}
-              {generations.length === 0 && !generationsLoading && (
-                <tr>
-                  <td colSpan="7" className="px-4 py-6 text-center text-gray-500">
-                    No image generations found.
-                  </td>
-                </tr>
-              )}
-              {generationsLoading && (
-                <tr>
-                  <td colSpan="7" className="px-4 py-6 text-center text-gray-500">
-                    <Spinner className="text-2xl" />
-                  </td>
-                </tr>
-              )}
-            </tbody>
-          </table>
-        </div>
-
-        {/* Pagination */}
-        <div className="flex items-center justify-between gap-4 mt-4">
-          <span className="text-sm text-gray-600 dark:text-gray-400">
-            {generationsTotal > 0
-              ? `Showing ${generationsStart + 1} to ${Math.min(generationsStart + generationsLength, generationsTotal)} of ${generationsTotal} entries`
-              : 'No entries'}
-          </span>
-          <div className="flex items-center gap-2">
-            <button
-              type="button"
-              disabled={currentPage <= 1 || generationsLoading}
-              onClick={() => setGenerationsStart(Math.max(0, generationsStart - generationsLength))}
-              className="px-3 py-1 rounded border border-gray-300 dark:border-gray-600 hover:bg-gray-100 dark:hover:bg-gray-700 disabled:opacity-50 disabled:cursor-not-allowed"
-            >
-              Previous
-            </button>
-            <span className="text-sm text-gray-600 dark:text-gray-400">
-              Page {currentPage}{totalPages > 0 ? ` of ${totalPages}` : ''}
-            </span>
-            <button
-              type="button"
-              disabled={currentPage >= totalPages || generationsLoading}
-              onClick={() => setGenerationsStart(generationsStart + generationsLength)}
-              className="px-3 py-1 rounded border border-gray-300 dark:border-gray-600 hover:bg-gray-100 dark:hover:bg-gray-700 disabled:opacity-50 disabled:cursor-not-allowed"
-            >
-              Next
-            </button>
-          </div>
-        </div>
-      </div>
     );
-  };
-
-  const tabs = [
-    { id: 'llm', label: 'LLM Endpoints', content: renderLlmTab() },
-    { id: 'image', label: 'Image Endpoints', content: renderImageTab() },
-    { id: 'generations', label: 'Image Generations', content: renderGenerationsTab() },
-  ];
-
-  return (
-    <div>
-      <h1 className="text-3xl font-bold mb-4">OpenAI Administration</h1>
-      <Tabs tabs={tabs} defaultTab="llm" />
-    </div>
-  );
 }

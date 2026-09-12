@@ -21,6 +21,11 @@ SELECT 'CREATE DATABASE texturegen3d' WHERE NOT EXISTS (SELECT FROM pg_database 
 \i Tables/ProjectImageGenerations.sql
 \i Tables/ProjectImageUpscales.sql
 \i Tables/ProjectModels.sql
+\i Tables/ProjectMeshes.sql
+\i Tables/ProjectCameraAngles.sql
+\i Tables/ProjectMeshLayers.sql
+\i Tables/ProjectReferences.sql
+\i Tables/ProjectMeshReferences.sql
 \i Tables/Subscriptions.sql
 
 -- Sequences

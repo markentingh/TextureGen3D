@@ -49,6 +49,10 @@ namespace TextureGen3D.API.Controllers.Admin
                     cp2k = m.CP2K,
                     cp4k = m.CP4K,
                     cp8k = m.CP8K,
+                    workflowJson = m.WorkflowJson,
+                    promptPath = m.PromptPath,
+                    depthMapPath = m.DepthMapPath,
+                    inputImagesPath = m.InputImagesPath,
                     active = m.Active
                 }).ToList();
 
@@ -87,6 +91,10 @@ namespace TextureGen3D.API.Controllers.Admin
                         existing.CP2K = request.CP2K;
                         existing.CP4K = request.CP4K;
                         existing.CP8K = request.CP8K;
+                        existing.WorkflowJson = request.WorkflowJson;
+                        existing.PromptPath = request.PromptPath;
+                        existing.DepthMapPath = request.DepthMapPath;
+                        existing.InputImagesPath = request.InputImagesPath;
                         existing.Active = request.Active;
                         await _repo.UpdateAsync(existing);
                     }
@@ -106,6 +114,10 @@ namespace TextureGen3D.API.Controllers.Admin
                         CP2K = request.CP2K,
                         CP4K = request.CP4K,
                         CP8K = request.CP8K,
+                        WorkflowJson = request.WorkflowJson,
+                        PromptPath = request.PromptPath,
+                        DepthMapPath = request.DepthMapPath,
+                        InputImagesPath = request.InputImagesPath,
                         Active = request.Active
                     };
                     await _repo.CreateAsync(model);

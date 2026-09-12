@@ -77,6 +77,12 @@ namespace TextureGen3D.Data.Repositories.Projects
             await _dbConnection.ExecuteAsync(query, new { id, appUserId, key });
         }
 
+        public async Task UpdateImageModelAsync(Guid id, Guid appUserId, Guid? imageModelId)
+        {
+            const string query = @"UPDATE public.""Projects"" SET ""ImageModelId"" = @imageModelId WHERE ""Id"" = @id AND ""AppUserId"" = @appUserId";
+            await _dbConnection.ExecuteAsync(query, new { id, appUserId, imageModelId });
+        }
+
         public async Task DeleteAsync(Guid id, Guid appUserId)
         {
             const string query = @"UPDATE public.""Projects"" SET ""Status"" = 0 WHERE ""Id"" = @id AND ""AppUserId"" = @appUserId";

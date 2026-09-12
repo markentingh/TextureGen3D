@@ -1,6 +1,8 @@
 using System.Data;
 using System.Reflection;
+using System.Text.Encodings.Web;
 using System.Text.Json;
+using TextureGen3D.API.Hubs;
 using TextureGen3D.API.Services;
 using TextureGen3D.Auth.Services;
 using TextureGen3D.Data.Interfaces;
@@ -28,7 +30,11 @@ builder.Services.AddHealthChecks();
 
 builder.Services.AddControllers()
     .AddApplicationPart(Assembly.Load("TextureGen3D.API"))
-    .AddApplicationPart(Assembly.Load("TextureGen3D.Auth"));
+    .AddApplicationPart(Assembly.Load("TextureGen3D.Auth"))
+    .AddJsonOptions(options =>
+    {
+        options.JsonSerializerOptions.Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping;
+    });
 
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.Configure<RouteOptions>(options => options.LowercaseUrls = true);
@@ -142,6 +148,7 @@ app.UseStaticFiles(new StaticFileOptions
 });
 
 app.MapControllers();
+app.MapHub<ComfyUiHub>("/hubs/comfyui");
 app.MapFallbackToFile("index.html");
 
 Console.WriteLine(

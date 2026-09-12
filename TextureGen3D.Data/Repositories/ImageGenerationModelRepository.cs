@@ -41,8 +41,8 @@ namespace TextureGen3D.Data.Repositories
         public async Task<ImageGenerationModel> CreateAsync(ImageGenerationModel model)
         {
             const string query = @"
-                INSERT INTO public.""ImageGeneration"" (""ModelKey"", ""Name"", ""Model"", ""CPMITTokens"", ""CPMIITokens"", ""CPMOTokens"", ""Type"", ""CP1K"", ""CP2K"", ""CP4K"", ""CP8K"", ""Active"")
-                VALUES (@ModelKey, @Name, @Model, @CPMITTokens, @CPMIITokens, @CPMOTokens, @Type, @CP1K, @CP2K, @CP4K, @CP8K, @Active)
+                INSERT INTO public.""ImageGeneration"" (""ModelKey"", ""Name"", ""Model"", ""CPMITTokens"", ""CPMIITokens"", ""CPMOTokens"", ""Type"", ""CP1K"", ""CP2K"", ""CP4K"", ""CP8K"", ""WorkflowJson"", ""PromptPath"", ""DepthMapPath"", ""InputImagesPath"", ""Active"")
+                VALUES (@ModelKey, @Name, @Model, @CPMITTokens, @CPMIITokens, @CPMOTokens, @Type, @CP1K, @CP2K, @CP4K, @CP8K, @WorkflowJson, @PromptPath, @DepthMapPath, @InputImagesPath, @Active)
                 RETURNING *";
             return await _dbConnection.QueryFirstAsync<ImageGenerationModel>(query, model);
         }
@@ -54,6 +54,7 @@ namespace TextureGen3D.Data.Repositories
                 SET ""ModelKey"" = @ModelKey, ""Name"" = @Name, ""Model"" = @Model,
                     ""CPMITTokens"" = @CPMITTokens, ""CPMIITokens"" = @CPMIITokens, ""CPMOTokens"" = @CPMOTokens,
                     ""Type"" = @Type, ""CP1K"" = @CP1K, ""CP2K"" = @CP2K, ""CP4K"" = @CP4K, ""CP8K"" = @CP8K,
+                    ""WorkflowJson"" = @WorkflowJson, ""PromptPath"" = @PromptPath, ""DepthMapPath"" = @DepthMapPath, ""InputImagesPath"" = @InputImagesPath,
                     ""Active"" = @Active, ""DateUpdated"" = CURRENT_TIMESTAMP
                 WHERE ""Id"" = @Id";
             await _dbConnection.ExecuteAsync(query, model);

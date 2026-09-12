@@ -1,4 +1,4 @@
-import React, { useRef, useEffect, useState, useCallback, forwardRef, useImperativeHandle } from 'react';
+import React, { useRef, useEffect, useState, useCallback, forwardRef, useImperativeHandle, memo } from 'react';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 
@@ -29,6 +29,8 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh }, ref) {
   const currentMeshRef = useRef(null);
   const animationFrameRef = useRef(null);
   const gridRef = useRef(null);
+  const orthoCameraRef = useRef(null);
+  const perspCameraRef = useRef(null);
 
   // Gizmo refs
   const gizmoSceneRef = useRef(null);       // axis scene (synced camera)
@@ -37,14 +39,37 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh }, ref) {
   const gizmoRingCameraRef = useRef(null);
   const gizmoRingsRef = useRef([]); // axis cones
   const gizmoAxisLinesRef = useRef([]); // axis lines
+  const gizmoPickArrayRef = useRef([]); // pre-built combined array for picking
   const gizmoOrbitRingRef = useRef(null);
   const gizmoFreeSphereRef = useRef(null);
-  const gizmoSizeRef = useRef(110);
+  const gizmoSizeRef = useRef(140);
   const gizmoInteractionRef = useRef(null);
   const raycasterRef = useRef(new THREE.Raycaster());
   const hoveredRingRef = useRef(null);
 
+  // Lighting gizmo refs
+  const lightGizmoSceneRef = useRef(null);
+  const lightGizmoCameraRef = useRef(null);      // picking camera (original frustum)
+  const lightGizmoRenderCamRef = useRef(null);   // render camera (pre-scaled frustum)
+  const lightGizmoRingRef = useRef(null);
+  const lightGizmoIconRef = useRef(null);
+  const lightGizmoFillRef = useRef(null);
+  const lightGizmoInteractionRef = useRef(null);
+  const dirLight1Ref = useRef(null);
+  const lightGizmoSizeRef = useRef(70);
+
   const [ready, setReady] = useState(false);
+
+  // Screen-space scene offset in CSS pixels — shifts rendered content right.
+  // Applied via camera frustum/projection shift (NOT by translating the
+  // mesh/camera, which would cancel out).
+  // 160px centers the mesh between the 320px left popup and the 288px right sidebar:
+  //   (popupWidth + sidebarWidth) / 2 = (320 + 288) / 2 = 160
+  const SCENE_OFFSET_PX = 160;
+  const sceneOffsetXRef = useRef(0);
+  const sceneOffsetYRef = useRef(0);
+  // Track ortho zoom to recompute frustum shift when it changes
+  const lastOrthoZoomRef = useRef(1);
 
   // Initialize scene once
   useEffect(() => {
@@ -53,7 +78,16 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh }, ref) {
 
     // ── Main scene ──
     const scene = new THREE.Scene();
-    scene.background = new THREE.Color(0x1a1a2e);
+
+    // Screen-space scene offset: shift rendered content right by 1/3 of the
+    // viewport width (in world units). Applied via frustum/projection shift
+    // so the mesh, lights, and orbit target all stay at world origin.
+    const aspect = container.clientWidth / container.clientHeight;
+    const orthoSize = 5;
+    // SCENE_OFFSET_PX in world units: px * (frustumWidth / viewportWidthPx)
+    const initOffsetX = SCENE_OFFSET_PX * (2 * orthoSize * aspect) / container.clientWidth;
+    sceneOffsetXRef.current = initOffsetX;
+    sceneOffsetYRef.current = 0;
 
     // Grid helper — shown only when no mesh is loaded
     const grid = new THREE.GridHelper(20, 40, 0x444466, 0x333344);
@@ -63,16 +97,36 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh }, ref) {
     scene.add(grid);
     gridRef.current = grid;
 
-    // Camera
-    const camera = new THREE.PerspectiveCamera(
+    // Camera (perspective — used when toggled)
+    const perspCamera = new THREE.PerspectiveCamera(
       50,
-      container.clientWidth / container.clientHeight,
+      aspect,
       0.001,
       10000
+    );
+    perspCamera.position.set(0, 0, 8);
+    perspCamera.lookAt(0, 0, 0);
+    perspCamera.up.set(0, 1, 0);
+    // Shift perspective content right by SCENE_OFFSET_PX via setViewOffset.
+    // Content shift = (fullWidth - vw) / 2, so fullWidth = vw + 2 * SCENE_OFFSET_PX.
+    {
+      const vw = container.clientWidth;
+      const vh = container.clientHeight;
+      perspCamera.setViewOffset(vw + 2 * SCENE_OFFSET_PX, vh, 0, 0, vw, vh);
+    }
+    perspCamera.updateProjectionMatrix();
+
+    // Orthographic camera (default) — frustum shifted right by initOffsetX
+    // (at zoom=1; the animation loop re-applies with /zoom when zoom changes)
+    const camera = new THREE.OrthographicCamera(
+      -orthoSize * aspect - initOffsetX, orthoSize * aspect - initOffsetX,
+      orthoSize, -orthoSize,
+      0.001, 10000
     );
     camera.position.set(0, 0, 8);
     camera.lookAt(0, 0, 0);
     camera.up.set(0, 1, 0);
+    lastOrthoZoomRef.current = 1;
 
     // Renderer
     const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true, preserveDrawingBuffer: true });
@@ -95,6 +149,7 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh }, ref) {
     const dirLight1 = new THREE.DirectionalLight(0xffffff, 1.0);
     dirLight1.position.set(10, 10, 10);
     scene.add(dirLight1);
+    dirLight1Ref.current = dirLight1;
 
     const dirLight2 = new THREE.DirectionalLight(0xffffff, 0.5);
     dirLight2.position.set(-10, 5, -10);
@@ -102,21 +157,40 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh }, ref) {
 
     // Orbit controls
     const controls = new OrbitControls(camera, renderer.domElement);
-    controls.enableDamping = true;
-    controls.dampingFactor = 0.08;
-    controls.rotateSpeed = 0.8;
+    controls.enableDamping = false;
+    controls.rotateSpeed = 1.0;
+    controls.mouseButtons = {
+      LEFT: null,
+      MIDDLE: THREE.MOUSE.ROTATE,
+      RIGHT: THREE.MOUSE.PAN,
+    };
+
+    // Ctrl + middle mouse = zoom (dolly); without Ctrl = rotate
+    const updateMiddleButton = (ctrlHeld) => {
+      if (controlsRef.current) {
+        controlsRef.current.mouseButtons.MIDDLE = ctrlHeld ? THREE.MOUSE.DOLLY : THREE.MOUSE.ROTATE;
+      }
+    };
+    const handleKeyDown = (e) => { if (e.key === 'Control') updateMiddleButton(true); };
+    const handleKeyUp = (e) => { if (e.key === 'Control') updateMiddleButton(false); };
+    const handleBlur = () => updateMiddleButton(false);
+    window.addEventListener('keydown', handleKeyDown);
+    window.addEventListener('keyup', handleKeyUp);
+    window.addEventListener('blur', handleBlur);
 
     // Store main refs
     sceneRef.current = scene;
     rendererRef.current = renderer;
-    cameraRef.current = camera;
+    cameraRef.current = camera; // ortho by default
     controlsRef.current = controls;
+    perspCameraRef.current = perspCamera;
+    orthoCameraRef.current = camera;
 
     // ── Gizmo (overlay) — Blender-style navigation gizmo ──
     // Z is up (blue), Y is forward (green), X is right (red) — Blender convention.
     // Two separate scenes: axisScene (synced with main camera) and ringScene (fixed).
 
-    // Axis scene — arrows rotate to reflect the current view direction
+    // Axis scene — circle sprites rotate to reflect the current view direction
     const axisScene = new THREE.Scene();
     const gizmoCamera = new THREE.OrthographicCamera(-2, 2, 2, -2, 0.1, 100);
     gizmoCamera.position.set(0, 0, 10);
@@ -128,23 +202,21 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh }, ref) {
     ringCamera.position.set(0, 0, 10);
     ringCamera.lookAt(0, 0, 0);
 
-    const axisLength = 1.1;
-    const coneRadius = 0.16;
-    const coneHeight = 0.45;
-    const baseOpacity = 0.7;
+    const baseOpacity = 1.0;
     const hoverOpacity = 1.0;
+    const axisLength = 1.1;
 
     // Blender convention: Z up (blue), Y forward (green), X right (red)
     const axisDefs = [
-      { dir: new THREE.Vector3(1, 0, 0), color: 0xef4444, label: 'X' },    // red — right
-      { dir: new THREE.Vector3(-1, 0, 0), color: 0x991b1b, label: 'X-' },  // dark red — left
-      { dir: new THREE.Vector3(0, 0, 1), color: 0x22c55e, label: 'Y' },    // green — forward
-      { dir: new THREE.Vector3(0, 0, -1), color: 0x166534, label: 'Y-' },  // dark green — back
-      { dir: new THREE.Vector3(0, 1, 0), color: 0x3b82f6, label: 'Z' },    // blue — up
-      { dir: new THREE.Vector3(0, -1, 0), color: 0x1e3a8a, label: 'Z-' },  // dark blue — down
+      { dir: new THREE.Vector3(1, 0, 0), color: '#ff0000', label: 'X' },    // red — right
+      { dir: new THREE.Vector3(-1, 0, 0), color: '#ff0000', label: '-X' },  // red — left
+      { dir: new THREE.Vector3(0, 0, 1), color: '#008000', label: 'Y' },    // green — forward
+      { dir: new THREE.Vector3(0, 0, -1), color: '#008000', label: '-Y' },  // green — back
+      { dir: new THREE.Vector3(0, 1, 0), color: '#0000ff', label: 'Z' },    // blue — up
+      { dir: new THREE.Vector3(0, -1, 0), color: '#0000ff', label: '-Z' },  // blue — down
     ];
 
-    // Helper: orient a cylinder/cone (default points +Y) along a given direction
+    // Helper: orient a cylinder (default points +Y) along a given direction
     const orientAlong = (obj, dir) => {
       if (dir.x > 0) obj.rotation.z = -Math.PI / 2;       // +X
       else if (dir.x < 0) obj.rotation.z = Math.PI / 2;    // -X
@@ -154,11 +226,33 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh }, ref) {
       else if (dir.y < 0) obj.rotation.x = Math.PI;        // -Y down — flip
     };
 
-    const axisCones = [];
+    // Helper: create a canvas texture with a solid colored circle + axis label text
+    const makeAxisSpriteTexture = (color, label) => {
+      const canvas = document.createElement('canvas');
+      canvas.width = 128;
+      canvas.height = 128;
+      const ctx = canvas.getContext('2d');
+      // Solid filled circle (no outline)
+      ctx.fillStyle = color;
+      ctx.beginPath();
+      ctx.arc(64, 64, 44, 0, Math.PI * 2);
+      ctx.fill();
+      // Label text
+      ctx.fillStyle = '#ffffff';
+      ctx.font = 'bold 44px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(label, 64, 64);
+      const texture = new THREE.CanvasTexture(canvas);
+      texture.needsUpdate = true;
+      return texture;
+    };
+
+    const axisSprites = [];
     const axisLines = [];
     axisDefs.forEach((def) => {
       // Line (cylinder) from origin toward the axis
-      const lineGeom = new THREE.CylinderGeometry(0.025, 0.025, axisLength, 8);
+      const lineGeom = new THREE.CylinderGeometry(0.03, 0.03, axisLength, 8);
       const lineMat = new THREE.MeshBasicMaterial({ color: def.color, transparent: true, opacity: baseOpacity, depthTest: false });
       const line = new THREE.Mesh(lineGeom, lineMat);
       line.position.copy(def.dir).multiplyScalar(axisLength / 2);
@@ -168,41 +262,32 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh }, ref) {
       axisScene.add(line);
       axisLines.push(line);
 
-      // Arrow cone at the end
-      const coneGeom = new THREE.ConeGeometry(coneRadius, coneHeight, 20);
-      const coneMat = new THREE.MeshBasicMaterial({ color: def.color, transparent: true, opacity: baseOpacity, depthTest: false });
-      const cone = new THREE.Mesh(coneGeom, coneMat);
-      cone.position.copy(def.dir).multiplyScalar(axisLength + coneHeight / 2);
-      orientAlong(cone, def.dir);
-      cone.renderOrder = 1000;
-      cone.userData = { ...def, type: 'axis', baseOpacity, hoverOpacity };
-      axisScene.add(cone);
-      axisCones.push(cone);
+      // Circle sprite with axis text at the end of the line (twice as large)
+      const tex = makeAxisSpriteTexture(def.color, def.label);
+      const mat = new THREE.SpriteMaterial({
+        map: tex,
+        transparent: true,
+        opacity: baseOpacity,
+        depthTest: false,
+      });
+      const sprite = new THREE.Sprite(mat);
+      sprite.position.copy(def.dir).multiplyScalar(axisLength + 0.3);
+      sprite.scale.set(1.1, 1.1, 1);
+      sprite.renderOrder = 1000;
+      sprite.userData = { ...def, type: 'axis', baseOpacity, hoverOpacity, texture: tex };
+      axisScene.add(sprite);
+      axisSprites.push(sprite);
     });
 
-    // Center sphere
-    const centerSphere = new THREE.Mesh(
-      new THREE.SphereGeometry(0.12, 16, 16),
-      new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.9, depthTest: false })
-    );
-    centerSphere.renderOrder = 1001;
-    centerSphere.userData = { type: 'center' };
-    axisScene.add(centerSphere);
+    // Center sphere removed — Blender gizmo has no center dot
 
-    // Outer white ring — always faces the viewer (in ringScene, rendered with fixed ringCamera)
-    const orbitRingRadius = 1.55;
-    const orbitRing = new THREE.Mesh(
-      new THREE.TorusGeometry(orbitRingRadius, 0.04, 16, 64),
-      new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.5, depthTest: false })
-    );
-    orbitRing.renderOrder = 998;
-    orbitRing.userData = { type: 'orbit', baseOpacity: 0.5, hoverOpacity: 1.0, baseTube: 0.04, hoverTube: 0.07 };
-    ringScene.add(orbitRing);
+    // Outer white ring removed — only axis arrows remain.
 
-    // Inner free-tumble sphere (invisible, fills the area inside the ring)
+    // Inner free-tumble sphere (invisible, fills the area inside the gizmo)
+    const freeSphereRadius = 2.2;
     const freeSphere = new THREE.Mesh(
-      new THREE.SphereGeometry(orbitRingRadius * 0.95, 32, 32),
-      new THREE.MeshBasicMaterial({ visible: false, side: THREE.DoubleSide })
+      new THREE.SphereGeometry(freeSphereRadius, 32, 32),
+      new THREE.MeshBasicMaterial({ transparent: true, opacity: 0, side: THREE.DoubleSide })
     );
     freeSphere.renderOrder = 997;
     freeSphere.userData = { type: 'free' };
@@ -212,27 +297,181 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh }, ref) {
     gizmoRingSceneRef.current = ringScene;
     gizmoCameraRef.current = gizmoCamera;
     gizmoRingCameraRef.current = ringCamera;
-    gizmoRingsRef.current = axisCones;
+    gizmoRingsRef.current = axisSprites;
     gizmoAxisLinesRef.current = axisLines;
-    gizmoOrbitRingRef.current = orbitRing;
+    // Pre-built combined array for picking (avoids per-pointermove array allocation)
+    gizmoPickArrayRef.current = axisSprites.concat(axisLines);
+    gizmoOrbitRingRef.current = null;
     gizmoFreeSphereRef.current = freeSphere;
 
+    // ── Lighting gizmo (left of navigation gizmo) ──
+    // Single white ring with a lightbulb icon. Dragging the ring orbits
+    // the scene's directional light around the model.
+    const lightScene = new THREE.Scene();
+    const lightGizmoCam = new THREE.OrthographicCamera(-2, 2, 2, -2, 0.1, 100);
+    lightGizmoCam.position.set(0, 0, 10);
+    lightGizmoCam.lookAt(0, 0, 0);
+
+    // Dedicated render camera with pre-scaled frustum so the animation loop
+    // never needs to mutate/restore the picking camera's frustum per frame.
+    // frustumScale = vpW / lgs = (lgs + lgs*3*2) / lgs = 7 (constant).
+    const _lgsInit = lightGizmoSizeRef.current;
+    const _frustumScale = (_lgsInit + _lgsInit * 3 * 2) / _lgsInit;
+    const lightGizmoRenderCam = new THREE.OrthographicCamera(
+      -2 * _frustumScale, 2 * _frustumScale,
+      2 * _frustumScale, -2 * _frustumScale,
+      0.1, 100
+    );
+    lightGizmoRenderCam.position.set(0, 0, 10);
+    lightGizmoRenderCam.lookAt(0, 0, 0);
+
+    // Google Material "light_mode" icon as a canvas texture
+    const makeLightbulbTexture = () => {
+      const canvas = document.createElement('canvas');
+      canvas.width = 128;
+      canvas.height = 128;
+      const ctx = canvas.getContext('2d');
+      ctx.fillStyle = '#ffcc00';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.font = '80px "Material Symbols Rounded"';
+      // light_mode — sun with rays icon
+      ctx.fillText('light_mode', 64, 64);
+      const texture = new THREE.CanvasTexture(canvas);
+      texture.needsUpdate = true;
+      return texture;
+    };
+
+    // Ensure the Material Symbols font is loaded before creating the texture,
+    // then update the texture once the font is ready.
+    const bulbTex = makeLightbulbTexture();
+    if (document.fonts && document.fonts.load) {
+      document.fonts.load('80px "Material Symbols Rounded"').then(() => {
+        // Re-render the texture with the loaded font
+        const canvas = bulbTex.image;
+        const ctx = canvas.getContext('2d');
+        ctx.clearRect(0, 0, 128, 128);
+        ctx.fillStyle = '#ffcc00';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.font = '80px "Material Symbols Rounded"';
+        ctx.fillText('light_mode', 64, 64);
+        bulbTex.needsUpdate = true;
+      });
+    }
+
+    const lightRingRadius = 1.9;
+    const lightRing = new THREE.Mesh(
+      new THREE.TorusGeometry(lightRingRadius, 0.08, 16, 64),
+      new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.5, depthTest: false })
+    );
+    lightRing.renderOrder = 998;
+    lightRing.userData = { type: 'light', baseOpacity: 0.5, hoverOpacity: 1.0, baseTube: 0.08, hoverTube: 0.12 };
+    lightScene.add(lightRing);
+
+    // Lightbulb icon sprite sitting on the ring (at the top of the ring)
+    const bulbMat = new THREE.SpriteMaterial({ map: bulbTex, transparent: true, opacity: 0.9, depthTest: false });
+    const bulbSprite = new THREE.Sprite(bulbMat);
+    bulbSprite.position.set(0, lightRingRadius, 0); // on the ring at the top
+    bulbSprite.scale.set(2.8, 2.8, 1);
+    bulbSprite.renderOrder = 999;
+    bulbSprite.userData = { type: 'light', texture: bulbTex };
+    lightScene.add(bulbSprite);
+
+    // Invisible fill sphere so the entire gizmo area is draggable
+    const lightFill = new THREE.Mesh(
+      new THREE.SphereGeometry(lightRingRadius * 0.95, 32, 32),
+      new THREE.MeshBasicMaterial({ transparent: true, opacity: 0, side: THREE.DoubleSide, depthTest: false })
+    );
+    lightFill.renderOrder = 997;
+    lightFill.userData = { type: 'light' };
+    lightScene.add(lightFill);
+
+    lightGizmoSceneRef.current = lightScene;
+    lightGizmoCameraRef.current = lightGizmoCam;
+    lightGizmoRenderCamRef.current = lightGizmoRenderCam;
+    lightGizmoRingRef.current = lightRing;
+    lightGizmoIconRef.current = bulbSprite;
+    lightGizmoFillRef.current = lightFill;
+
     setReady(true);
+
+    // Pre-allocated temp objects for the animation loop (avoid per-frame allocation)
+    const animTmpDir = new THREE.Vector3();
+    const animTmpCamDir = new THREE.Vector3();
+
+    // Helper: apply zoom-aware frustum offset to the ortho camera.
+    // Three.js ortho zoom keeps (left+right)/2 fixed but shrinks half-width
+    // by /zoom, so a fixed frustum shift drifts as zoom changes.
+    // Fix: scale the shift by 1/zoom so NDC stays constant.
+    const applyOrthoOffset = (cam) => {
+      const z = cam.zoom;
+      const sx = sceneOffsetXRef.current / z;
+      const sy = sceneOffsetYRef.current / z;
+      const aspect = container.clientWidth / container.clientHeight;
+      const Oa = 5 * aspect;
+      cam.left = -Oa - sx;
+      cam.right = Oa - sx;
+      cam.top = 5 + sy;
+      cam.bottom = -5 + sy;
+      cam.updateProjectionMatrix();
+      lastOrthoZoomRef.current = z;
+    };
 
     // ── Animation loop ──
     const animate = () => {
       animationFrameRef.current = requestAnimationFrame(animate);
-      controls.update();
+
+      // Apply zoom-aware ortho frustum offset before controls.update() so
+      // the projection matrix is correct when OrbitControls uses it.
+      const orthoCam = orthoCameraRef.current;
+      if (orthoCam && orthoCam.zoom !== lastOrthoZoomRef.current) {
+        applyOrthoOffset(orthoCam);
+      }
+
+      controlsRef.current?.update();
 
       // Sync gizmo axis orientation with main camera so the axis arrows reflect
       // the current view direction (like Blender's navigation gizmo).
       const mainCam = cameraRef.current;
       if (mainCam && gizmoCameraRef.current) {
-        const dir = new THREE.Vector3();
-        mainCam.getWorldDirection(dir);
-        gizmoCameraRef.current.position.copy(dir).multiplyScalar(-10);
+        mainCam.getWorldDirection(animTmpDir);
+        gizmoCameraRef.current.position.copy(animTmpDir).multiplyScalar(-10);
         gizmoCameraRef.current.up.copy(mainCam.up);
         gizmoCameraRef.current.lookAt(0, 0, 0);
+
+        // Depth shading: only darken axis sprites & lines that are farther from
+        // the camera than the gizmo center (i.e. behind the center point).
+        animTmpCamDir.copy(animTmpDir).negate(); // direction from origin toward camera
+        gizmoRingsRef.current.forEach((sprite) => {
+          if (!sprite.userData.dir) return;
+          const dot = sprite.userData.dir.dot(animTmpCamDir);
+          // dot > 0 = in front of center (full opacity), dot < 0 = behind center (dark)
+          const shade = dot >= 0 ? 1.0 : 0.35 + 0.65 * (1 + dot);
+          if (!hoveredRingRef.current || hoveredRingRef.current !== sprite) {
+            sprite.material.opacity = shade;
+          }
+        });
+        gizmoAxisLinesRef.current.forEach((line) => {
+          if (!line.userData.dir) return;
+          const dot = line.userData.dir.dot(animTmpCamDir);
+          const shade = dot >= 0 ? 1.0 : 0.35 + 0.65 * (1 + dot);
+          if (!hoveredRingRef.current || hoveredRingRef.current !== line) {
+            line.material.opacity = shade;
+          }
+        });
+      }
+
+      // Update lightbulb icon position on the ring based on current light direction.
+      // The light orbits in the XZ plane; map (x, z) to the ring's (x, y).
+      const light = dirLight1Ref.current;
+      const bulbIcon = lightGizmoIconRef.current;
+      if (light && bulbIcon) {
+        const lx = light.position.x;
+        const lz = light.position.z;
+        const len = Math.sqrt(lx * lx + lz * lz) || 1;
+        const ringR = 1.9;
+        bulbIcon.position.set((lx / len) * ringR, -(lz / len) * ringR, 0);
       }
 
       const w = container.clientWidth;
@@ -244,23 +483,45 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh }, ref) {
       renderer.setViewport(0, 0, w, h);
       renderer.setScissor(0, 0, w, h);
       renderer.clear();
-      renderer.render(scene, camera);
+      renderer.render(scene, cameraRef.current);
 
       // Render gizmo in top-right corner region (scissor + viewport)
+      // Shifted down-left by 12px padding so the larger ring doesn't bleed off the edge
+      const pad = 12;
       renderer.setScissorTest(true);
-      renderer.setViewport(w - gs, h - gs, gs, gs);
-      renderer.setScissor(w - gs, h - gs, gs, gs);
+      renderer.setViewport(w - gs - pad, h - gs - pad, gs, gs);
+      renderer.setScissor(w - gs - pad, h - gs - pad, gs, gs);
       renderer.clearDepth();
 
-      // Render axis arrows with the camera-synced gizmo camera
+      // Render axis arrows with the camera-synced gizmo camera.
+      // autoClear stays false (set once at init) so this render does NOT
+      // wipe the main scene's color buffer in the gizmo scissor region —
+      // the mesh stays visible behind the transparent gizmo.
       renderer.render(gizmoSceneRef.current, gizmoCameraRef.current);
 
       // Render the orbit ring + free sphere with the fixed ring camera
       // (so the white circle never rotates — always faces the viewer)
-      renderer.autoClear = false;
       renderer.clearDepth();
       renderer.render(gizmoRingSceneRef.current, gizmoRingCameraRef.current);
-      renderer.autoClear = true;
+
+      // Render lighting gizmo to the left of the navigation gizmo (half size, centered)
+      const lgs = lightGizmoSizeRef.current;
+      const lgGap = 32; // 2em gap between the two gizmos
+      // Center vertically with the navigation gizmo
+      const lgY = h - gs - pad + (gs - lgs) / 2;
+      const lgX = w - gs - pad - lgs - lgGap;
+      // Enlarge both viewport and scissor so the oversized icon isn't clipped.
+      // The render camera already has a pre-scaled frustum (set once at init),
+      // so the ring stays the same visual size — no per-frame frustum mutation.
+      const scissorPad = lgs * 3;
+      const vpW = lgs + scissorPad * 2;
+      const vpH = lgs + scissorPad * 2;
+      const vpX = lgX - scissorPad;
+      const vpY = lgY - scissorPad;
+      renderer.setViewport(vpX, vpY, vpW, vpH);
+      renderer.setScissor(vpX, vpY, vpW, vpH);
+      renderer.clearDepth();
+      renderer.render(lightGizmoSceneRef.current, lightGizmoRenderCamRef.current);
 
       renderer.setScissorTest(false);
     };
@@ -271,43 +532,110 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh }, ref) {
       if (!container) return;
       const w = container.clientWidth;
       const h = container.clientHeight;
-      camera.aspect = w / h;
-      camera.updateProjectionMatrix();
+      const aspect = w / h;
+      const orthoSize = 5;
+      // Screen-space scene offset in world units (SCENE_OFFSET_PX converted).
+      sceneOffsetXRef.current = SCENE_OFFSET_PX * (2 * orthoSize * aspect) / w;
+      sceneOffsetYRef.current = 0;
+      // Update perspective camera (shift content right by SCENE_OFFSET_PX)
+      perspCameraRef.current.aspect = aspect;
+      perspCameraRef.current.setViewOffset(w + 2 * SCENE_OFFSET_PX, h, 0, 0, w, h);
+      perspCameraRef.current.updateProjectionMatrix();
+      // Update ortho camera with zoom-aware frustum shift.
+      // The offset is divided by zoom so NDC stays constant as zoom changes.
+      const z = orthoCameraRef.current.zoom;
+      const sx = sceneOffsetXRef.current / z;
+      const sy = sceneOffsetYRef.current / z;
+      orthoCameraRef.current.left = -orthoSize * aspect - sx;
+      orthoCameraRef.current.right = orthoSize * aspect - sx;
+      orthoCameraRef.current.top = orthoSize + sy;
+      orthoCameraRef.current.bottom = -orthoSize + sy;
+      orthoCameraRef.current.updateProjectionMatrix();
+      lastOrthoZoomRef.current = z;
       renderer.setSize(w, h);
     };
     window.addEventListener('resize', handleResize);
 
     // ── Gizmo interaction ──
+    // Pre-allocated reusable objects to avoid per-pointermove allocations
+    const pickNDC = new THREE.Vector2();
+    const lightPickArray = [null, null, null]; // filled with refs at pick time
+    const freeSpherePickArray = [null];
+
     const getGizmoNDC = (e) => {
       const rect = renderer.domElement.getBoundingClientRect();
       const gs = gizmoSizeRef.current;
-      // Gizmo region: top-right, from (w-gs, 0) to (w, gs) in screen coords
-      const gx = rect.right - gs;
-      const gy = rect.top; // top of canvas
-      const ndc = new THREE.Vector2(
+      const pad = 12;
+      // Gizmo region: shifted down-left by pad from top-right corner
+      const gx = rect.right - gs - pad;
+      const gy = rect.top + pad;
+      pickNDC.set(
         ((e.clientX - gx) / gs) * 2 - 1,
         -((e.clientY - gy) / gs) * 2 + 1
       );
-      return ndc;
+      return pickNDC;
     };
 
     const isPointInGizmoRegion = (e) => {
       const rect = renderer.domElement.getBoundingClientRect();
       const gs = gizmoSizeRef.current;
-      return e.clientX >= rect.right - gs && e.clientX <= rect.right &&
-             e.clientY >= rect.top && e.clientY <= rect.top + gs;
+      const pad = 12;
+      return e.clientX >= rect.right - gs - pad && e.clientX <= rect.right - pad &&
+             e.clientY >= rect.top + pad && e.clientY <= rect.top + gs + pad;
+    };
+
+    // Lighting gizmo region (left of the navigation gizmo, half size, centered)
+    const getLightGizmoNDC = (e) => {
+      const rect = renderer.domElement.getBoundingClientRect();
+      const gs = gizmoSizeRef.current;
+      const lgs = lightGizmoSizeRef.current;
+      const pad = 12;
+      const gap = 32; // 2em gap between the two gizmos
+      const lgY = rect.top + pad + (gs - lgs) / 2;
+      const gx = rect.right - gs - pad - lgs - gap;
+      const gy = lgY;
+      pickNDC.set(
+        ((e.clientX - gx) / lgs) * 2 - 1,
+        -((e.clientY - gy) / lgs) * 2 + 1
+      );
+      return pickNDC;
+    };
+
+    const isPointInLightGizmoRegion = (e) => {
+      const rect = renderer.domElement.getBoundingClientRect();
+      const gs = gizmoSizeRef.current;
+      const lgs = lightGizmoSizeRef.current;
+      const pad = 12;
+      const gap = 32; // 2em gap between the two gizmos
+      const lgY = rect.top + pad + (gs - lgs) / 2;
+      const lx = rect.right - gs - pad - lgs - gap;
+      return e.clientX >= lx && e.clientX <= lx + lgs &&
+             e.clientY >= lgY && e.clientY <= lgY + lgs;
     };
 
     const pickGizmo = (e) => {
+      // Check lighting gizmo first (it's to the left)
+      if (isPointInLightGizmoRegion(e)) {
+        const ndc = getLightGizmoNDC(e);
+        raycasterRef.current.setFromCamera(ndc, lightGizmoCameraRef.current);
+        lightPickArray[0] = lightGizmoRingRef.current;
+        lightPickArray[1] = lightGizmoIconRef.current;
+        lightPickArray[2] = lightGizmoFillRef.current;
+        const lightIntersects = raycasterRef.current.intersectObjects(lightPickArray, false);
+        if (lightIntersects.length > 0) return lightIntersects[0].object;
+        // Fallback: if inside the gizmo region but ray missed, return the fill sphere
+        return lightGizmoFillRef.current;
+      }
       if (!isPointInGizmoRegion(e)) return null;
       const ndc = getGizmoNDC(e);
-      // Pick axis cones with the synced gizmo camera
+      // Pick axis sprites + lines with the synced gizmo camera
       raycasterRef.current.setFromCamera(ndc, gizmoCameraRef.current);
-      const axisIntersects = raycasterRef.current.intersectObjects([...gizmoRingsRef.current, ...gizmoAxisLinesRef.current], false);
+      const axisIntersects = raycasterRef.current.intersectObjects(gizmoPickArrayRef.current, false);
       if (axisIntersects.length > 0) return axisIntersects[0].object;
       // Pick orbit ring + free sphere with the fixed ring camera
       raycasterRef.current.setFromCamera(ndc, gizmoRingCameraRef.current);
-      const ringIntersects = raycasterRef.current.intersectObjects([gizmoOrbitRingRef.current, gizmoFreeSphereRef.current], false);
+      freeSpherePickArray[0] = gizmoFreeSphereRef.current;
+      const ringIntersects = raycasterRef.current.intersectObjects(freeSpherePickArray, false);
       return ringIntersects.length > 0 ? ringIntersects[0].object : null;
     };
 
@@ -322,24 +650,24 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh }, ref) {
       // Reset previous hover
       if (hoveredRingRef.current) {
         const prev = hoveredRingRef.current;
-        if (prev.userData.type === 'orbit') {
+        if (prev.userData.type === 'light') {
           setRingThickness(prev, prev.userData.baseTube);
           prev.material.opacity = prev.userData.baseOpacity;
         } else if (prev.userData.type === 'axis') {
           prev.material.opacity = prev.userData.baseOpacity;
-          // Also reset the corresponding line
+          // Reset the corresponding line
           const line = gizmoAxisLinesRef.current.find((l) => l.userData.label === prev.userData.label);
           if (line) line.material.opacity = line.userData.baseOpacity;
         }
       }
       hoveredRingRef.current = obj;
       if (obj) {
-        if (obj.userData.type === 'orbit') {
+        if (obj.userData.type === 'light') {
           setRingThickness(obj, obj.userData.hoverTube);
           obj.material.opacity = obj.userData.hoverOpacity;
         } else if (obj.userData.type === 'axis') {
           obj.material.opacity = obj.userData.hoverOpacity;
-          // Also brighten the corresponding line
+          // Brighten the corresponding line
           const line = gizmoAxisLinesRef.current.find((l) => l.userData.label === obj.userData.label);
           if (line) line.material.opacity = line.userData.hoverOpacity;
         }
@@ -376,8 +704,9 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh }, ref) {
       // will snap the view on pointerup.
       const rect = renderer.domElement.getBoundingClientRect();
       const gs = gizmoSizeRef.current;
-      const cx = rect.right - gs / 2;
-      const cy = rect.top + gs / 2;
+      const pad = 12;
+      const cx = rect.right - gs / 2 - pad;
+      const cy = rect.top + gs / 2 + pad;
       const startAngle = Math.atan2(e.clientY - cy, e.clientX - cx);
 
       gizmoInteractionRef.current = {
@@ -390,16 +719,49 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh }, ref) {
         lastX: e.clientX,
         lastY: e.clientY,
         moved: false,
+        // For free rotation: capture initial offset & up, accumulate total rotation
+        startOffset: type === 'free' && cameraRef.current && controlsRef.current
+          ? cameraRef.current.position.clone().sub(controlsRef.current.target)
+          : null,
+        startUp: (() => {
+          if (type !== 'free' || !cameraRef.current || !controlsRef.current) return null;
+          const up = cameraRef.current.up.clone();
+          // Orthogonalize up against the view direction so the cross product
+          // for the camera right vector can never collapse (prevents gimbal lock).
+          const fwd = cameraRef.current.position.clone().sub(controlsRef.current.target).negate().normalize();
+          const d = up.dot(fwd);
+          up.sub(fwd.multiplyScalar(d)).normalize();
+          return up;
+        })(),
+        totalQuat: new THREE.Quaternion(),
       };
 
       // Disable orbit controls while dragging gizmo
       controlsRef.current.enabled = false;
     };
 
+    // Reused temp objects for free rotation (avoid per-frame allocation)
+    const freeWorldY = new THREE.Vector3(0, 1, 0);
+    const freeTmpQuatY = new THREE.Quaternion();
+    const freeTmpQuatX = new THREE.Quaternion();
+    const freeTmpOffset = new THREE.Vector3();
+    const freeTmpUp = new THREE.Vector3();
+    const freeTmpForward = new THREE.Vector3();
+    const freeTmpRight = new THREE.Vector3();
+
+    // Reused temp objects for light gizmo (avoid per-frame allocation)
+    const lightTmpPos = new THREE.Vector3();
+    const lightTmpQuat = new THREE.Quaternion();
+
+    // Reused temp objects for axis drag (avoid per-frame allocation)
+    const axisTmpTarget = new THREE.Vector3();
+    const axisTmpOffset = new THREE.Vector3();
+    const axisTmpQuat = new THREE.Quaternion();
+
     const handlePointerMove = (e) => {
       if (gizmoInteractionRef.current) {
         // Dragging
-        const { type, dir, startAngle, startX, startY, lastX, lastY } = gizmoInteractionRef.current;
+        const { type, dir, startAngle, startX, startY, lastX, lastY, startUp, startOffset, totalQuat } = gizmoInteractionRef.current;
         const mainCam = cameraRef.current;
         const mainControls = controlsRef.current;
         if (!mainCam || !mainControls) return;
@@ -410,63 +772,80 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh }, ref) {
           gizmoInteractionRef.current.moved = true;
         }
 
-        const target = mainControls.target.clone();
-        const offset = mainCam.position.clone().sub(target);
+        const target = axisTmpTarget.copy(mainControls.target);
+        const offset = axisTmpOffset.copy(mainCam.position).sub(target);
 
         if (type === 'axis') {
-          // Dial approach: measure the absolute angle of the mouse around the
-          // gizmo center using atan2, then take the delta from the previous frame.
-          const rect = renderer.domElement.getBoundingClientRect();
-          const gs = gizmoSizeRef.current;
-          const cx = rect.right - gs / 2;
-          const cy = rect.top + gs / 2;
-          const currentAngle = Math.atan2(e.clientY - cy, e.clientX - cx);
-          const prevAngle = gizmoInteractionRef.current.lastAngle;
-          let deltaAngle = currentAngle - prevAngle;
-          // Wrap to [-PI, PI] for smooth crossing of the ±PI boundary
-          while (deltaAngle > Math.PI) deltaAngle -= 2 * Math.PI;
-          while (deltaAngle < -Math.PI) deltaAngle += 2 * Math.PI;
-
-          const quat = new THREE.Quaternion().setFromAxisAngle(dir.clone(), deltaAngle);
-          // Rotate both the camera position offset AND the up vector together
-          // so the view doesn't flip when rotating around X or Y axes.
-          offset.applyQuaternion(quat);
-          mainCam.up.applyQuaternion(quat);
+          // Linear: only vertical (Y) mouse movement rotates around the clicked axis.
+          const dy = e.clientY - lastY;
+          const sensitivity = 0.01;
+          axisTmpQuat.setFromAxisAngle(dir, dy * sensitivity);
+          offset.applyQuaternion(axisTmpQuat);
+          mainCam.up.applyQuaternion(axisTmpQuat);
           mainCam.position.copy(target).add(offset);
           mainCam.lookAt(target);
           mainControls.update();
-          gizmoInteractionRef.current.lastAngle = currentAngle;
-        } else if (type === 'orbit') {
-          // Outer ring: orbit camera around world Z (up axis — yaw)
-          const rect = renderer.domElement.getBoundingClientRect();
-          const gs = gizmoSizeRef.current;
-          const cx = rect.right - gs / 2;
-          const cy = rect.top + gs / 2;
-          const currentAngle = Math.atan2(e.clientY - cy, e.clientX - cx);
-          const deltaAngle = currentAngle - startAngle;
-          const quat = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), deltaAngle);
-          offset.applyQuaternion(quat);
-          mainCam.position.copy(target).add(offset);
-          mainCam.lookAt(target);
-          mainControls.update();
-          gizmoInteractionRef.current.startAngle = currentAngle;
+          gizmoInteractionRef.current.lastX = e.clientX;
+          gizmoInteractionRef.current.lastY = e.clientY;
+        } else if (type === 'light') {
+          // Lighting gizmo: linear Y mouse movement orbits the directional light around the model.
+          const dy = e.clientY - lastY;
+          const sensitivity = 0.015;
+          const light = dirLight1Ref.current;
+          if (light) {
+            lightTmpPos.copy(light.position);
+            lightTmpQuat.setFromAxisAngle(freeWorldY, dy * sensitivity);
+            lightTmpPos.applyQuaternion(lightTmpQuat);
+            light.position.copy(lightTmpPos);
+          }
+          gizmoInteractionRef.current.lastX = e.clientX;
+          gizmoInteractionRef.current.lastY = e.clientY;
         } else if (type === 'free') {
-          // Inner area: free tumble (horizontal → Z yaw, vertical → X pitch)
+          // Free tumble using an accumulated quaternion.
+          // Each frame we derive camera state from the INITIAL offset/up + totalQuat,
+          // so there is zero accumulation error (no drift, no violent spinning).
+          // Yaw is applied around world Y; pitch around the camera's current right
+          // (derived from the accumulated rotation, not from a stale matrix).
           const dx = e.clientX - lastX;
           const dy = e.clientY - lastY;
-          const quatY = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), dx * 0.01);
-          const quatX = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), dy * 0.01);
-          offset.applyQuaternion(quatY).applyQuaternion(quatX);
+          const sens = 0.015;
+
+          // 1. Apply yaw around world Y (premultiply = world-space rotation)
+          if (dx !== 0) {
+            freeTmpQuatY.setFromAxisAngle(freeWorldY, -dx * sens);
+            totalQuat.premultiply(freeTmpQuatY);
+          }
+
+          // 2. Compute the camera's current right vector from the accumulated rotation
+          //    (only needed if we have vertical movement for pitch)
+          if (dy !== 0) {
+            freeTmpOffset.copy(startOffset).applyQuaternion(totalQuat);
+            freeTmpUp.copy(startUp).applyQuaternion(totalQuat);
+            freeTmpForward.copy(freeTmpOffset).negate().normalize();
+            freeTmpRight.crossVectors(freeTmpForward, freeTmpUp).normalize();
+
+            // 3. Apply pitch around that right vector (premultiply = world-space rotation)
+            freeTmpQuatX.setFromAxisAngle(freeTmpRight, -dy * sens);
+            totalQuat.premultiply(freeTmpQuatX);
+          }
+
+          // 4. Derive final camera state from initial state + totalQuat
+          //    Reuse freeTmpUp (already holds startUp*totalQuat if dy!=0)
+          offset.copy(startOffset).applyQuaternion(totalQuat);
           mainCam.position.copy(target).add(offset);
+          if (dy === 0) freeTmpUp.copy(startUp).applyQuaternion(totalQuat);
+          mainCam.up.copy(freeTmpUp);
           mainCam.lookAt(target);
-          mainControls.update();
+          // Note: controls.update() is called by the animation loop every frame,
+          // which syncs OrbitControls' internal spherical state. No need to call
+          // it here — that was causing redundant per-pointermove work.
           gizmoInteractionRef.current.lastX = e.clientX;
           gizmoInteractionRef.current.lastY = e.clientY;
         }
       } else {
         // Hover detection
         const hit = pickGizmo(e);
-        if (hit && (hit.userData.type === 'axis' || hit.userData.type === 'orbit')) {
+        if (hit && (hit.userData.type === 'axis' || hit.userData.type === 'light')) {
           applyHover(hit);
           renderer.domElement.style.cursor = 'pointer';
         } else if (hit && hit.userData.type === 'free') {
@@ -499,11 +878,14 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh }, ref) {
     // ── Cleanup ──
     return () => {
       window.removeEventListener('resize', handleResize);
+      window.removeEventListener('keydown', handleKeyDown);
+      window.removeEventListener('keyup', handleKeyUp);
+      window.removeEventListener('blur', handleBlur);
       renderer.domElement.removeEventListener('pointerdown', handlePointerDown);
       window.removeEventListener('pointermove', handlePointerMove);
       window.removeEventListener('pointerup', handlePointerUp);
       if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current);
-      controls.dispose();
+      controlsRef.current?.dispose();
       renderer.dispose();
       if (renderer.domElement && container.contains(renderer.domElement)) {
         container.removeChild(renderer.domElement);
@@ -516,22 +898,33 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh }, ref) {
           else obj.material.dispose();
         }
       });
-      // Dispose gizmo axis scene
+      // Dispose gizmo axis scene (including sprite textures)
       axisScene.traverse((obj) => {
         if (obj.geometry) obj.geometry.dispose();
-        if (obj.material) obj.material.dispose();
+        if (obj.material) {
+          if (obj.material.map) obj.material.map.dispose();
+          obj.material.dispose();
+        }
       });
       // Dispose gizmo ring scene
       ringScene.traverse((obj) => {
         if (obj.geometry) obj.geometry.dispose();
         if (obj.material) obj.material.dispose();
       });
+      // Dispose lighting gizmo scene
+      lightScene.traverse((obj) => {
+        if (obj.geometry) obj.geometry.dispose();
+        if (obj.material) {
+          if (obj.material.map) obj.material.map.dispose();
+          obj.material.dispose();
+        }
+      });
     };
   }, []);
 
   // Expose methods to parent via ref
   useImperativeHandle(ref, () => ({
-    captureThumbnail(size = 75) {
+    captureThumbnail(size = 75, rotation = null) {
       const mainCamera = cameraRef.current;
       const mesh = currentMeshRef.current;
       if (!mainCamera || !mesh) return null;
@@ -554,14 +947,20 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh }, ref) {
       const thumbScene = new THREE.Scene();
       const thumbCamera = new THREE.PerspectiveCamera(45, 1, 0.1, 1000);
 
-      // Lights so the grey material is visible
-      const ambient = new THREE.AmbientLight(0xffffff, 0.6);
+      // Lights so the grey material is visible — brighter, multi-directional
+      const ambient = new THREE.AmbientLight(0xffffff, 1.0);
       thumbScene.add(ambient);
-      const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
-      dirLight.position.set(5, 10, 7);
-      thumbScene.add(dirLight);
+      const dirLight1 = new THREE.DirectionalLight(0xffffff, 1.2);
+      dirLight1.position.set(5, 10, 7);
+      thumbScene.add(dirLight1);
+      const dirLight2 = new THREE.DirectionalLight(0xffffff, 0.8);
+      dirLight2.position.set(-5, -3, -7);
+      thumbScene.add(dirLight2);
+      const dirLight3 = new THREE.DirectionalLight(0xffffff, 0.5);
+      dirLight3.position.set(0, -8, 5);
+      thumbScene.add(dirLight3);
 
-      // Clone the mesh with grey material (no textures)
+      // Clone the mesh with normal-map material
       const thumbMesh = mesh.clone(true);
       thumbMesh.traverse((child) => {
         if (child.isMesh) {
@@ -569,10 +968,7 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh }, ref) {
             if (Array.isArray(child.material)) child.material.forEach((m) => m.dispose());
             else child.material.dispose();
           }
-          child.material = new THREE.MeshStandardMaterial({
-            color: 0x9ca3af,
-            metalness: 0.1,
-            roughness: 0.8,
+          child.material = new THREE.MeshNormalMaterial({
             side: THREE.DoubleSide,
           });
         }
@@ -588,18 +984,35 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh }, ref) {
       // Reposition the thumb mesh so its bounding box is centered at origin
       thumbMesh.position.sub(center);
 
-      // Match the main camera's view direction and up vector
-      const viewDir = new THREE.Vector3();
-      mainCamera.getWorldDirection(viewDir);
+      // Determine view direction: use explicit rotation if provided,
+      // otherwise match the main camera's current view direction.
       const distance = (maxDim / 2) / Math.tan((thumbCamera.fov * Math.PI / 180) / 2) * 1.4;
-      thumbCamera.position.copy(viewDir.clone().multiplyScalar(-distance));
-      thumbCamera.up.copy(mainCamera.up);
-      thumbCamera.lookAt(0, 0, 0);
+      if (rotation) {
+        // Apply the requested rotation to the thumb camera directly
+        thumbCamera.rotation.set(
+          THREE.MathUtils.degToRad(rotation.x || 0),
+          THREE.MathUtils.degToRad(rotation.y || 0),
+          THREE.MathUtils.degToRad(rotation.z || 0),
+        );
+        thumbCamera.updateMatrixWorld();
+        const viewDir = new THREE.Vector3(0, 0, -1);
+        viewDir.applyQuaternion(thumbCamera.quaternion);
+        thumbCamera.position.copy(viewDir.clone().multiplyScalar(-distance));
+        thumbCamera.up.set(0, 1, 0);
+        thumbCamera.lookAt(0, 0, 0);
+      } else {
+        // Match the main camera's view direction and up vector
+        const viewDir = new THREE.Vector3();
+        mainCamera.getWorldDirection(viewDir);
+        thumbCamera.position.copy(viewDir.clone().multiplyScalar(-distance));
+        thumbCamera.up.copy(mainCamera.up);
+        thumbCamera.lookAt(0, 0, 0);
+      }
       thumbCamera.updateProjectionMatrix();
 
       // Render
       thumbRenderer.render(thumbScene, thumbCamera);
-      const dataUrl = thumbCanvas.toDataURL('image/jpeg', 0.85);
+      const dataUrl = thumbCanvas.toDataURL('image/png');
 
       // Cleanup
       thumbScene.traverse((obj) => {
@@ -611,6 +1024,9 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh }, ref) {
       });
       thumbRenderer.dispose();
       thumbRenderer.forceContextLoss();
+      // Destroy the hidden canvas
+      thumbCanvas.remove();
+      thumbRenderer.domElement = null;
 
       return dataUrl;
     },
@@ -631,6 +1047,452 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh }, ref) {
 
     getControls() {
       return controlsRef.current;
+    },
+
+    setCameraRotation(rotation) {
+      const camera = cameraRef.current;
+      const controls = controlsRef.current;
+      if (!camera || !controls) return;
+      camera.rotation.set(
+        THREE.MathUtils.degToRad(rotation.x || 0),
+        THREE.MathUtils.degToRad(rotation.y || 0),
+        THREE.MathUtils.degToRad(rotation.z || 0),
+      );
+      camera.updateMatrixWorld();
+      // Reposition so the camera still looks at world origin after rotation
+      const forward = new THREE.Vector3(0, 0, -1);
+      forward.applyQuaternion(camera.quaternion);
+      const dist = camera.position.length() || 8;
+      camera.position.copy(forward).multiplyScalar(-dist);
+      controls.target.set(0, 0, 0);
+      controls.update();
+    },
+
+    setProjectionMode(mode) {
+      const perspCam = perspCameraRef.current;
+      const orthoCam = orthoCameraRef.current;
+      const renderer = rendererRef.current;
+      const container = containerRef.current;
+      if (!perspCam || !orthoCam || !renderer || !container) return;
+
+      // Dispose old controls
+      const oldControls = controlsRef.current;
+      if (oldControls) oldControls.dispose();
+
+      if (mode === 'orthographic') {
+        // Copy current perspective camera orientation to ortho
+        orthoCam.position.copy(perspCam.position);
+        orthoCam.rotation.copy(perspCam.rotation);
+        orthoCam.up.copy(perspCam.up);
+        // Update ortho frustum to match container aspect, with zoom-aware
+        // scene offset shift (offset is divided by zoom so NDC stays constant)
+        const aspect = container.clientWidth / container.clientHeight;
+        const orthoSize = 5;
+        const z = orthoCam.zoom || 1;
+        const sx = sceneOffsetXRef.current / z;
+        const sy = sceneOffsetYRef.current / z;
+        orthoCam.left = -orthoSize * aspect - sx;
+        orthoCam.right = orthoSize * aspect - sx;
+        orthoCam.top = orthoSize + sy;
+        orthoCam.bottom = -orthoSize + sy;
+        orthoCam.updateProjectionMatrix();
+        lastOrthoZoomRef.current = z;
+        // Switch camera ref
+        cameraRef.current = orthoCam;
+      } else {
+        // Copy current ortho camera orientation to perspective
+        perspCam.position.copy(orthoCam.position);
+        perspCam.rotation.copy(orthoCam.rotation);
+        perspCam.up.copy(orthoCam.up);
+        // Ensure perspective view offset is applied (set at init/resize)
+        const vw = container.clientWidth;
+        const vh = container.clientHeight;
+        perspCam.setViewOffset(vw + 2 * SCENE_OFFSET_PX, vh, 0, 0, vw, vh);
+        perspCam.updateProjectionMatrix();
+        // Switch camera ref
+        cameraRef.current = perspCam;
+      }
+
+      // Create new controls bound to the active camera
+      const newControls = new OrbitControls(cameraRef.current, renderer.domElement);
+      newControls.enableDamping = false;
+      newControls.rotateSpeed = 1.0;
+      newControls.mouseButtons = {
+        LEFT: null,
+        MIDDLE: THREE.MOUSE.ROTATE,
+        RIGHT: THREE.MOUSE.PAN,
+      };
+      newControls.target.set(0, 0, 0);
+      newControls.update();
+      controlsRef.current = newControls;
+    },
+
+    /**
+     * Generate a 1024x1024 depth map from the current camera view.
+     * Returns a PNG data URL with a black background.
+     */
+    captureDepthMap(size = 1024, rotation = null) {
+      const mainCamera = cameraRef.current;
+      const mesh = currentMeshRef.current;
+      if (!mainCamera || !mesh) return null;
+
+      // Create a hidden canvas for offscreen depth rendering
+      const hiddenCanvas = document.createElement('canvas');
+      hiddenCanvas.width = size;
+      hiddenCanvas.height = size;
+      hiddenCanvas.style.display = 'none';
+      document.body.appendChild(hiddenCanvas);
+
+      const depthRenderer = new THREE.WebGLRenderer({
+        canvas: hiddenCanvas,
+        antialias: false,
+        alpha: false,
+        preserveDrawingBuffer: true,
+      });
+      depthRenderer.setPixelRatio(1);
+      depthRenderer.setSize(size, size);
+      depthRenderer.setClearColor(0x000000, 1);
+
+      const depthScene = new THREE.Scene();
+      depthScene.background = new THREE.Color(0x000000);
+
+      // Clone the mesh with depth material
+      const depthMesh = mesh.clone(true);
+      depthMesh.traverse((child) => {
+        if (child.isMesh) {
+          if (child.material) {
+            if (Array.isArray(child.material)) child.material.forEach((m) => m.dispose());
+            else child.material.dispose();
+          }
+          child.material = new THREE.MeshDepthMaterial({
+            depthPacking: THREE.BasicDepthPacking,
+            side: THREE.DoubleSide,
+          });
+        }
+      });
+      depthScene.add(depthMesh);
+
+      // Compute bounding box
+      const box = new THREE.Box3().setFromObject(depthMesh);
+      const center = box.getCenter(new THREE.Vector3());
+      const size3 = box.getSize(new THREE.Vector3());
+      const maxDim = Math.max(size3.x, size3.y, size3.z) || 1;
+      depthMesh.position.sub(center);
+
+      const depthCamera = new THREE.PerspectiveCamera(45, 1, 0.1, 1000);
+      const distance = (maxDim / 2) / Math.tan((depthCamera.fov * Math.PI / 180) / 2) * 1.4;
+
+      if (rotation) {
+        depthCamera.rotation.set(
+          THREE.MathUtils.degToRad(rotation.x || 0),
+          THREE.MathUtils.degToRad(rotation.y || 0),
+          THREE.MathUtils.degToRad(rotation.z || 0),
+        );
+        depthCamera.updateMatrixWorld();
+        const viewDir = new THREE.Vector3(0, 0, -1);
+        viewDir.applyQuaternion(depthCamera.quaternion);
+        depthCamera.position.copy(viewDir.clone().multiplyScalar(-distance));
+        depthCamera.up.set(0, 1, 0);
+        depthCamera.lookAt(0, 0, 0);
+      } else {
+        const viewDir = new THREE.Vector3();
+        mainCamera.getWorldDirection(viewDir);
+        depthCamera.position.copy(viewDir.clone().multiplyScalar(-distance));
+        depthCamera.up.copy(mainCamera.up);
+        depthCamera.lookAt(0, 0, 0);
+      }
+
+      // Tighten near/far planes around the mesh so depth values span the full 0–1 range
+      depthCamera.near = distance - maxDim;
+      depthCamera.far = distance + maxDim;
+      depthCamera.updateProjectionMatrix();
+
+      depthRenderer.render(depthScene, depthCamera);
+      const dataUrl = hiddenCanvas.toDataURL('image/png');
+
+      // Cleanup: dispose renderer, lose WebGL context, remove hidden canvas
+      depthScene.traverse((obj) => {
+        if (obj.geometry) obj.geometry.dispose();
+        if (obj.material) {
+          if (Array.isArray(obj.material)) obj.material.forEach((m) => m.dispose());
+          else obj.material.dispose();
+        }
+      });
+      depthRenderer.dispose();
+      depthRenderer.forceContextLoss();
+      hiddenCanvas.remove();
+
+      return dataUrl;
+    },
+
+    /**
+     * Project a generated image onto the mesh UV map based on the camera angle.
+     * Returns a PNG data URL of the UV map with the projected texture.
+     * The UV map canvas is the same size as the generated image (1024x1024).
+     */
+    projectImageToUvMap(imageDataUrl, rotation = null, uvMapSize = 1024) {
+      const mainRenderer = rendererRef.current;
+      const mesh = currentMeshRef.current;
+      const mainCamera = cameraRef.current;
+      if (!mainRenderer || !mesh || !mainCamera) return null;
+
+      // Use a render target on the existing renderer — no extra WebGL contexts
+      const renderTarget = new THREE.WebGLRenderTarget(uvMapSize, uvMapSize, {
+        format: THREE.RGBAFormat,
+        type: THREE.UnsignedByteType,
+        minFilter: THREE.NearestFilter,
+        magFilter: THREE.NearestFilter,
+      });
+
+      const uvScene = new THREE.Scene();
+      uvScene.background = new THREE.Color(0x000000);
+
+      // Clone mesh with a shader that encodes UV as RGB
+      const uvMesh = mesh.clone(true);
+      uvMesh.traverse((child) => {
+        if (child.isMesh) {
+          if (child.material) {
+            if (Array.isArray(child.material)) child.material.forEach((m) => m.dispose());
+            else child.material.dispose();
+          }
+          child.material = new THREE.ShaderMaterial({
+            vertexShader: `
+              varying vec2 vUv;
+              void main() {
+                vUv = uv;
+                gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+              }
+            `,
+            fragmentShader: `
+              varying vec2 vUv;
+              void main() {
+                gl_FragColor = vec4(vUv.x, vUv.y, 0.0, 1.0);
+              }
+            `,
+            side: THREE.DoubleSide,
+          });
+        }
+      });
+      uvScene.add(uvMesh);
+
+      // Compute bounding box
+      const box = new THREE.Box3().setFromObject(uvMesh);
+      const center = box.getCenter(new THREE.Vector3());
+      const size3 = box.getSize(new THREE.Vector3());
+      const maxDim = Math.max(size3.x, size3.y, size3.z) || 1;
+      uvMesh.position.sub(center);
+
+      const uvCamera = new THREE.PerspectiveCamera(45, 1, 0.1, 1000);
+      const distance = (maxDim / 2) / Math.tan((uvCamera.fov * Math.PI / 180) / 2) * 1.4;
+
+      if (rotation) {
+        uvCamera.rotation.set(
+          THREE.MathUtils.degToRad(rotation.x || 0),
+          THREE.MathUtils.degToRad(rotation.y || 0),
+          THREE.MathUtils.degToRad(rotation.z || 0),
+        );
+        uvCamera.updateMatrixWorld();
+        const viewDir = new THREE.Vector3(0, 0, -1);
+        viewDir.applyQuaternion(uvCamera.quaternion);
+        uvCamera.position.copy(viewDir.clone().multiplyScalar(-distance));
+        uvCamera.up.set(0, 1, 0);
+        uvCamera.lookAt(0, 0, 0);
+      } else {
+        const viewDir = new THREE.Vector3();
+        mainCamera.getWorldDirection(viewDir);
+        uvCamera.position.copy(viewDir.clone().multiplyScalar(-distance));
+        uvCamera.up.copy(mainCamera.up);
+        uvCamera.lookAt(0, 0, 0);
+      }
+      uvCamera.updateProjectionMatrix();
+
+      // Render UV-encoded scene to the render target and read back pixels
+      mainRenderer.setRenderTarget(renderTarget);
+      mainRenderer.setClearColor(0x000000, 1);
+      mainRenderer.clear();
+      mainRenderer.render(uvScene, uvCamera);
+
+      const uvEncodedData = new Uint8Array(uvMapSize * uvMapSize * 4);
+      mainRenderer.readRenderTargetPixels(renderTarget, 0, 0, uvMapSize, uvMapSize, uvEncodedData);
+
+      // Restore main render target
+      mainRenderer.setRenderTarget(null);
+
+      // Cleanup UV scene
+      uvScene.traverse((obj) => {
+        if (obj.geometry) obj.geometry.dispose();
+        if (obj.material) {
+          if (Array.isArray(obj.material)) obj.material.forEach((m) => m.dispose());
+          else obj.material.dispose();
+        }
+      });
+      renderTarget.dispose();
+
+      // Create the UV map canvas
+      const uvCanvas = document.createElement('canvas');
+      uvCanvas.width = uvMapSize;
+      uvCanvas.height = uvMapSize;
+      const uvCtx = uvCanvas.getContext('2d');
+      uvCtx.fillStyle = '#000000';
+      uvCtx.fillRect(0, 0, uvMapSize, uvMapSize);
+
+      // Load the generated image and paint onto the UV map
+      const genImg = new Image();
+      genImg.src = imageDataUrl;
+
+      return new Promise((resolve) => {
+        genImg.onload = () => {
+          const genCanvas = document.createElement('canvas');
+          genCanvas.width = uvMapSize;
+          genCanvas.height = uvMapSize;
+          const genCtx = genCanvas.getContext('2d');
+          genCtx.drawImage(genImg, 0, 0, uvMapSize, uvMapSize);
+          const genData = genCtx.getImageData(0, 0, uvMapSize, uvMapSize).data;
+
+          const uvImageData = uvCtx.createImageData(uvMapSize, uvMapSize);
+          const uvPixels = uvImageData.data;
+
+          // For each pixel in the UV-encoded render (flipped Y for canvas coords),
+          // paint the corresponding generated image pixel onto the UV map at the UV coordinates
+          for (let y = 0; y < uvMapSize; y++) {
+            // WebGL origin is bottom-left, canvas is top-left — flip Y
+            const srcY = uvMapSize - 1 - y;
+            for (let x = 0; x < uvMapSize; x++) {
+              const encIdx = (srcY * uvMapSize + x) * 4;
+              const r = uvEncodedData[encIdx];
+              const g = uvEncodedData[encIdx + 1];
+
+              // Skip black pixels (background)
+              if (r === 0 && g === 0) continue;
+
+              const u = r / 255;
+              const v = g / 255;
+
+              // Sample generated image at (u, v)
+              const genX = Math.floor(u * uvMapSize);
+              const genY = Math.floor((1 - v) * uvMapSize);
+              if (genX < 0 || genX >= uvMapSize || genY < 0 || genY >= uvMapSize) continue;
+
+              const genIdx = (genY * uvMapSize + genX) * 4;
+
+              // Paint onto UV map at (u, v)
+              const uvX = Math.floor(u * uvMapSize);
+              const uvY = Math.floor((1 - v) * uvMapSize);
+              if (uvX < 0 || uvX >= uvMapSize || uvY < 0 || uvY >= uvMapSize) continue;
+
+              const uvIdx = (uvY * uvMapSize + uvX) * 4;
+              uvPixels[uvIdx] = genData[genIdx];
+              uvPixels[uvIdx + 1] = genData[genIdx + 1];
+              uvPixels[uvIdx + 2] = genData[genIdx + 2];
+              uvPixels[uvIdx + 3] = 255;
+            }
+          }
+
+          uvCtx.putImageData(uvImageData, 0, 0);
+          resolve(uvCanvas.toDataURL('image/png'));
+        };
+        genImg.onerror = () => resolve(null);
+      });
+    },
+
+    /**
+     * Get the current mesh's geometry for UV map operations.
+     */
+    getMeshGeometry() {
+      const mesh = currentMeshRef.current;
+      if (!mesh) return null;
+      let geometry = null;
+      mesh.traverse((child) => {
+        if (child.isMesh && !geometry) geometry = child.geometry;
+      });
+      return geometry;
+    },
+
+    /**
+     * Update the mesh material to use combined UV map textures from layers.
+     * @param {Array} uvMapUrls - Array of UV map data URLs ordered by layer index
+     */
+    updateLayerTextures(uvMapUrls) {
+      const mesh = currentMeshRef.current;
+      if (!mesh) return;
+
+      // Load all UV map textures
+      const loader = new THREE.TextureLoader();
+      const textures = uvMapUrls.map((url) => {
+        if (!url) return null;
+        const tex = loader.load(url);
+        tex.flipY = false;
+        return tex;
+      });
+
+      const validTextures = textures.filter((t) => t !== null);
+
+      // No layers — restore the original grey MeshStandardMaterial
+      if (validTextures.length === 0) {
+        mesh.traverse((child) => {
+          if (child.isMesh) {
+            if (child.material) {
+              if (Array.isArray(child.material)) child.material.forEach((m) => m.dispose());
+              else child.material.dispose();
+            }
+            child.material = new THREE.MeshStandardMaterial({
+              color: 0x9ca3af,
+              metalness: 0.1,
+              roughness: 0.8,
+              side: THREE.DoubleSide,
+            });
+          }
+        });
+        return;
+      }
+
+      const layerCount = Math.min(validTextures.length, 16);
+
+      // Build uniforms with one sampler2D per layer (up to 16)
+      const uniforms = { layerCount: { value: layerCount } };
+      for (let i = 0; i < layerCount; i++) {
+        uniforms[`layer${i}`] = { value: validTextures[i] };
+      }
+
+      // Dynamically generate the fragment shader with exactly layerCount samplers
+      const fragmentShader = `
+        uniform int layerCount;
+        ${Array.from({ length: layerCount }, (_, i) => `uniform sampler2D layer${i};`).join('\n        ')}
+        varying vec2 vUv;
+        void main() {
+          vec4 color = vec4(0.0);
+          ${Array.from({ length: layerCount }, (_, i) => `
+          {
+            vec4 layerColor${i} = texture2D(layer${i}, vUv);
+            float mask${i} = step(0.01, length(layerColor${i}.rgb));
+            color.rgb = mix(color.rgb, layerColor${i}.rgb, mask${i} * layerColor${i}.a);
+            color.a = max(color.a, layerColor${i}.a * mask${i});
+          }`).join('')}
+          if (color.a < 0.01) discard;
+          gl_FragColor = color;
+        }
+      `;
+
+      mesh.traverse((child) => {
+        if (child.isMesh) {
+          if (child.material) {
+            if (Array.isArray(child.material)) child.material.forEach((m) => m.dispose());
+            else child.material.dispose();
+          }
+          child.material = new THREE.ShaderMaterial({
+            uniforms,
+            vertexShader: `
+              varying vec2 vUv;
+              void main() {
+                vUv = uv;
+                gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+              }
+            `,
+            fragmentShader,
+            side: THREE.DoubleSide,
+          });
+        }
+      });
     },
   }), []);
 
@@ -727,11 +1589,15 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh }, ref) {
     const scale = 4 / maxDim;
     mesh.scale.setScalar(scale);
 
+    // Mesh stays at world origin — the screen-space shift is handled by the
+    // camera frustum/projection offset, not by translating the mesh.
+    mesh.position.set(0, 0, 0);
     scene.add(mesh);
 
-    // Position camera facing the front of the mesh (Y forward, Z up — Blender convention)
+    // Position camera straight in front of the mesh (forward = +Z in Three.js,
+    // which maps to Y-forward in Blender convention), Z-up, at eye level.
     const dist = 8;
-    camera.position.set(0, -dist, dist * 0.5);
+    camera.position.set(0, 0, dist);
     camera.lookAt(0, 0, 0);
     camera.up.set(0, 1, 0);
     controls.target.set(0, 0, 0);
@@ -762,9 +1628,9 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh }, ref) {
     <div
       ref={containerRef}
       className="absolute inset-0 w-full h-full"
-      style={{ background: '#1a1a2e' }}
+      style={{ background: 'radial-gradient(circle at center, #2a2a5e, #1a1a2e)' }}
     />
   );
 });
 
-export default ModelViewer;
+export default memo(ModelViewer);

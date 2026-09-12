@@ -12,6 +12,7 @@ namespace TextureGen3D.Data.Interfaces.Projects
         Task UpdateAsync(Project project);
         Task UpdateTitleAsync(Guid id, Guid appUserId, string title);
         Task UpdateKeyAsync(Guid id, Guid appUserId, string key);
+        Task UpdateImageModelAsync(Guid id, Guid appUserId, Guid? imageModelId);
         Task DeleteAsync(Guid id, Guid appUserId);
         Task UnarchiveAsync(Guid id, Guid appUserId);
     }

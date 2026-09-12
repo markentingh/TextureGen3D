@@ -30,6 +30,11 @@ namespace TextureGen3D.Data.Services
             builder.Services.AddTransient<IProjectImageGenerationRepository, ProjectImageGenerationRepository>();
             builder.Services.AddTransient<IProjectImageUpscaleRepository, ProjectImageUpscaleRepository>();
             builder.Services.AddTransient<IProjectModelRepository, ProjectModelRepository>();
+            builder.Services.AddTransient<IProjectMeshRepository, ProjectMeshRepository>();
+            builder.Services.AddTransient<IProjectCameraAngleRepository, ProjectCameraAngleRepository>();
+            builder.Services.AddTransient<IProjectReferenceRepository, ProjectReferenceRepository>();
+            builder.Services.AddTransient<IProjectMeshReferenceRepository, ProjectMeshReferenceRepository>();
+            builder.Services.AddTransient<IProjectMeshLayerRepository, ProjectMeshLayerRepository>();
 
             // Billing
             builder.Services.AddTransient<IProductRepository, ProductRepository>();

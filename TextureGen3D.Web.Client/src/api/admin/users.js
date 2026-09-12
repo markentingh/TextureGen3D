@@ -4,6 +4,7 @@ const Users = (args) => Api({ ...args }).endpoints(({ api }) => {
   const apiPath = '/api/admin/users';
   return {
     getAllFiltered: (filter) => api.post(`${apiPath}/get-all-filtered`, filter),
+    searchUsers: (query) => api.post(`${apiPath}/get-all-filtered`, { fullName: query, role: 0, sort: 'Email ASC', start: 0, length: 20 }),
     getById: (userId) => api.get(`${apiPath}/get/${userId}`),
     getRoles: () => api.get(`${apiPath}/get-roles`),
     updateFullName: (user) => api.post(`${apiPath}/update-full-name`, user),

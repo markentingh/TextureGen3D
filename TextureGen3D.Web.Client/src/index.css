@@ -11,3 +11,26 @@
 #root {
   min-height: 100vh;
 }
+
+/* Purple scrollbar — 8px width, site-wide */
+* {
+  scrollbar-width:thin;
+  scrollbar-color: #a855f7 transparent;
+}
+
+*::-webkit-scrollbar {
+  width: 15px;
+}
+
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+*::-webkit-scrollbar-thumb {
+  background-color: #a855f7;
+  border-radius: 4px;
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background-color: #9333ea;
+}

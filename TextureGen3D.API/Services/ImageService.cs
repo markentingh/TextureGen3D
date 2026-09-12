@@ -11,6 +11,8 @@ namespace TextureGen3D.API.Services
     public interface IImageService
     {
         Task<byte[]> GenerateThumbnailAsync(byte[] imageData, int size = 350);
+        Task<byte[]> ConvertToJpegAsync(byte[] imageData, int quality = 85);
+        Task<byte[]> ConvertToHighQualityJpegAsync(byte[] imageData);
         Task SaveProjectThumbAsync(Guid projectId, byte[] imageData);
         Task<byte[]> GetProjectThumbAsync(Guid projectId);
         Task<bool> HasProjectThumbAsync(Guid projectId);
@@ -22,6 +24,26 @@ namespace TextureGen3D.API.Services
         Task<(int width, int height)?> GetImageDimensionsAsync(byte[] imageBytes);
         Task<byte[]> ResizeImageAsync(byte[] imageData, int maxWidth);
         Task<byte[]> ResizeImageMaxAsync(byte[] imageData, int maxSize);
+        Task SaveProjectReferenceAsync(Guid projectId, Guid referenceId, string extension, byte[] fileData);
+        Task<byte[]> GetProjectReferenceAsync(Guid projectId, Guid referenceId, string extension);
+        Task DeleteProjectReferenceAsync(Guid projectId, Guid referenceId, string extension);
+        Task SaveProjectReferenceThumbAsync(Guid projectId, Guid referenceId, string extension, byte[] imageData);
+        Task<byte[]> GetProjectReferenceThumbAsync(Guid projectId, Guid referenceId, string extension);
+        Task DeleteProjectReferenceThumbAsync(Guid projectId, Guid referenceId, string extension);
+        // Project mesh layer images
+        Task SaveProjectMeshLayerImageAsync(Guid projectId, Guid meshId, Guid layerId, byte[] fileData);
+        Task<byte[]> GetProjectMeshLayerImageAsync(Guid projectId, Guid meshId, Guid layerId);
+        Task DeleteProjectMeshLayerImageAsync(Guid projectId, Guid meshId, Guid layerId);
+        Task SaveProjectMeshLayerThumbAsync(Guid projectId, Guid meshId, Guid layerId, byte[] imageData);
+        Task<byte[]> GetProjectMeshLayerThumbAsync(Guid projectId, Guid meshId, Guid layerId);
+        Task DeleteProjectMeshLayerThumbAsync(Guid projectId, Guid meshId, Guid layerId);
+        Task SaveProjectMeshLayerUvMapAsync(Guid projectId, Guid meshId, Guid layerId, byte[] fileData);
+        Task<byte[]> GetProjectMeshLayerUvMapAsync(Guid projectId, Guid meshId, Guid layerId);
+        Task DeleteProjectMeshLayerUvMapAsync(Guid projectId, Guid meshId, Guid layerId);
+        Task SaveProjectMeshLayerDepthMapAsync(Guid projectId, Guid meshId, Guid layerId, byte[] fileData);
+        Task<byte[]> GetProjectMeshLayerDepthMapAsync(Guid projectId, Guid meshId, Guid layerId);
+        Task DeleteProjectMeshLayerDepthMapAsync(Guid projectId, Guid meshId, Guid layerId);
+        Task DeleteProjectMeshLayerFolderAsync(Guid projectId, Guid meshId, Guid layerId);
     }
 
     public class ImageService : IImageService
@@ -48,6 +70,26 @@ namespace TextureGen3D.API.Services
 
             using var ms = new MemoryStream();
             await image.SaveAsync(ms, new JpegEncoder { Quality = 85 });
+            return ms.ToArray();
+        }
+
+        public async Task<byte[]> ConvertToJpegAsync(byte[] imageData, int quality = 85)
+        {
+            using var image = Image.Load(imageData);
+            using var ms = new MemoryStream();
+            await image.SaveAsync(ms, new JpegEncoder { Quality = quality });
+            return ms.ToArray();
+        }
+
+        public async Task<byte[]> ConvertToHighQualityJpegAsync(byte[] imageData)
+        {
+            using var image = Image.Load(imageData);
+            using var ms = new MemoryStream();
+            await image.SaveAsync(ms, new JpegEncoder
+            {
+                Quality = 100,
+                ColorType = JpegEncodingColor.Rgb,
+            });
             return ms.ToArray();
         }
 
@@ -194,6 +236,187 @@ namespace TextureGen3D.API.Services
             using var ms = new MemoryStream();
             await image.SaveAsync(ms, new PngEncoder());
             return ms.ToArray();
+        }
+
+        public async Task SaveProjectReferenceAsync(Guid projectId, Guid referenceId, string extension, byte[] fileData)
+        {
+            var relativePath = Path.Combine("projects", projectId.ToString(), "references", $"{referenceId}.{extension}");
+
+            if (_activeStorage == "azure")
+            {
+                await SaveToAzureBlobAsync(relativePath, fileData);
+                return;
+            }
+
+            await SaveToFileSystemAsync(relativePath, fileData);
+        }
+
+        public async Task<byte[]> GetProjectReferenceAsync(Guid projectId, Guid referenceId, string extension)
+        {
+            var relativePath = Path.Combine("projects", projectId.ToString(), "references", $"{referenceId}.{extension}");
+
+            if (_activeStorage == "azure")
+                return await GetFromAzureBlobAsync(relativePath);
+
+            return await GetFromFileSystemAsync(relativePath);
+        }
+
+        public async Task DeleteProjectReferenceAsync(Guid projectId, Guid referenceId, string extension)
+        {
+            var relativePath = Path.Combine("projects", projectId.ToString(), "references", $"{referenceId}.{extension}");
+
+            if (_activeStorage == "azure")
+            {
+                await DeleteFromAzureBlobAsync(relativePath);
+                return;
+            }
+
+            await DeleteFromFileSystemAsync(relativePath);
+        }
+
+        public async Task SaveProjectReferenceThumbAsync(Guid projectId, Guid referenceId, string extension, byte[] imageData)
+        {
+            var relativePath = Path.Combine("projects", projectId.ToString(), "references", $"{referenceId}_thumb.{extension}");
+            var thumbData = await GenerateThumbnailAsync(imageData, 150);
+
+            if (_activeStorage == "azure")
+            {
+                await SaveToAzureBlobAsync(relativePath, thumbData);
+                return;
+            }
+
+            await SaveToFileSystemAsync(relativePath, thumbData);
+        }
+
+        public async Task<byte[]> GetProjectReferenceThumbAsync(Guid projectId, Guid referenceId, string extension)
+        {
+            var relativePath = Path.Combine("projects", projectId.ToString(), "references", $"{referenceId}_thumb.{extension}");
+
+            if (_activeStorage == "azure")
+                return await GetFromAzureBlobAsync(relativePath);
+
+            return await GetFromFileSystemAsync(relativePath);
+        }
+
+        public async Task DeleteProjectReferenceThumbAsync(Guid projectId, Guid referenceId, string extension)
+        {
+            var relativePath = Path.Combine("projects", projectId.ToString(), "references", $"{referenceId}_thumb.{extension}");
+
+            if (_activeStorage == "azure")
+            {
+                await DeleteFromAzureBlobAsync(relativePath);
+                return;
+            }
+
+            await DeleteFromFileSystemAsync(relativePath);
+        }
+
+        // ── Project mesh layer images ──
+
+        public async Task SaveProjectMeshLayerImageAsync(Guid projectId, Guid meshId, Guid layerId, byte[] fileData)
+        {
+            var relativePath = Path.Combine("projects", projectId.ToString(), "meshes", meshId.ToString(), layerId.ToString(), "image.png");
+            if (_activeStorage == "azure") { await SaveToAzureBlobAsync(relativePath, fileData); return; }
+            await SaveToFileSystemAsync(relativePath, fileData);
+        }
+
+        public async Task<byte[]> GetProjectMeshLayerImageAsync(Guid projectId, Guid meshId, Guid layerId)
+        {
+            var relativePath = Path.Combine("projects", projectId.ToString(), "meshes", meshId.ToString(), layerId.ToString(), "image.png");
+            if (_activeStorage == "azure") return await GetFromAzureBlobAsync(relativePath);
+            return await GetFromFileSystemAsync(relativePath);
+        }
+
+        public async Task DeleteProjectMeshLayerImageAsync(Guid projectId, Guid meshId, Guid layerId)
+        {
+            var relativePath = Path.Combine("projects", projectId.ToString(), "meshes", meshId.ToString(), layerId.ToString(), "image.png");
+            if (_activeStorage == "azure") { await DeleteFromAzureBlobAsync(relativePath); return; }
+            await DeleteFromFileSystemAsync(relativePath);
+        }
+
+        public async Task SaveProjectMeshLayerThumbAsync(Guid projectId, Guid meshId, Guid layerId, byte[] imageData)
+        {
+            var relativePath = Path.Combine("projects", projectId.ToString(), "meshes", meshId.ToString(), layerId.ToString(), "image_thumb.png");
+            if (_activeStorage == "azure") { await SaveToAzureBlobAsync(relativePath, imageData); return; }
+            await SaveToFileSystemAsync(relativePath, imageData);
+        }
+
+        public async Task<byte[]> GetProjectMeshLayerThumbAsync(Guid projectId, Guid meshId, Guid layerId)
+        {
+            var relativePath = Path.Combine("projects", projectId.ToString(), "meshes", meshId.ToString(), layerId.ToString(), "image_thumb.png");
+            if (_activeStorage == "azure") return await GetFromAzureBlobAsync(relativePath);
+            return await GetFromFileSystemAsync(relativePath);
+        }
+
+        public async Task DeleteProjectMeshLayerThumbAsync(Guid projectId, Guid meshId, Guid layerId)
+        {
+            var relativePath = Path.Combine("projects", projectId.ToString(), "meshes", meshId.ToString(), layerId.ToString(), "image_thumb.png");
+            if (_activeStorage == "azure") { await DeleteFromAzureBlobAsync(relativePath); return; }
+            await DeleteFromFileSystemAsync(relativePath);
+        }
+
+        public async Task SaveProjectMeshLayerUvMapAsync(Guid projectId, Guid meshId, Guid layerId, byte[] fileData)
+        {
+            var relativePath = Path.Combine("projects", projectId.ToString(), "meshes", meshId.ToString(), layerId.ToString(), "uvmap.png");
+            if (_activeStorage == "azure") { await SaveToAzureBlobAsync(relativePath, fileData); return; }
+            await SaveToFileSystemAsync(relativePath, fileData);
+        }
+
+        public async Task<byte[]> GetProjectMeshLayerUvMapAsync(Guid projectId, Guid meshId, Guid layerId)
+        {
+            var relativePath = Path.Combine("projects", projectId.ToString(), "meshes", meshId.ToString(), layerId.ToString(), "uvmap.png");
+            if (_activeStorage == "azure") return await GetFromAzureBlobAsync(relativePath);
+            return await GetFromFileSystemAsync(relativePath);
+        }
+
+        public async Task DeleteProjectMeshLayerUvMapAsync(Guid projectId, Guid meshId, Guid layerId)
+        {
+            var relativePath = Path.Combine("projects", projectId.ToString(), "meshes", meshId.ToString(), layerId.ToString(), "uvmap.png");
+            if (_activeStorage == "azure") { await DeleteFromAzureBlobAsync(relativePath); return; }
+            await DeleteFromFileSystemAsync(relativePath);
+        }
+
+        public async Task SaveProjectMeshLayerDepthMapAsync(Guid projectId, Guid meshId, Guid layerId, byte[] fileData)
+        {
+            var relativePath = Path.Combine("projects", projectId.ToString(), "meshes", meshId.ToString(), layerId.ToString(), "depthmap.jpg");
+            if (_activeStorage == "azure") { await SaveToAzureBlobAsync(relativePath, fileData); return; }
+            await SaveToFileSystemAsync(relativePath, fileData);
+        }
+
+        public async Task<byte[]> GetProjectMeshLayerDepthMapAsync(Guid projectId, Guid meshId, Guid layerId)
+        {
+            var relativePath = Path.Combine("projects", projectId.ToString(), "meshes", meshId.ToString(), layerId.ToString(), "depthmap.jpg");
+            if (_activeStorage == "azure") return await GetFromAzureBlobAsync(relativePath);
+            return await GetFromFileSystemAsync(relativePath);
+        }
+
+        public async Task DeleteProjectMeshLayerDepthMapAsync(Guid projectId, Guid meshId, Guid layerId)
+        {
+            var relativePath = Path.Combine("projects", projectId.ToString(), "meshes", meshId.ToString(), layerId.ToString(), "depthmap.jpg");
+            if (_activeStorage == "azure") { await DeleteFromAzureBlobAsync(relativePath); return; }
+            await DeleteFromFileSystemAsync(relativePath);
+        }
+
+        public async Task DeleteProjectMeshLayerFolderAsync(Guid projectId, Guid meshId, Guid layerId)
+        {
+            var folderPath = Path.Combine("projects", projectId.ToString(), "meshes", meshId.ToString(), layerId.ToString());
+
+            if (_activeStorage == "azure")
+            {
+                // Azure blob storage has no real folders — delete all blobs with this prefix
+                var blobServiceClient = new BlobServiceClient(GetAzureConnectionString());
+                var containerClient = blobServiceClient.GetBlobContainerClient(GetAzureContainerName());
+                var prefix = folderPath.Replace('\\', '/') + "/";
+                await foreach (var blob in containerClient.GetBlobsAsync(prefix: prefix))
+                {
+                    await containerClient.DeleteBlobIfExistsAsync(blob.Name);
+                }
+                return;
+            }
+
+            var fullPath = GetFileSystemPath(folderPath);
+            if (Directory.Exists(fullPath))
+                Directory.Delete(fullPath, recursive: true);
         }
 
         #region Storage helpers
