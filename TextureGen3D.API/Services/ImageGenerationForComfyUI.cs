@@ -41,6 +41,7 @@ namespace TextureGen3D.API.Services
             string promptPath,
             string depthMapPath,
             string inputImagesPath,
+            string subfolder,
             IProgress<(int value, string? message)>? progress = null,
             CancellationToken cancellationToken = default)
         {
@@ -66,8 +67,8 @@ namespace TextureGen3D.API.Services
             if (!string.IsNullOrWhiteSpace(depthMapPath) && request.InputImages != null && request.InputImages.Count > 0)
             {
                 var depthBytes = request.InputImages[0];
-                var uploaded = await UploadImageAsync(client, endpoint, apiKey, depthBytes, "depthmap.png", cancellationToken);
-                var depthValue = $"{uploaded.Subfolder}/{uploaded.Name}";
+                var uploaded = await UploadImageAsync(client, endpoint, apiKey, depthBytes, "depthmap.png", subfolder, cancellationToken);
+                var depthValue = BuildImagePath(uploaded.Subfolder, uploaded.Name);
                 SetWorkflowValue(workflow, depthMapPath, depthValue);
             }
 
@@ -78,18 +79,19 @@ namespace TextureGen3D.API.Services
                 var uploadedPaths = new List<string>();
                 for (var i = 0; i < refImages.Count; i++)
                 {
-                    var uploaded = await UploadImageAsync(client, endpoint, apiKey, refImages[i], $"reference_{i}.png", cancellationToken);
-                    uploadedPaths.Add($"{uploaded.Subfolder}/{uploaded.Name}");
+                    var uploaded = await UploadImageAsync(client, endpoint, apiKey, refImages[i], $"reference_{i}.png", subfolder, cancellationToken);
+                    uploadedPaths.Add(BuildImagePath(uploaded.Subfolder, uploaded.Name));
                 }
                 SetWorkflowArrayValue(workflow, inputImagesPath, uploadedPaths);
             }
 
             // 4. Queue the prompt via /prompt API
             progress?.Report((5, "Queuing workflow..."));
-            var promptId = await QueuePromptAsync(client, endpoint, apiKey, workflow, cancellationToken);
+            var clientId = Guid.NewGuid().ToString("N");
+            var promptId = await QueuePromptAsync(client, endpoint, apiKey, workflow, clientId, cancellationToken);
 
-            // 5. Listen for progress via WebSocket
-            await ListenForProgressAsync(endpoint, apiKey, promptId, progress, cancellationToken);
+            // 5. Listen for progress via WebSocket (using the same client_id)
+            await ListenForProgressAsync(endpoint, apiKey, promptId, clientId, progress, cancellationToken);
 
             // 6. Fetch the output image via /view endpoint
             progress?.Report((100, "Downloading output image..."));
@@ -103,7 +105,7 @@ namespace TextureGen3D.API.Services
         /// Returns the name and subfolder from the response.
         /// </summary>
         async Task<(string Name, string Subfolder)> UploadImageAsync(
-            HttpClient client, string endpoint, string apiKey, byte[] imageBytes, string filename, CancellationToken ct)
+            HttpClient client, string endpoint, string apiKey, byte[] imageBytes, string filename, string uploadSubfolder, CancellationToken ct)
         {
             using var formContent = new MultipartFormDataContent();
             var imageContent = new ByteArrayContent(imageBytes);
@@ -111,6 +113,8 @@ namespace TextureGen3D.API.Services
             formContent.Add(imageContent, "image", filename);
             formContent.Add(new StringContent("input"), "type");
             formContent.Add(new StringContent("true"), "overwrite");
+            if (!string.IsNullOrWhiteSpace(uploadSubfolder))
+                formContent.Add(new StringContent(uploadSubfolder), "subfolder");
 
             using var httpRequest = new HttpRequestMessage(HttpMethod.Post, $"{endpoint}/upload/image")
             {
@@ -140,12 +144,12 @@ namespace TextureGen3D.API.Services
         /// Returns the prompt_id from the response.
         /// </summary>
         async Task<string> QueuePromptAsync(
-            HttpClient client, string endpoint, string apiKey, JsonObject workflow, CancellationToken ct)
+            HttpClient client, string endpoint, string apiKey, JsonObject workflow, string clientId, CancellationToken ct)
         {
             var payload = new JsonObject
             {
                 ["prompt"] = workflow,
-                ["client_id"] = Guid.NewGuid().ToString("N")
+                ["client_id"] = clientId
             };
 
             var jsonContent = JsonSerializer.Serialize(payload);
@@ -174,7 +178,7 @@ namespace TextureGen3D.API.Services
         /// for the given prompt_id. Reports progress updates.
         /// </summary>
         async Task ListenForProgressAsync(
-            string endpoint, string apiKey, string promptId,
+            string endpoint, string apiKey, string promptId, string clientId,
             IProgress<(int value, string? message)>? progress, CancellationToken ct)
         {
             // Convert HTTP endpoint to WebSocket URL
@@ -183,7 +187,10 @@ namespace TextureGen3D.API.Services
                 .Replace("http://", "ws://")
                 .Replace("/api", "/ws");
 
-            var wsUrl = $"{wsBase}?clientId={Guid.NewGuid():N}";
+            // Build the WebSocket URL with the same client_id used for the prompt
+            var wsUrl = $"{wsBase}?clientId={clientId}";
+            if (!string.IsNullOrWhiteSpace(apiKey))
+                wsUrl += $"&token={apiKey}";
 
             using var ws = new ClientWebSocket();
             if (!string.IsNullOrWhiteSpace(apiKey))
@@ -207,34 +214,47 @@ namespace TextureGen3D.API.Services
                     ms.Write(buffer, 0, result.Count);
                 } while (!result.EndOfMessage);
 
+                // ComfyUI sends binary frames for preview images — skip them
+                if (result.MessageType != WebSocketMessageType.Text)
+                    continue;
+
                 var json = Encoding.UTF8.GetString(ms.ToArray());
-                var msg = JsonNode.Parse(json) as JsonObject;
+                if (string.IsNullOrWhiteSpace(json) || json[0] != '{')
+                    continue;
+
+                JsonObject? msg;
+                try { msg = JsonNode.Parse(json) as JsonObject; }
+                catch { continue; }
                 if (msg == null) continue;
 
                 var type = msg["type"]?.GetValue<string>();
+                var data = msg["data"] as JsonObject;
+
+                // Filter to our job (when prompt_id is present in data)
+                var msgPromptId = data?["prompt_id"]?.GetValue<string>();
+                if (msgPromptId != null && msgPromptId != promptId)
+                    continue;
 
                 if (type == "progress")
                 {
-                    var data = msg["data"] as JsonObject;
                     var value = data?["value"]?.GetValue<int>() ?? 0;
                     var max = data?["max"]?.GetValue<int>() ?? 1;
-                    var pct = max > 0 ? (int)((double)value / max * 95) : 0;
+                    var pct = max > 0 ? (int)((double)value / max * 90) : 0;
                     progress?.Report((5 + pct, $"Generating: {value}/{max} steps"));
                 }
                 else if (type == "executing")
                 {
-                    var data = msg["data"] as JsonObject;
                     var nodeId = data?["node"]?.GetValue<string>();
-                    if (nodeId == null)
-                    {
-                        // Execution complete
-                        completed = true;
-                        progress?.Report((99, "Generation complete"));
-                    }
+                    if (nodeId != null)
+                        progress?.Report((5, $"Executing node: {nodeId}"));
+                }
+                else if (type == "execution_success")
+                {
+                    completed = true;
+                    progress?.Report((99, "Generation complete"));
                 }
                 else if (type == "execution_error")
                 {
-                    var data = msg["data"] as JsonObject;
                     var errorMsg = data?["exception_message"]?.GetValue<string>() ?? "Unknown error";
                     throw new InvalidOperationException($"ComfyUI execution error: {errorMsg}");
                 }
@@ -317,6 +337,15 @@ namespace TextureGen3D.API.Services
                 throw new InvalidOperationException($"ComfyUI /view failed: {viewResponse.StatusCode}");
 
             return await viewResponse.Content.ReadAsByteArrayAsync(cts.Token);
+        }
+
+        /// <summary>
+        /// Build the image path for a LoadImage node from the upload response.
+        /// Returns "{subfolder}/{name}" if subfolder is non-empty, otherwise just "{name}".
+        /// </summary>
+        static string BuildImagePath(string subfolder, string name)
+        {
+            return string.IsNullOrWhiteSpace(subfolder) ? name : $"{subfolder}/{name}";
         }
 
         /// <summary>

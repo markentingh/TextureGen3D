@@ -1,10 +1,12 @@
 import React, { useState, useRef, useEffect } from 'react';
 import Modal from '@/components/ui/modal';
+import ConfirmModal from '@/components/ui/confirm-modal';
+import ButtonIcon from '@/components/ui/button-icon';
 import Spinner from '@/components/ui/spinner';
 import { ProjectReferences } from '@/api/user/projectReferences';
 import { ProjectMeshReferences } from '@/api/user/projectMeshReferences';
 
-export default function ProjectReferencesModal({ projectId, token, meshId, onClose, onAdded, onDeleted, onProjectReferencesChanged }) {
+export default function ProjectReferencesModal({ projectId, token, meshId, cameraAngleMode, selectedRefId, onSelectReference, onClose, onAdded, onDeleted, onProjectReferencesChanged }) {
   const [projectRefs, setProjectRefs] = useState([]);
   const [meshRefIds, setMeshRefIds] = useState(new Set());
   const [loading, setLoading] = useState(true);
@@ -119,8 +121,9 @@ export default function ProjectReferencesModal({ projectId, token, meshId, onClo
     }
   };
 
+  const [deleteTarget, setDeleteTarget] = useState(null);
+
   const handleDeleteProjectRef = async (refId) => {
-    if (!confirm('Delete this reference image from the project? This will remove it from all meshes and delete the file.')) return;
     try {
       const api = ProjectReferences({ token });
       await api.delete(projectId, refId);
@@ -144,7 +147,7 @@ export default function ProjectReferencesModal({ projectId, token, meshId, onClo
         ) : (
           <>
             <p className="text-xs text-gray-500 dark:text-gray-400">
-              Click a thumbnail to {meshId ? 'toggle it for this mesh' : 'select it'}. Click the trash icon to delete from the project.
+              Click a thumbnail to {cameraAngleMode ? 'set it as the reference for this camera angle' : meshId ? 'toggle it for this mesh' : 'select it'}. Click the trash icon to delete from the project.
             </p>
             <div
               onDrop={handleDrop}
@@ -183,12 +186,14 @@ export default function ProjectReferencesModal({ projectId, token, meshId, onClo
               </div>
 
               {projectRefs.map((ref) => {
-                const isSelected = meshRefIds.has(ref.id);
+                const isSelected = cameraAngleMode
+                  ? selectedRefId === ref.id
+                  : meshRefIds.has(ref.id);
                 return (
                   <div
                     key={ref.id}
-                    onClick={() => handleToggleMeshRef(ref.id)}
-                    className={`relative rounded-lg overflow-hidden border-2 cursor-pointer transition ${
+                    onClick={() => cameraAngleMode ? onSelectReference?.(ref.id) : handleToggleMeshRef(ref.id)}
+                    className={`relative rounded-lg overflow-hidden border-2 cursor-pointer transition group ${
                       isSelected ? 'border-purple-500 ring-1 ring-purple-500' : 'border-gray-200 dark:border-gray-600 hover:border-purple-300'
                     }`}
                     style={{ width: 150, height: 150 }}
@@ -206,15 +211,15 @@ export default function ProjectReferencesModal({ projectId, token, meshId, onClo
                         </svg>
                       </div>
                     )}
-                    <button
-                      onClick={(e) => { e.stopPropagation(); handleDeleteProjectRef(ref.id); }}
-                      className="absolute bottom-0.5 right-0.5 p-0.5 rounded bg-black/50 text-white opacity-0 hover:opacity-100 hover:bg-red-600 transition"
-                      aria-label="Delete from project"
-                    >
-                      <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-                      </svg>
-                    </button>
+                    <div className="absolute bottom-0.5 right-0.5 opacity-0 group-hover:opacity-100 transition">
+                      <ButtonIcon
+                        name="delete"
+                        color="red"
+                        title="Delete from project"
+                        onClick={(e) => { e.stopPropagation(); setDeleteTarget(ref.id); }}
+                        className="w-6 h-6"
+                      />
+                    </div>
                   </div>
                 );
               })}
@@ -222,6 +227,15 @@ export default function ProjectReferencesModal({ projectId, token, meshId, onClo
           </>
         )}
       </div>
+      <ConfirmModal
+        show={!!deleteTarget}
+        title="Delete Reference"
+        message="Do you really want to delete this reference image? It will be removed from the server and this cannot be undone."
+        confirmLabel="Delete"
+        confirmColor="red"
+        onConfirm={() => { const t = deleteTarget; setDeleteTarget(null); if (t) handleDeleteProjectRef(t); }}
+        onClose={() => setDeleteTarget(null)}
+      />
     </Modal>
   );
 }

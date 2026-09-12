@@ -21,6 +21,7 @@ namespace TextureGen3D.API.Controllers
         readonly IImageGenerationModelRepository _imageGenModelRepo;
         readonly IImageService _imageService;
         readonly IImageGeneration _imageGeneration;
+        readonly IEnumerable<IImageGeneration> _allImageGenerations;
 
         static readonly HashSet<string> AllowedExtensions = new(StringComparer.OrdinalIgnoreCase)
         {
@@ -33,7 +34,8 @@ namespace TextureGen3D.API.Controllers
             IProjectMeshReferenceRepository meshRefRepo,
             IImageGenerationModelRepository imageGenModelRepo,
             IImageService imageService,
-            IImageGeneration imageGeneration)
+            IImageGeneration imageGeneration,
+            IEnumerable<IImageGeneration> allImageGenerations)
         {
             _projectRepo = projectRepo;
             _refRepo = refRepo;
@@ -41,6 +43,7 @@ namespace TextureGen3D.API.Controllers
             _imageGenModelRepo = imageGenModelRepo;
             _imageService = imageService;
             _imageGeneration = imageGeneration;
+            _allImageGenerations = allImageGenerations;
         }
 
         [HttpGet("{projectId}")]
@@ -318,7 +321,10 @@ namespace TextureGen3D.API.Controllers
                     InputImages = new List<byte[]> { referenceBytes }
                 };
 
-                var result = await _imageGeneration.GenerateAsync(genRequest);
+                // Select the correct IImageGeneration implementation based on ModelKey
+                var genService = _allImageGenerations.FirstOrDefault(g => g.ModelKey == imageModel.ModelKey)
+                    ?? _imageGeneration;
+                var result = await genService.GenerateAsync(genRequest);
                 if (result.ImageBytes == null || result.ImageBytes.Length == 0)
                     return Json(new ApiResponse { success = false, message = "Image generation returned no image" });
 
@@ -335,7 +341,7 @@ namespace TextureGen3D.API.Controllers
         }
 
         [HttpPost("{projectId}/save-generated")]
-        public async Task<IActionResult> SaveGenerated(Guid projectId, [FromBody] SaveGeneratedReferenceRequest request)
+        public async Task<IActionResult> SaveGenerated(Guid projectId, [FromQuery] string mode, [FromQuery] Guid? referenceId)
         {
             try
             {
@@ -347,10 +353,21 @@ namespace TextureGen3D.API.Controllers
                 if (project == null)
                     return Json(new ApiResponse { success = false, message = "Project not found" });
 
-                if (string.IsNullOrWhiteSpace(request.ImageBase64))
+                // Read raw base64 image data from the request body
+                string imageBase64;
+                using (var reader = new System.IO.StreamReader(Request.Body))
+                {
+                    imageBase64 = await reader.ReadToEndAsync();
+                }
+
+                if (string.IsNullOrWhiteSpace(imageBase64))
                     return Json(new ApiResponse { success = false, message = "No image data provided" });
 
-                var fileBytes = Convert.FromBase64String(request.ImageBase64);
+                // Strip data URL prefix if present
+                if (imageBase64.StartsWith("data:"))
+                    imageBase64 = imageBase64.Substring(imageBase64.IndexOf(',') + 1);
+
+                var fileBytes = Convert.FromBase64String(imageBase64);
                 var extension = "png";
 
                 // Resize to max 1024 width
@@ -372,20 +389,20 @@ namespace TextureGen3D.API.Controllers
                     }
                 }
 
-                if (request.Mode == "replace" && request.ReferenceId != Guid.Empty)
+                if (mode == "replace" && referenceId.HasValue && referenceId.Value != Guid.Empty)
                 {
                     // Replace existing reference
-                    var existing = await _refRepo.GetByIdAsync(request.ReferenceId, projectId);
+                    var existing = await _refRepo.GetByIdAsync(referenceId.Value, projectId);
                     if (existing == null)
                         return Json(new ApiResponse { success = false, message = "Reference not found" });
 
                     // Delete old files
-                    await _imageService.DeleteProjectReferenceAsync(projectId, request.ReferenceId, existing.Extension);
-                    await _imageService.DeleteProjectReferenceThumbAsync(projectId, request.ReferenceId, existing.Extension);
+                    await _imageService.DeleteProjectReferenceAsync(projectId, referenceId.Value, existing.Extension);
+                    await _imageService.DeleteProjectReferenceThumbAsync(projectId, referenceId.Value, existing.Extension);
 
                     // Save new files with png extension
-                    await _imageService.SaveProjectReferenceAsync(projectId, request.ReferenceId, extension, fileBytes);
-                    await _imageService.SaveProjectReferenceThumbAsync(projectId, request.ReferenceId, extension, fileBytes);
+                    await _imageService.SaveProjectReferenceAsync(projectId, referenceId.Value, extension, fileBytes);
+                    await _imageService.SaveProjectReferenceThumbAsync(projectId, referenceId.Value, extension, fileBytes);
 
                     // Update DB record
                     existing.Extension = extension;

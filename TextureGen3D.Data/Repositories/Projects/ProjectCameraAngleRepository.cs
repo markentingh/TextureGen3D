@@ -22,8 +22,8 @@ namespace TextureGen3D.Data.Repositories.Projects
                 angle.Created = DateTime.UtcNow;
 
             const string query = @"
-                INSERT INTO public.""ProjectCameraAngles"" (""Id"", ""ProjectId"", ""ModelId"", ""MeshId"", ""Rotation"", ""Created"")
-                VALUES (@Id, @ProjectId, @ModelId, @MeshId, @Rotation, @Created)
+                INSERT INTO public.""ProjectCameraAngles"" (""Id"", ""ProjectId"", ""ModelId"", ""MeshId"", ""Rotation"", ""Prompt"", ""ProjectReferenceId"", ""Created"")
+                VALUES (@Id, @ProjectId, @ModelId, @MeshId, @Rotation, @Prompt, @ProjectReferenceId, @Created)
                 RETURNING *";
             return await _dbConnection.QueryFirstAsync<ProjectCameraAngle>(query, angle);
         }
@@ -44,6 +44,18 @@ namespace TextureGen3D.Data.Repositories.Projects
         {
             const string query = @"SELECT * FROM public.""ProjectCameraAngles"" WHERE ""ProjectId"" = @projectId ORDER BY ""Created"" ASC";
             return await _dbConnection.QueryAsync<ProjectCameraAngle>(query, new { projectId });
+        }
+
+        public async Task UpdatePromptAsync(Guid id, Guid projectId, string prompt)
+        {
+            const string query = @"UPDATE public.""ProjectCameraAngles"" SET ""Prompt"" = @prompt WHERE ""Id"" = @id AND ""ProjectId"" = @projectId";
+            await _dbConnection.ExecuteAsync(query, new { id, projectId, prompt });
+        }
+
+        public async Task UpdateReferenceAsync(Guid id, Guid projectId, Guid? projectReferenceId)
+        {
+            const string query = @"UPDATE public.""ProjectCameraAngles"" SET ""ProjectReferenceId"" = @projectReferenceId WHERE ""Id"" = @id AND ""ProjectId"" = @projectId";
+            await _dbConnection.ExecuteAsync(query, new { id, projectId, projectReferenceId });
         }
 
         public async Task DeleteAsync(Guid id, Guid projectId)

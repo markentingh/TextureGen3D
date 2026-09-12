@@ -155,8 +155,7 @@ export default function AdminOpenAI() {
     const fetchImageModels = () => {
         getImageModels().then(response => {
             if (response.data.success) {
-                // Only show type 0 (Image Generation) models in the admin modal
-                setImageModels((response.data.data || []).filter(m => m.type === 0));
+                setImageModels(response.data.data || []);
             }
         }).catch(error => {
             console.error('Error fetching image generation models:', error);

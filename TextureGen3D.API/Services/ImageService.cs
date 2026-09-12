@@ -40,6 +40,9 @@ namespace TextureGen3D.API.Services
         Task SaveProjectMeshLayerUvMapAsync(Guid projectId, Guid meshId, Guid layerId, byte[] fileData);
         Task<byte[]> GetProjectMeshLayerUvMapAsync(Guid projectId, Guid meshId, Guid layerId);
         Task DeleteProjectMeshLayerUvMapAsync(Guid projectId, Guid meshId, Guid layerId);
+        Task SaveProjectMeshLayerUvMapThumbAsync(Guid projectId, Guid meshId, Guid layerId, byte[] fileData);
+        Task<byte[]> GetProjectMeshLayerUvMapThumbAsync(Guid projectId, Guid meshId, Guid layerId);
+        Task DeleteProjectMeshLayerUvMapThumbAsync(Guid projectId, Guid meshId, Guid layerId);
         Task SaveProjectMeshLayerDepthMapAsync(Guid projectId, Guid meshId, Guid layerId, byte[] fileData);
         Task<byte[]> GetProjectMeshLayerDepthMapAsync(Guid projectId, Guid meshId, Guid layerId);
         Task DeleteProjectMeshLayerDepthMapAsync(Guid projectId, Guid meshId, Guid layerId);
@@ -372,6 +375,27 @@ namespace TextureGen3D.API.Services
         public async Task DeleteProjectMeshLayerUvMapAsync(Guid projectId, Guid meshId, Guid layerId)
         {
             var relativePath = Path.Combine("projects", projectId.ToString(), "meshes", meshId.ToString(), layerId.ToString(), "uvmap.png");
+            if (_activeStorage == "azure") { await DeleteFromAzureBlobAsync(relativePath); return; }
+            await DeleteFromFileSystemAsync(relativePath);
+        }
+
+        public async Task SaveProjectMeshLayerUvMapThumbAsync(Guid projectId, Guid meshId, Guid layerId, byte[] fileData)
+        {
+            var relativePath = Path.Combine("projects", projectId.ToString(), "meshes", meshId.ToString(), layerId.ToString(), "uvmap_thumb.png");
+            if (_activeStorage == "azure") { await SaveToAzureBlobAsync(relativePath, fileData); return; }
+            await SaveToFileSystemAsync(relativePath, fileData);
+        }
+
+        public async Task<byte[]> GetProjectMeshLayerUvMapThumbAsync(Guid projectId, Guid meshId, Guid layerId)
+        {
+            var relativePath = Path.Combine("projects", projectId.ToString(), "meshes", meshId.ToString(), layerId.ToString(), "uvmap_thumb.png");
+            if (_activeStorage == "azure") return await GetFromAzureBlobAsync(relativePath);
+            return await GetFromFileSystemAsync(relativePath);
+        }
+
+        public async Task DeleteProjectMeshLayerUvMapThumbAsync(Guid projectId, Guid meshId, Guid layerId)
+        {
+            var relativePath = Path.Combine("projects", projectId.ToString(), "meshes", meshId.ToString(), layerId.ToString(), "uvmap_thumb.png");
             if (_activeStorage == "azure") { await DeleteFromAzureBlobAsync(relativePath); return; }
             await DeleteFromFileSystemAsync(relativePath);
         }

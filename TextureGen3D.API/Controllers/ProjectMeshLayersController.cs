@@ -18,6 +18,7 @@ namespace TextureGen3D.API.Controllers
         readonly IProjectMeshLayerRepository _layerRepo;
         readonly IProjectMeshReferenceRepository _meshRefRepo;
         readonly IProjectReferenceRepository _refRepo;
+        readonly IProjectCameraAngleRepository _angleRepo;
         readonly IImageService _imageService;
         readonly IImageGeneration _imageGeneration;
         readonly IEnumerable<IImageGeneration> _allImageGenerations;
@@ -29,6 +30,7 @@ namespace TextureGen3D.API.Controllers
             IProjectMeshLayerRepository layerRepo,
             IProjectMeshReferenceRepository meshRefRepo,
             IProjectReferenceRepository refRepo,
+            IProjectCameraAngleRepository angleRepo,
             IImageService imageService,
             IImageGeneration imageGeneration,
             IEnumerable<IImageGeneration> allImageGenerations,
@@ -39,6 +41,7 @@ namespace TextureGen3D.API.Controllers
             _layerRepo = layerRepo;
             _meshRefRepo = meshRefRepo;
             _refRepo = refRepo;
+            _angleRepo = angleRepo;
             _imageService = imageService;
             _imageGeneration = imageGeneration;
             _allImageGenerations = allImageGenerations;
@@ -232,6 +235,21 @@ namespace TextureGen3D.API.Controllers
             }
         }
 
+        [HttpGet("{projectId}/mesh/{meshId}/{layerId}/uvmap-thumb")]
+        public async Task<IActionResult> GetUvMapThumb(Guid projectId, Guid meshId, Guid layerId)
+        {
+            try
+            {
+                var data = await _imageService.GetProjectMeshLayerUvMapThumbAsync(projectId, meshId, layerId);
+                if (data == null) return NotFound();
+                return File(data, "image/png");
+            }
+            catch
+            {
+                return NotFound();
+            }
+        }
+
         public class SaveImageRequest
         {
             public Guid MeshId { get; set; }
@@ -294,6 +312,48 @@ namespace TextureGen3D.API.Controllers
 
                 await _imageService.SaveProjectMeshLayerUvMapAsync(projectId, request.MeshId, layerId, uvmapBytes);
 
+                // Generate and save a thumbnail of the UV map
+                var uvThumbBytes = await _imageService.GenerateThumbnailAsync(uvmapBytes, 100);
+                await _imageService.SaveProjectMeshLayerUvMapThumbAsync(projectId, request.MeshId, layerId, uvThumbBytes);
+
+                return Json(new ApiResponse { success = true });
+            }
+            catch (Exception ex)
+            {
+                return Json(new ApiResponse { success = false, message = ex.Message });
+            }
+        }
+
+        public class ReprojectRequest
+        {
+            public Guid MeshId { get; set; }
+            public string CameraAngle { get; set; } = ""; // JSON {x,y,z}
+        }
+
+        /// <summary>
+        /// Re-project the layer's existing image.png onto the UV map using the stored camera angle.
+        /// The frontend calls this from the reprojection button on the layer list item.
+        /// Returns the re-projected UV map as base64 so the frontend can save it.
+        /// </summary>
+        [HttpPost("{projectId}/{layerId}/reproject")]
+        public async Task<IActionResult> Reproject(Guid projectId, Guid layerId, [FromBody] ReprojectRequest request)
+        {
+            try
+            {
+                var userId = GetUserId();
+                if (userId == Guid.Empty)
+                    return Json(new ApiResponse { success = false, message = "Could not find user" });
+
+                var project = await _projectRepo.GetByIdAsync(projectId, userId);
+                if (project == null)
+                    return Json(new ApiResponse { success = false, message = "Project not found" });
+
+                // Update the camera angle if provided
+                if (!string.IsNullOrWhiteSpace(request.CameraAngle))
+                {
+                    await _layerRepo.UpdateCameraAngleAsync(layerId, projectId, request.CameraAngle);
+                }
+
                 return Json(new ApiResponse { success = true });
             }
             catch (Exception ex)
@@ -308,6 +368,50 @@ namespace TextureGen3D.API.Controllers
             public int ImageModelId { get; set; }
             public string Prompt { get; set; } = "";
             public string DepthMap { get; set; } = ""; // base64 data URL of the depth map
+            public string CameraAngle { get; set; } = ""; // JSON {x,y,z}
+            public Guid? CameraAngleId { get; set; } // if set, use this camera angle's reference image instead of mesh references
+        }
+
+        public class SaveDepthMapRequest
+        {
+            public Guid MeshId { get; set; }
+            public string DepthMap { get; set; } = ""; // base64 data URL
+        }
+
+        /// <summary>
+        /// Save a depth map to the layer folder before starting ComfyUI generation.
+        /// The ComfyUI hub reads the depth map from storage instead of receiving it via SignalR.
+        /// </summary>
+        [HttpPost("{projectId}/{layerId}/save-depthmap")]
+        public async Task<IActionResult> SaveDepthMap(Guid projectId, Guid layerId, [FromBody] SaveDepthMapRequest request)
+        {
+            try
+            {
+                var userId = GetUserId();
+                if (userId == Guid.Empty)
+                    return Json(new ApiResponse { success = false, message = "Could not find user" });
+
+                var project = await _projectRepo.GetByIdAsync(projectId, userId);
+                if (project == null)
+                    return Json(new ApiResponse { success = false, message = "Project not found" });
+
+                if (string.IsNullOrWhiteSpace(request.DepthMap))
+                    return Json(new ApiResponse { success = false, message = "No depth map provided" });
+
+                var base64 = request.DepthMap.StartsWith("data:")
+                    ? request.DepthMap[(request.DepthMap.IndexOf(',') + 1)..]
+                    : request.DepthMap;
+                var depthMapBytes = Convert.FromBase64String(base64);
+
+                var depthJpeg = await _imageService.ConvertToHighQualityJpegAsync(depthMapBytes);
+                await _imageService.SaveProjectMeshLayerDepthMapAsync(projectId, request.MeshId, layerId, depthJpeg);
+
+                return Json(new ApiResponse { success = true });
+            }
+            catch (Exception ex)
+            {
+                return Json(new ApiResponse { success = false, message = ex.Message });
+            }
         }
 
         [HttpPost("{projectId}/{layerId}/generate")]
@@ -339,15 +443,33 @@ namespace TextureGen3D.API.Controllers
                     inputImages.Add(depthMapBytes);
                 }
 
-                // Fetch active image references for this mesh from ProjectMeshReferences
-                var meshRefs = await _meshRefRepo.GetByMeshIdAsync(request.MeshId, projectId);
-                foreach (var meshRef in meshRefs.Where(mr => mr.Active))
+                // Fetch image references: use camera angle's reference if CameraAngleId is set, otherwise mesh references
+                if (request.CameraAngleId.HasValue)
                 {
-                    var reference = await _refRepo.GetByIdAsync(meshRef.ProjectReferenceId, projectId);
-                    if (reference == null) continue;
-                    var refBytes = await _imageService.GetProjectReferenceAsync(projectId, reference.Id, reference.Extension);
-                    if (refBytes != null && refBytes.Length > 0)
-                        inputImages.Add(refBytes);
+                    var angle = await _angleRepo.GetByIdAsync(request.CameraAngleId.Value, projectId);
+                    if (angle != null && angle.ProjectReferenceId.HasValue)
+                    {
+                        var reference = await _refRepo.GetByIdAsync(angle.ProjectReferenceId.Value, projectId);
+                        if (reference != null)
+                        {
+                            var refBytes = await _imageService.GetProjectReferenceAsync(projectId, reference.Id, reference.Extension);
+                            if (refBytes != null && refBytes.Length > 0)
+                                inputImages.Add(refBytes);
+                        }
+                    }
+                }
+                else
+                {
+                    // Fetch active image references for this mesh from ProjectMeshReferences
+                    var meshRefs = await _meshRefRepo.GetByMeshIdAsync(request.MeshId, projectId);
+                    foreach (var meshRef in meshRefs.Where(mr => mr.Active))
+                    {
+                        var reference = await _refRepo.GetByIdAsync(meshRef.ProjectReferenceId, projectId);
+                        if (reference == null) continue;
+                        var refBytes = await _imageService.GetProjectReferenceAsync(projectId, reference.Id, reference.Extension);
+                        if (refBytes != null && refBytes.Length > 0)
+                            inputImages.Add(refBytes);
+                    }
                 }
 
                 if (inputImages.Count == 0)
@@ -381,6 +503,12 @@ namespace TextureGen3D.API.Controllers
                 // Generate and save 100x100 thumbnail
                 var thumbBytes = await _imageService.GenerateThumbnailAsync(result.ImageBytes, 100);
                 await _imageService.SaveProjectMeshLayerThumbAsync(projectId, request.MeshId, layerId, thumbBytes);
+
+                // Save the camera angle if provided
+                if (!string.IsNullOrWhiteSpace(request.CameraAngle))
+                {
+                    await _layerRepo.UpdateCameraAngleAsync(layerId, projectId, request.CameraAngle);
+                }
 
                 // Save the depth map as JPEG
                 if (depthMapBytes != null && depthMapBytes.Length > 0)
@@ -454,6 +582,145 @@ namespace TextureGen3D.API.Controllers
                 return Json(new ApiResponse { success = true, data = new
                 {
                     image = $"data:image/png;base64,{Convert.ToBase64String(imageBytes)}"
+                }});
+            }
+            catch (Exception ex)
+            {
+                return Json(new ApiResponse { success = false, message = ex.Message });
+            }
+        }
+
+        public class UpdateVisibleRequest
+        {
+            public bool Visible { get; set; }
+        }
+
+        [HttpPost("{projectId}/{layerId}/toggle-visible")]
+        public async Task<IActionResult> ToggleVisible(Guid projectId, Guid layerId, [FromBody] UpdateVisibleRequest request)
+        {
+            try
+            {
+                var userId = GetUserId();
+                if (userId == Guid.Empty)
+                    return Json(new ApiResponse { success = false, message = "Could not find user" });
+
+                var project = await _projectRepo.GetByIdAsync(projectId, userId);
+                if (project == null)
+                    return Json(new ApiResponse { success = false, message = "Project not found" });
+
+                await _layerRepo.UpdateVisibleAsync(layerId, projectId, request.Visible);
+                return Json(new ApiResponse { success = true });
+            }
+            catch (Exception ex)
+            {
+                return Json(new ApiResponse { success = false, message = ex.Message });
+            }
+        }
+
+        public class StitchRequest
+        {
+            public Guid MeshId { get; set; }
+            public int ImageModelId { get; set; }
+            public List<Guid> LayerIds { get; set; } = new();
+        }
+
+        [HttpPost("{projectId}/stitch-layers")]
+        public async Task<IActionResult> StitchLayers(Guid projectId, [FromBody] StitchRequest request)
+        {
+            try
+            {
+                var userId = GetUserId();
+                if (userId == Guid.Empty)
+                    return Json(new ApiResponse { success = false, message = "Could not find user" });
+
+                var project = await _projectRepo.GetByIdAsync(projectId, userId);
+                if (project == null)
+                    return Json(new ApiResponse { success = false, message = "Project not found" });
+
+                // Collect UV map images from selected layers
+                var inputImages = new List<byte[]>();
+                foreach (var layerId in request.LayerIds)
+                {
+                    var uvmapBytes = await _imageService.GetProjectMeshLayerUvMapAsync(projectId, request.MeshId, layerId);
+                    if (uvmapBytes != null && uvmapBytes.Length > 0)
+                        inputImages.Add(uvmapBytes);
+                }
+
+                if (inputImages.Count == 0)
+                    return Json(new ApiResponse { success = false, message = "No UV maps found in selected layers" });
+
+                // Get the image generation model
+                var imageModel = await _imageGenModelRepo.GetByIdAsync(request.ImageModelId);
+                if (imageModel == null)
+                    return Json(new ApiResponse { success = false, message = "Image model not found" });
+
+                // Build the stitch prompt
+                var stitchPrompt = "You are given multiple UV map texture layers for a single 3D model. " +
+                    "Each image is a UV map texture with transparent regions where that layer has no coverage. " +
+                    "Stitch all UV map layers together into a single seamless, high-quality albedo texture map. " +
+                    "Merge overlapping regions by blending colors smoothly. " +
+                    "Fill any remaining transparent gaps with the nearest surrounding colors. " +
+                    "The final image must be a complete, seamless UV texture map with no transparency, " +
+                    "no shadows, no lighting, no highlights, and no reflections — only flat base colors " +
+                    "and surface details suitable for projection onto a 3D model.";
+
+                // Select the correct IImageGeneration implementation
+                var genService = _allImageGenerations.FirstOrDefault(g => g.ModelKey == imageModel.ModelKey)
+                    ?? _imageGeneration;
+
+                var genRequest = new ImageGenerationRequest
+                {
+                    Prompt = stitchPrompt,
+                    Model = imageModel.Model,
+                    Width = 1024,
+                    Height = 1024,
+                    InputImages = inputImages,
+                };
+
+                var result = await genService.GenerateAsync(genRequest);
+                if (result.ImageBytes == null || result.ImageBytes.Length == 0)
+                    return Json(new ApiResponse { success = false, message = "Image generation returned no image" });
+
+                // Get all existing layers for this mesh
+                var existingLayers = await _layerRepo.GetByMeshIdAsync(request.MeshId, projectId);
+
+                // Increment all existing layers' indices by 1
+                foreach (var layer in existingLayers)
+                {
+                    await _layerRepo.UpdateIndexAsync(layer.Id, projectId, layer.Index + 1);
+                }
+
+                // Set all existing layers' visibility to false
+                await _layerRepo.SetAllVisibleAsync(request.MeshId, projectId, false);
+
+                // Create the new stitched layer at index 0
+                var newLayer = new ProjectMeshLayer
+                {
+                    ProjectId = projectId,
+                    ProjectMeshId = request.MeshId,
+                    Name = "Stitched",
+                    Index = 0,
+                    CameraAngle = "",
+                    Visible = true,
+                };
+                var createdLayer = await _layerRepo.CreateAsync(newLayer);
+
+                // Save the generated image to the new layer
+                await _imageService.SaveProjectMeshLayerImageAsync(projectId, request.MeshId, createdLayer.Id, result.ImageBytes);
+
+                // Generate and save thumbnail
+                var thumbBytes = await _imageService.GenerateThumbnailAsync(result.ImageBytes, 100);
+                await _imageService.SaveProjectMeshLayerThumbAsync(projectId, request.MeshId, createdLayer.Id, thumbBytes);
+
+                // The generated image IS the UV map (it's a stitched UV map texture)
+                await _imageService.SaveProjectMeshLayerUvMapAsync(projectId, request.MeshId, createdLayer.Id, result.ImageBytes);
+                var uvThumbBytes = await _imageService.GenerateThumbnailAsync(result.ImageBytes, 100);
+                await _imageService.SaveProjectMeshLayerUvMapThumbAsync(projectId, request.MeshId, createdLayer.Id, uvThumbBytes);
+
+                return Json(new ApiResponse { success = true, data = new
+                {
+                    layerId = createdLayer.Id,
+                    image = $"data:image/png;base64,{Convert.ToBase64String(result.ImageBytes)}"
                 }});
             }
             catch (Exception ex)

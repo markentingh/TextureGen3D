@@ -71,6 +71,8 @@ namespace TextureGen3D.API.Controllers
             public Guid ModelId { get; set; }
             public Guid MeshId { get; set; }
             public string Rotation { get; set; } = "{}";
+            public string Prompt { get; set; } = "";
+            public Guid? ProjectReferenceId { get; set; }
         }
 
         [HttpPost("{projectId}")]
@@ -92,9 +94,65 @@ namespace TextureGen3D.API.Controllers
                     ModelId = request.ModelId,
                     MeshId = request.MeshId,
                     Rotation = request.Rotation,
+                    Prompt = request.Prompt ?? "",
+                    ProjectReferenceId = request.ProjectReferenceId,
                 };
                 var created = await _angleRepo.CreateAsync(angle);
                 return Json(new ApiResponse { success = true, data = created });
+            }
+            catch (Exception ex)
+            {
+                return Json(new ApiResponse { success = false, message = ex.Message });
+            }
+        }
+
+        public class UpdatePromptRequest
+        {
+            public string Prompt { get; set; } = "";
+        }
+
+        [HttpPost("{projectId}/{angleId}/update-prompt")]
+        public async Task<IActionResult> UpdatePrompt(Guid projectId, Guid angleId, [FromBody] UpdatePromptRequest request)
+        {
+            try
+            {
+                var userId = GetUserId();
+                if (userId == Guid.Empty)
+                    return Json(new ApiResponse { success = false, message = "Could not find user" });
+
+                var project = await _projectRepo.GetByIdAsync(projectId, userId);
+                if (project == null)
+                    return Json(new ApiResponse { success = false, message = "Project not found" });
+
+                await _angleRepo.UpdatePromptAsync(angleId, projectId, request.Prompt ?? "");
+                return Json(new ApiResponse { success = true });
+            }
+            catch (Exception ex)
+            {
+                return Json(new ApiResponse { success = false, message = ex.Message });
+            }
+        }
+
+        public class UpdateReferenceRequest
+        {
+            public Guid? ProjectReferenceId { get; set; }
+        }
+
+        [HttpPost("{projectId}/{angleId}/update-reference")]
+        public async Task<IActionResult> UpdateReference(Guid projectId, Guid angleId, [FromBody] UpdateReferenceRequest request)
+        {
+            try
+            {
+                var userId = GetUserId();
+                if (userId == Guid.Empty)
+                    return Json(new ApiResponse { success = false, message = "Could not find user" });
+
+                var project = await _projectRepo.GetByIdAsync(projectId, userId);
+                if (project == null)
+                    return Json(new ApiResponse { success = false, message = "Project not found" });
+
+                await _angleRepo.UpdateReferenceAsync(angleId, projectId, request.ProjectReferenceId);
+                return Json(new ApiResponse { success = true });
             }
             catch (Exception ex)
             {

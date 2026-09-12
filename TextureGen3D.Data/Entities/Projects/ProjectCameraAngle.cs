@@ -7,6 +7,8 @@ namespace TextureGen3D.Data.Entities.Projects
         public Guid ModelId { get; set; }
         public Guid MeshId { get; set; }
         public string Rotation { get; set; } = "{}";
+        public string Prompt { get; set; } = "";
+        public Guid? ProjectReferenceId { get; set; }
         public DateTime Created { get; set; }
     }
 }

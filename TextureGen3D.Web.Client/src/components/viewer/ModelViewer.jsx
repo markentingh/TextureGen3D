@@ -20,7 +20,7 @@ import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
  *   captureThumbnail(size=75) — renders the current view to a data URL thumbnail
  *   getCameraRotation() — returns { x, y, z } rotation of the camera in degrees
  */
-const ModelViewer = forwardRef(function ModelViewer({ selectedMesh }, ref) {
+const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded }, ref) {
   const containerRef = useRef(null);
   const sceneRef = useRef(null);
   const rendererRef = useRef(null);
@@ -30,6 +30,8 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh }, ref) {
   const animationFrameRef = useRef(null);
   const gridRef = useRef(null);
   const orthoCameraRef = useRef(null);
+  const onMeshLoadedRef = useRef(onMeshLoaded);
+  useEffect(() => { onMeshLoadedRef.current = onMeshLoaded; });
   const perspCameraRef = useRef(null);
 
   // Gizmo refs
@@ -640,7 +642,7 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh }, ref) {
     };
 
     const setRingThickness = (ring, tube) => {
-      if (!ring || !ring.geometry) return;
+      if (!ring || !ring.geometry || !ring.geometry.parameters || ring.geometry.parameters.radius == null) return;
       const currentRadius = ring.geometry.parameters.radius;
       ring.geometry.dispose();
       ring.geometry = new THREE.TorusGeometry(currentRadius, tube, 16, 64);
@@ -651,8 +653,8 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh }, ref) {
       if (hoveredRingRef.current) {
         const prev = hoveredRingRef.current;
         if (prev.userData.type === 'light') {
-          setRingThickness(prev, prev.userData.baseTube);
-          prev.material.opacity = prev.userData.baseOpacity;
+          if (prev.userData.baseTube != null) setRingThickness(prev, prev.userData.baseTube);
+          if (prev.userData.baseOpacity != null) prev.material.opacity = prev.userData.baseOpacity;
         } else if (prev.userData.type === 'axis') {
           prev.material.opacity = prev.userData.baseOpacity;
           // Reset the corresponding line
@@ -663,8 +665,8 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh }, ref) {
       hoveredRingRef.current = obj;
       if (obj) {
         if (obj.userData.type === 'light') {
-          setRingThickness(obj, obj.userData.hoverTube);
-          obj.material.opacity = obj.userData.hoverOpacity;
+          if (obj.userData.hoverTube != null) setRingThickness(obj, obj.userData.hoverTube);
+          if (obj.userData.hoverOpacity != null) obj.material.opacity = obj.userData.hoverOpacity;
         } else if (obj.userData.type === 'axis') {
           obj.material.opacity = obj.userData.hoverOpacity;
           // Brighten the corresponding line
@@ -797,6 +799,15 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh }, ref) {
             lightTmpQuat.setFromAxisAngle(freeWorldY, dy * sensitivity);
             lightTmpPos.applyQuaternion(lightTmpQuat);
             light.position.copy(lightTmpPos);
+            // Update the shader uniform on the mesh material so lighting reacts in real time
+            const mesh = currentMeshRef.current;
+            if (mesh) {
+              mesh.traverse((child) => {
+                if (child.isMesh && child.material && child.material.uniforms && child.material.uniforms.dir1Pos) {
+                  child.material.uniforms.dir1Pos.value.copy(light.position);
+                }
+              });
+            }
           }
           gizmoInteractionRef.current.lastX = e.clientX;
           gizmoInteractionRef.current.lastY = e.clientY;
@@ -924,6 +935,15 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh }, ref) {
 
   // Expose methods to parent via ref
   useImperativeHandle(ref, () => ({
+    getCameraAngle() {
+      const cam = cameraRef.current;
+      if (!cam) return null;
+      return {
+        x: THREE.MathUtils.radToDeg(cam.rotation.x),
+        y: THREE.MathUtils.radToDeg(cam.rotation.y),
+        z: THREE.MathUtils.radToDeg(cam.rotation.z),
+      };
+    },
     captureThumbnail(size = 75, rotation = null) {
       const mainCamera = cameraRef.current;
       const mesh = currentMeshRef.current;
@@ -1179,9 +1199,17 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh }, ref) {
       const maxDim = Math.max(size3.x, size3.y, size3.z) || 1;
       depthMesh.position.sub(center);
 
-      const depthCamera = new THREE.PerspectiveCamera(45, 1, 0.1, 1000);
-      const distance = (maxDim / 2) / Math.tan((depthCamera.fov * Math.PI / 180) / 2) * 1.4;
+      // Use an orthographic camera for the depth map — no perspective distortion,
+      // and depth values map linearly across the near/far range.
+      const frustumHalf = maxDim / 2 * 1.1; // small padding so the mesh isn't clipped
+      const depthCamera = new THREE.OrthographicCamera(
+        -frustumHalf, frustumHalf,
+        frustumHalf, -frustumHalf,
+        0.1, maxDim * 4
+      );
 
+      // Position the camera along the view direction
+      const camDistance = maxDim * 2; // well outside the mesh
       if (rotation) {
         depthCamera.rotation.set(
           THREE.MathUtils.degToRad(rotation.x || 0),
@@ -1191,20 +1219,22 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh }, ref) {
         depthCamera.updateMatrixWorld();
         const viewDir = new THREE.Vector3(0, 0, -1);
         viewDir.applyQuaternion(depthCamera.quaternion);
-        depthCamera.position.copy(viewDir.clone().multiplyScalar(-distance));
+        depthCamera.position.copy(viewDir.clone().multiplyScalar(-camDistance));
         depthCamera.up.set(0, 1, 0);
         depthCamera.lookAt(0, 0, 0);
       } else {
         const viewDir = new THREE.Vector3();
         mainCamera.getWorldDirection(viewDir);
-        depthCamera.position.copy(viewDir.clone().multiplyScalar(-distance));
+        depthCamera.position.copy(viewDir.clone().multiplyScalar(-camDistance));
         depthCamera.up.copy(mainCamera.up);
         depthCamera.lookAt(0, 0, 0);
       }
 
-      // Tighten near/far planes around the mesh so depth values span the full 0–1 range
-      depthCamera.near = distance - maxDim;
-      depthCamera.far = distance + maxDim;
+      // Tighten near/far planes tightly around the mesh so depth values
+      // span the full 0–1 range — brighter whites for near surfaces,
+      // darker greys for far surfaces.
+      depthCamera.near = camDistance - maxDim / 2 * 1.05;
+      depthCamera.far = camDistance + maxDim / 2 * 1.05;
       depthCamera.updateProjectionMatrix();
 
       depthRenderer.render(depthScene, depthCamera);
@@ -1227,171 +1257,288 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh }, ref) {
 
     /**
      * Project a generated image onto the mesh UV map based on the camera angle.
+     * Uses projective texturing (GPU shader) — renders the mesh in UV space and
+     * for each UV fragment, computes the projected texture coordinate using the
+     * projector camera's matrices and samples the generated image.
+     * No CPU-side pixel painting, no quantization gaps.
      * Returns a PNG data URL of the UV map with the projected texture.
-     * The UV map canvas is the same size as the generated image (1024x1024).
      */
     projectImageToUvMap(imageDataUrl, rotation = null, uvMapSize = 1024) {
-      const mainRenderer = rendererRef.current;
+      console.log('[UVProject] Starting, rotation:', rotation, 'uvMapSize:', uvMapSize);
       const mesh = currentMeshRef.current;
       const mainCamera = cameraRef.current;
-      if (!mainRenderer || !mesh || !mainCamera) return null;
-
-      // Use a render target on the existing renderer — no extra WebGL contexts
-      const renderTarget = new THREE.WebGLRenderTarget(uvMapSize, uvMapSize, {
-        format: THREE.RGBAFormat,
-        type: THREE.UnsignedByteType,
-        minFilter: THREE.NearestFilter,
-        magFilter: THREE.NearestFilter,
-      });
-
-      const uvScene = new THREE.Scene();
-      uvScene.background = new THREE.Color(0x000000);
-
-      // Clone mesh with a shader that encodes UV as RGB
-      const uvMesh = mesh.clone(true);
-      uvMesh.traverse((child) => {
-        if (child.isMesh) {
-          if (child.material) {
-            if (Array.isArray(child.material)) child.material.forEach((m) => m.dispose());
-            else child.material.dispose();
-          }
-          child.material = new THREE.ShaderMaterial({
-            vertexShader: `
-              varying vec2 vUv;
-              void main() {
-                vUv = uv;
-                gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
-              }
-            `,
-            fragmentShader: `
-              varying vec2 vUv;
-              void main() {
-                gl_FragColor = vec4(vUv.x, vUv.y, 0.0, 1.0);
-              }
-            `,
-            side: THREE.DoubleSide,
-          });
-        }
-      });
-      uvScene.add(uvMesh);
-
-      // Compute bounding box
-      const box = new THREE.Box3().setFromObject(uvMesh);
-      const center = box.getCenter(new THREE.Vector3());
-      const size3 = box.getSize(new THREE.Vector3());
-      const maxDim = Math.max(size3.x, size3.y, size3.z) || 1;
-      uvMesh.position.sub(center);
-
-      const uvCamera = new THREE.PerspectiveCamera(45, 1, 0.1, 1000);
-      const distance = (maxDim / 2) / Math.tan((uvCamera.fov * Math.PI / 180) / 2) * 1.4;
-
-      if (rotation) {
-        uvCamera.rotation.set(
-          THREE.MathUtils.degToRad(rotation.x || 0),
-          THREE.MathUtils.degToRad(rotation.y || 0),
-          THREE.MathUtils.degToRad(rotation.z || 0),
-        );
-        uvCamera.updateMatrixWorld();
-        const viewDir = new THREE.Vector3(0, 0, -1);
-        viewDir.applyQuaternion(uvCamera.quaternion);
-        uvCamera.position.copy(viewDir.clone().multiplyScalar(-distance));
-        uvCamera.up.set(0, 1, 0);
-        uvCamera.lookAt(0, 0, 0);
-      } else {
-        const viewDir = new THREE.Vector3();
-        mainCamera.getWorldDirection(viewDir);
-        uvCamera.position.copy(viewDir.clone().multiplyScalar(-distance));
-        uvCamera.up.copy(mainCamera.up);
-        uvCamera.lookAt(0, 0, 0);
+      if (!mesh || !mainCamera) {
+        console.log('[UVProject] No mesh or camera, returning null');
+        return null;
       }
-      uvCamera.updateProjectionMatrix();
+      console.log('[UVProject] Mesh found, camera found');
 
-      // Render UV-encoded scene to the render target and read back pixels
-      mainRenderer.setRenderTarget(renderTarget);
-      mainRenderer.setClearColor(0x000000, 1);
-      mainRenderer.clear();
-      mainRenderer.render(uvScene, uvCamera);
-
-      const uvEncodedData = new Uint8Array(uvMapSize * uvMapSize * 4);
-      mainRenderer.readRenderTargetPixels(renderTarget, 0, 0, uvMapSize, uvMapSize, uvEncodedData);
-
-      // Restore main render target
-      mainRenderer.setRenderTarget(null);
-
-      // Cleanup UV scene
-      uvScene.traverse((obj) => {
-        if (obj.geometry) obj.geometry.dispose();
-        if (obj.material) {
-          if (Array.isArray(obj.material)) obj.material.forEach((m) => m.dispose());
-          else obj.material.dispose();
-        }
-      });
-      renderTarget.dispose();
-
-      // Create the UV map canvas
-      const uvCanvas = document.createElement('canvas');
-      uvCanvas.width = uvMapSize;
-      uvCanvas.height = uvMapSize;
-      const uvCtx = uvCanvas.getContext('2d');
-      uvCtx.fillStyle = '#000000';
-      uvCtx.fillRect(0, 0, uvMapSize, uvMapSize);
-
-      // Load the generated image and paint onto the UV map
+      // Load the generated image as a texture first (needed for the shader)
+      console.log('[UVProject] Loading generated image...');
       const genImg = new Image();
       genImg.src = imageDataUrl;
 
       return new Promise((resolve) => {
         genImg.onload = () => {
-          const genCanvas = document.createElement('canvas');
-          genCanvas.width = uvMapSize;
-          genCanvas.height = uvMapSize;
-          const genCtx = genCanvas.getContext('2d');
-          genCtx.drawImage(genImg, 0, 0, uvMapSize, uvMapSize);
-          const genData = genCtx.getImageData(0, 0, uvMapSize, uvMapSize).data;
+          try {
+            console.log('[UVProject] Generated image loaded:', genImg.width, 'x', genImg.height);
 
-          const uvImageData = uvCtx.createImageData(uvMapSize, uvMapSize);
-          const uvPixels = uvImageData.data;
+            // Create the generated image texture — no color space conversion, pass RGB through directly
+            const genTexture = new THREE.Texture(genImg);
+            genTexture.needsUpdate = true;
 
-          // For each pixel in the UV-encoded render (flipped Y for canvas coords),
-          // paint the corresponding generated image pixel onto the UV map at the UV coordinates
-          for (let y = 0; y < uvMapSize; y++) {
-            // WebGL origin is bottom-left, canvas is top-left — flip Y
-            const srcY = uvMapSize - 1 - y;
-            for (let x = 0; x < uvMapSize; x++) {
-              const encIdx = (srcY * uvMapSize + x) * 4;
-              const r = uvEncodedData[encIdx];
-              const g = uvEncodedData[encIdx + 1];
+            // Create a hidden canvas + dedicated renderer so the main canvas is untouched
+            const hiddenCanvas = document.createElement('canvas');
+            hiddenCanvas.width = uvMapSize;
+            hiddenCanvas.height = uvMapSize;
+            hiddenCanvas.style.display = 'none';
+            document.body.appendChild(hiddenCanvas);
 
-              // Skip black pixels (background)
-              if (r === 0 && g === 0) continue;
+            const hiddenRenderer = new THREE.WebGLRenderer({
+              canvas: hiddenCanvas,
+              antialias: false,
+              alpha: true,
+              preserveDrawingBuffer: true,
+            });
+            hiddenRenderer.setPixelRatio(1);
+            hiddenRenderer.setSize(uvMapSize, uvMapSize);
+            hiddenRenderer.setClearColor(0x000000, 0); // transparent background
+            hiddenRenderer.autoClear = true;
+            console.log('[UVProject] Hidden renderer created');
 
-              const u = r / 255;
-              const v = g / 255;
+            const renderTarget = new THREE.WebGLRenderTarget(uvMapSize, uvMapSize, {
+              format: THREE.RGBAFormat,
+              type: THREE.UnsignedByteType,
+              minFilter: THREE.NearestFilter,
+              magFilter: THREE.NearestFilter,
+            });
 
-              // Sample generated image at (u, v)
-              const genX = Math.floor(u * uvMapSize);
-              const genY = Math.floor((1 - v) * uvMapSize);
-              if (genX < 0 || genX >= uvMapSize || genY < 0 || genY >= uvMapSize) continue;
+            // Compute bounding box of the original mesh to set up the projector camera
+            const box = new THREE.Box3().setFromObject(mesh);
+            const center = box.getCenter(new THREE.Vector3());
+            const size3 = box.getSize(new THREE.Vector3());
+            const maxDim = Math.max(size3.x, size3.y, size3.z) || 1;
+            console.log('[UVProject] Bounding box:', { center: { x: center.x, y: center.y, z: center.z }, size: { x: size3.x, y: size3.y, z: size3.z }, maxDim });
 
-              const genIdx = (genY * uvMapSize + genX) * 4;
+            // Create orthographic projector camera — no perspective distortion
+            const frustumHalf = maxDim / 2 * 1.1;
+            const projCamera = new THREE.OrthographicCamera(
+              -frustumHalf, frustumHalf,
+              frustumHalf, -frustumHalf,
+              0.1, maxDim * 4
+            );
+            const camDistance = maxDim * 2;
 
-              // Paint onto UV map at (u, v)
-              const uvX = Math.floor(u * uvMapSize);
-              const uvY = Math.floor((1 - v) * uvMapSize);
-              if (uvX < 0 || uvX >= uvMapSize || uvY < 0 || uvY >= uvMapSize) continue;
-
-              const uvIdx = (uvY * uvMapSize + uvX) * 4;
-              uvPixels[uvIdx] = genData[genIdx];
-              uvPixels[uvIdx + 1] = genData[genIdx + 1];
-              uvPixels[uvIdx + 2] = genData[genIdx + 2];
-              uvPixels[uvIdx + 3] = 255;
+            if (rotation) {
+              projCamera.rotation.set(
+                THREE.MathUtils.degToRad(rotation.x || 0),
+                THREE.MathUtils.degToRad(rotation.y || 0),
+                THREE.MathUtils.degToRad(rotation.z || 0),
+              );
+              projCamera.updateMatrixWorld();
+              const viewDir = new THREE.Vector3(0, 0, -1);
+              viewDir.applyQuaternion(projCamera.quaternion);
+              projCamera.position.copy(viewDir.clone().multiplyScalar(-camDistance));
+              projCamera.up.set(0, 1, 0);
+              projCamera.lookAt(0, 0, 0);
+              console.log('[UVProject] Projector camera from rotation:', { pos: { x: projCamera.position.x, y: projCamera.position.y, z: projCamera.position.z } });
+            } else {
+              const viewDir = new THREE.Vector3();
+              mainCamera.getWorldDirection(viewDir);
+              projCamera.position.copy(viewDir.clone().multiplyScalar(-camDistance));
+              projCamera.up.copy(mainCamera.up);
+              projCamera.lookAt(0, 0, 0);
+              console.log('[UVProject] Projector camera from main camera:', { pos: { x: projCamera.position.x, y: projCamera.position.y, z: projCamera.position.z } });
             }
-          }
+            projCamera.updateMatrixWorld();
+            projCamera.updateProjectionMatrix();
 
-          uvCtx.putImageData(uvImageData, 0, 0);
-          resolve(uvCanvas.toDataURL('image/png'));
+            // Clone mesh with projective texturing shader that renders in UV space.
+            // The vertex shader uses UV as the clip-space position (so the output is a UV map),
+            // and passes the world position to the fragment shader for projective texturing.
+            // The fragment shader transforms the world position by the projector camera
+            // matrices to find where this fragment appears in the generated image, then
+            // samples the generated image at that position.
+            const uvScene = new THREE.Scene();
+            const uvMesh = mesh.clone(true);
+            let meshChildCount = 0;
+            uvMesh.traverse((child) => {
+              if (child.isMesh) {
+                meshChildCount++;
+                if (child.material) {
+                  if (Array.isArray(child.material)) child.material.forEach((m) => m.dispose());
+                  else child.material.dispose();
+                }
+                child.material = new THREE.ShaderMaterial({
+                  uniforms: {
+                    cameraMatrix: { value: projCamera.matrixWorldInverse },
+                    projMatrix: { value: projCamera.projectionMatrix },
+                    projTexture: { value: genTexture },
+                    cameraPos: { value: projCamera.position },
+                    uvMapSize: { value: uvMapSize },
+                  },
+                  vertexShader: `
+                    varying vec4 vWorldPos;
+                    varying vec3 vWorldNormal;
+                    void main() {
+                      vWorldPos = modelMatrix * vec4(position, 1.0);
+                      vWorldNormal = normalize(mat3(modelMatrix) * normal);
+                      // Render in UV space: map UV (0,0)-(1,1) to NDC (-1,-1)-(1,1)
+                      gl_Position = vec4(uv * 2.0 - 1.0, 0.0, 1.0);
+                    }
+                  `,
+                  fragmentShader: `
+                    uniform mat4 cameraMatrix;
+                    uniform mat4 projMatrix;
+                    uniform sampler2D projTexture;
+                    uniform vec3 cameraPos;
+                    uniform float uvMapSize;
+                    varying vec4 vWorldPos;
+                    varying vec3 vWorldNormal;
+                    void main() {
+                      vec3 worldPos = vWorldPos.xyz;
+                      vec3 normal = normalize(vWorldNormal);
+                      vec3 viewDir = normalize(cameraPos - worldPos);
+                      // Only project onto faces whose normals point toward the projector camera
+                      if (dot(normal, viewDir) <= 0.0) discard;
+                      // Project the world position into the projector camera's clip space
+                      vec4 texc = projMatrix * cameraMatrix * vWorldPos;
+                      vec2 uv = texc.xy / texc.w / 2.0 + 0.5;
+                      // Only paint if the fragment is inside the projector's frustum
+                      if (max(uv.x, uv.y) <= 1.0 && min(uv.x, uv.y) >= 0.0) {
+                        // Edge fade: fade out 50 pixels from each edge
+                        float fadePixels = 50.0;
+                        float fadeUv = fadePixels / uvMapSize;
+                        float edgeFade = min(
+                          min(uv.x, 1.0 - uv.x),
+                          min(uv.y, 1.0 - uv.y)
+                        ) / fadeUv;
+                        float alpha = clamp(edgeFade, 0.0, 1.0);
+                        gl_FragColor = vec4(texture2D(projTexture, uv).rgb, alpha);
+                      } else {
+                        discard; // transparent — outside projector frustum
+                      }
+                    }
+                  `,
+                  side: THREE.DoubleSide,
+                });
+              }
+            });
+            uvScene.add(uvMesh);
+            console.log('[UVProject] Mesh cloned with projective shader, child mesh count:', meshChildCount);
+
+            // Render the UV-space scene to the render target
+            hiddenRenderer.setRenderTarget(renderTarget);
+            hiddenRenderer.setClearColor(0x000000, 0);
+            hiddenRenderer.clear();
+            hiddenRenderer.render(uvScene, projCamera);
+            console.log('[UVProject] Rendered UV-space projective scene to render target');
+
+            // Read pixels from the render target
+            const pixels = new Uint8Array(uvMapSize * uvMapSize * 4);
+            hiddenRenderer.readRenderTargetPixels(renderTarget, 0, 0, uvMapSize, uvMapSize, pixels);
+
+            // Count non-transparent pixels
+            let nonTransparentCount = 0;
+            for (let i = 3; i < pixels.length; i += 4) {
+              if (pixels[i] !== 0) nonTransparentCount++;
+            }
+            console.log('[UVProject] Non-transparent pixels:', nonTransparentCount, '/', uvMapSize * uvMapSize);
+
+            // Cleanup render target + UV scene + hidden renderer
+            hiddenRenderer.setRenderTarget(null);
+            uvScene.traverse((obj) => {
+              if (obj.geometry) obj.geometry.dispose();
+              if (obj.material) {
+                if (Array.isArray(obj.material)) obj.material.forEach((m) => m.dispose());
+                else obj.material.dispose();
+              }
+            });
+            genTexture.dispose();
+            renderTarget.dispose();
+            hiddenRenderer.dispose();
+            hiddenRenderer.forceContextLoss();
+            hiddenCanvas.remove();
+
+            // Write pixels to a 2D canvas, flipping Y (WebGL origin is bottom-left, canvas is top-left)
+            const uvCanvas = document.createElement('canvas');
+            uvCanvas.width = uvMapSize;
+            uvCanvas.height = uvMapSize;
+            const uvCtx = uvCanvas.getContext('2d');
+            const uvImageData = uvCtx.createImageData(uvMapSize, uvMapSize);
+            for (let y = 0; y < uvMapSize; y++) {
+              const srcRow = (uvMapSize - 1 - y) * uvMapSize * 4;
+              const dstRow = y * uvMapSize * 4;
+              for (let x = 0; x < uvMapSize * 4; x++) {
+                uvImageData.data[dstRow + x] = pixels[srcRow + x];
+              }
+            }
+
+            // Dilate colored pixels 2px into transparent areas to bleed colors
+            // outside UV island edges and avoid creases on the mesh
+            const bleedPixels = 2;
+            for (let pass = 0; pass < bleedPixels; pass++) {
+              const srcData = new Uint8ClampedArray(uvImageData.data);
+              for (let y = 0; y < uvMapSize; y++) {
+                for (let x = 0; x < uvMapSize; x++) {
+                  const idx = (y * uvMapSize + x) * 4;
+                  // Only dilate transparent pixels
+                  if (srcData[idx + 3] > 0) continue;
+                  // Find the nearest non-transparent neighbor (4-connected)
+                  let found = false;
+                  // Check 4 neighbors
+                  const neighbors = [
+                    x > 0 ? (y * uvMapSize + (x - 1)) * 4 : -1,
+                    x < uvMapSize - 1 ? (y * uvMapSize + (x + 1)) * 4 : -1,
+                    y > 0 ? ((y - 1) * uvMapSize + x) * 4 : -1,
+                    y < uvMapSize - 1 ? ((y + 1) * uvMapSize + x) * 4 : -1,
+                  ];
+                  for (const nIdx of neighbors) {
+                    if (nIdx >= 0 && srcData[nIdx + 3] > 0) {
+                      uvImageData.data[idx] = srcData[nIdx];
+                      uvImageData.data[idx + 1] = srcData[nIdx + 1];
+                      uvImageData.data[idx + 2] = srcData[nIdx + 2];
+                      uvImageData.data[idx + 3] = 255;
+                      found = true;
+                      break;
+                    }
+                  }
+                  if (!found) {
+                    // Check 8-connected (diagonals) as fallback
+                    const diagonals = [
+                      x > 0 && y > 0 ? ((y - 1) * uvMapSize + (x - 1)) * 4 : -1,
+                      x < uvMapSize - 1 && y > 0 ? ((y - 1) * uvMapSize + (x + 1)) * 4 : -1,
+                      x > 0 && y < uvMapSize - 1 ? ((y + 1) * uvMapSize + (x - 1)) * 4 : -1,
+                      x < uvMapSize - 1 && y < uvMapSize - 1 ? ((y + 1) * uvMapSize + (x + 1)) * 4 : -1,
+                    ];
+                    for (const dIdx of diagonals) {
+                      if (dIdx >= 0 && srcData[dIdx + 3] > 0) {
+                        uvImageData.data[idx] = srcData[dIdx];
+                        uvImageData.data[idx + 1] = srcData[dIdx + 1];
+                        uvImageData.data[idx + 2] = srcData[dIdx + 2];
+                        uvImageData.data[idx + 3] = 255;
+                        break;
+                      }
+                    }
+                  }
+                }
+              }
+            }
+
+            uvCtx.putImageData(uvImageData, 0, 0);
+
+            const result = uvCanvas.toDataURL('image/png');
+            console.log('[UVProject] UV map data URL length:', result?.length);
+            resolve(result);
+          } catch (err) {
+            console.error('[UVProject] Error:', err);
+            resolve(null);
+          }
         };
-        genImg.onerror = () => resolve(null);
+        genImg.onerror = () => {
+          console.error('[UVProject] Generated image failed to load');
+          resolve(null);
+        };
       });
     },
 
@@ -1421,7 +1568,7 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh }, ref) {
       const textures = uvMapUrls.map((url) => {
         if (!url) return null;
         const tex = loader.load(url);
-        tex.flipY = false;
+        tex.flipY = true; // canvas paints v=0 at bottom; flipY=true maps UV v=0 to canvas bottom
         return tex;
       });
 
@@ -1448,20 +1595,33 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh }, ref) {
 
       const layerCount = Math.min(validTextures.length, 16);
 
-      // Build uniforms with one sampler2D per layer (up to 16)
-      const uniforms = { layerCount: { value: layerCount } };
+      // Collect the directional light position for the shader
+      const dirLight1 = dirLight1Ref.current;
+      const dir1Pos = dirLight1 ? dirLight1.position : new THREE.Vector3(10, 10, 10);
+
+      // Build uniforms with one sampler2D per layer (up to 16) + light position
+      const uniforms = {
+        layerCount: { value: layerCount },
+        dir1Pos: { value: dir1Pos },
+      };
       for (let i = 0; i < layerCount; i++) {
         uniforms[`layer${i}`] = { value: validTextures[i] };
       }
 
-      // Dynamically generate the fragment shader with exactly layerCount samplers
+      // Dynamically generate the fragment shader with exactly layerCount samplers + shadow lighting
+      // Layers are applied in reverse order (highest index first, lowest index last)
+      // so that lower-index layers appear on top of higher-index layers
+      const layerIndices = Array.from({ length: layerCount }, (_, i) => layerCount - 1 - i);
       const fragmentShader = `
         uniform int layerCount;
         ${Array.from({ length: layerCount }, (_, i) => `uniform sampler2D layer${i};`).join('\n        ')}
+        uniform vec3 dir1Pos;
         varying vec2 vUv;
+        varying vec3 vNormal;
+        varying vec3 vWorldPos;
         void main() {
           vec4 color = vec4(0.0);
-          ${Array.from({ length: layerCount }, (_, i) => `
+          ${layerIndices.map((i) => `
           {
             vec4 layerColor${i} = texture2D(layer${i}, vUv);
             float mask${i} = step(0.01, length(layerColor${i}.rgb));
@@ -1469,7 +1629,15 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh }, ref) {
             color.a = max(color.a, layerColor${i}.a * mask${i});
           }`).join('')}
           if (color.a < 0.01) discard;
-          gl_FragColor = color;
+
+          // Shadow-only lighting: don't brighten the texture, only darken areas facing away from the light
+          vec3 normal = normalize(vNormal);
+          vec3 lightDir = normalize(dir1Pos - vWorldPos);
+          float NdotL = dot(normal, lightDir);
+          // Shadow factor: 1.0 (no shadow) when facing the light, 0.35 (dark) when facing away
+          float shadow = mix(0.35, 1.0, clamp(NdotL * 0.5 + 0.5, 0.0, 1.0));
+
+          gl_FragColor = vec4(color.rgb * shadow, color.a);
         }
       `;
 
@@ -1483,8 +1651,12 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh }, ref) {
             uniforms,
             vertexShader: `
               varying vec2 vUv;
+              varying vec3 vNormal;
+              varying vec3 vWorldPos;
               void main() {
                 vUv = uv;
+                vNormal = normalize(mat3(modelMatrix) * normal);
+                vWorldPos = (modelMatrix * vec4(position, 1.0)).xyz;
                 gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
               }
             `,
@@ -1602,6 +1774,9 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh }, ref) {
     camera.up.set(0, 1, 0);
     controls.target.set(0, 0, 0);
     controls.update();
+
+    // Notify parent that the mesh has been loaded into the viewer
+    if (onMeshLoadedRef.current) onMeshLoadedRef.current(meshMeta);
   }, []);
 
   useEffect(() => {

@@ -34,3 +34,11 @@
 *::-webkit-scrollbar-thumb:hover {
   background-color: #9333ea;
 }
+
+@keyframes icon-spin {
+  to { transform: rotate(360deg); }
+}
+
+.icon-spin {
+  animation: icon-spin 1s linear infinite;
+}

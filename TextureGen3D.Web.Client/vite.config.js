@@ -55,6 +55,11 @@ export default defineConfig(({ mode }) => {
                 '^/api': {
                     target,
                     secure: false
+                },
+                '^/hubs': {
+                    target,
+                    secure: false,
+                    ws: true
                 }
             },
             port: port,

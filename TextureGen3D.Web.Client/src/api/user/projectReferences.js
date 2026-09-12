@@ -16,7 +16,10 @@ const ProjectReferences = (args) => Api({ ...args }).endpoints(({ api }) => {
     delete: (projectId, referenceId) => api.post(`${apiPath}/${projectId}/${referenceId}/delete`),
     updateActive: (projectId, referenceId, active) => api.post(`${apiPath}/${projectId}/${referenceId}/update-active?active=${active}`),
     generate: (projectId, data) => api.post(`${apiPath}/${projectId}/generate`, data),
-    saveGenerated: (projectId, data) => api.post(`${apiPath}/${projectId}/save-generated`, data),
+    saveGenerated: (projectId, imageBase64, mode, referenceId) =>
+      api.post(`${apiPath}/${projectId}/save-generated?mode=${mode}&referenceId=${referenceId || ''}`, imageBase64, {
+        headers: { 'Content-Type': 'text/plain' }
+      }),
   };
 });
 

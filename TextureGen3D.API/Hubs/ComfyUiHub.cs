@@ -17,19 +17,22 @@ namespace TextureGen3D.API.Hubs
         readonly IImageGenerationModelRepository _imageGenModelRepo;
         readonly IProjectMeshReferenceRepository _meshRefRepo;
         readonly IProjectReferenceRepository _refRepo;
+        readonly IProjectCameraAngleRepository _angleRepo;
         readonly IImageService _imageService;
 
         public ComfyUiHub(
-            IEnumerable<IImageGeneration> imageGenerations,
+            ImageGenerationForComfyUI comfyUiService,
             IImageGenerationModelRepository imageGenModelRepo,
             IProjectMeshReferenceRepository meshRefRepo,
             IProjectReferenceRepository refRepo,
+            IProjectCameraAngleRepository angleRepo,
             IImageService imageService)
         {
-            _comfyUiService = imageGenerations.OfType<ImageGenerationForComfyUI>().First();
+            _comfyUiService = comfyUiService;
             _imageGenModelRepo = imageGenModelRepo;
             _meshRefRepo = meshRefRepo;
             _refRepo = refRepo;
+            _angleRepo = angleRepo;
             _imageService = imageService;
         }
 
@@ -42,45 +45,61 @@ namespace TextureGen3D.API.Hubs
         public async Task GenerateImage(
             int imageModelId,
             string prompt,
-            string depthMapBase64,
             Guid projectId,
-            Guid meshId)
+            Guid meshId,
+            Guid layerId,
+            Guid? cameraAngleId = null)
         {
             try
             {
                 var imageModel = await _imageGenModelRepo.GetByIdAsync(imageModelId);
                 if (imageModel == null)
                 {
-                    await Clients.Caller.SendAsync("GenerationError", "Image model not found.");
+                    await Clients.Caller.SendAsync("GenerationError", "Image model not found.", null);
                     return;
                 }
 
                 if (string.IsNullOrWhiteSpace(imageModel.WorkflowJson))
                 {
-                    await Clients.Caller.SendAsync("GenerationError", "ComfyUI model has no workflow JSON configured.");
+                    await Clients.Caller.SendAsync("GenerationError", "ComfyUI model has no workflow JSON configured.", null);
                     return;
                 }
 
                 // Build input images: depth map first, then active mesh references
                 var inputImages = new List<byte[]>();
 
-                if (!string.IsNullOrWhiteSpace(depthMapBase64))
-                {
-                    var base64 = depthMapBase64.StartsWith("data:")
-                        ? depthMapBase64[(depthMapBase64.IndexOf(',') + 1)..]
-                        : depthMapBase64;
-                    inputImages.Add(Convert.FromBase64String(base64));
-                }
+                // Read the depth map from storage (uploaded via API before connecting to hub)
+                var depthMapBytes = await _imageService.GetProjectMeshLayerDepthMapAsync(projectId, meshId, layerId);
+                if (depthMapBytes != null && depthMapBytes.Length > 0)
+                    inputImages.Add(depthMapBytes);
 
-                // Fetch active image references for this mesh from ProjectMeshReferences
-                var meshRefs = await _meshRefRepo.GetByMeshIdAsync(meshId, projectId);
-                foreach (var meshRef in meshRefs.Where(mr => mr.Active))
+                // Fetch image references: use camera angle's reference if cameraAngleId is set, otherwise mesh references
+                if (cameraAngleId.HasValue)
                 {
-                    var reference = await _refRepo.GetByIdAsync(meshRef.ProjectReferenceId, projectId);
-                    if (reference == null) continue;
-                    var refBytes = await _imageService.GetProjectReferenceAsync(projectId, reference.Id, reference.Extension);
-                    if (refBytes != null && refBytes.Length > 0)
-                        inputImages.Add(refBytes);
+                    var angle = await _angleRepo.GetByIdAsync(cameraAngleId.Value, projectId);
+                    if (angle != null && angle.ProjectReferenceId.HasValue)
+                    {
+                        var reference = await _refRepo.GetByIdAsync(angle.ProjectReferenceId.Value, projectId);
+                        if (reference != null)
+                        {
+                            var refBytes = await _imageService.GetProjectReferenceAsync(projectId, reference.Id, reference.Extension);
+                            if (refBytes != null && refBytes.Length > 0)
+                                inputImages.Add(refBytes);
+                        }
+                    }
+                }
+                else
+                {
+                    // Fetch active image references for this mesh from ProjectMeshReferences
+                    var meshRefs = await _meshRefRepo.GetByMeshIdAsync(meshId, projectId);
+                    foreach (var meshRef in meshRefs.Where(mr => mr.Active))
+                    {
+                        var reference = await _refRepo.GetByIdAsync(meshRef.ProjectReferenceId, projectId);
+                        if (reference == null) continue;
+                        var refBytes = await _imageService.GetProjectReferenceAsync(projectId, reference.Id, reference.Extension);
+                        if (refBytes != null && refBytes.Length > 0)
+                            inputImages.Add(refBytes);
+                    }
                 }
 
                 var genRequest = new ImageGenerationRequest
@@ -92,11 +111,11 @@ namespace TextureGen3D.API.Hubs
                     InputImages = inputImages,
                 };
 
-                var progress = new Progress<(int value, string? message)>(async p =>
+                var progress = new Progress<(int value, string? message)>(p =>
                 {
                     try
                     {
-                        await Clients.Caller.SendAsync("ProgressUpdate", p.value, p.message);
+                        _ = Clients.Caller.SendAsync("ProgressUpdate", p.value, p.message);
                     }
                     catch { /* client may have disconnected */ }
                 });
@@ -107,6 +126,7 @@ namespace TextureGen3D.API.Hubs
                     imageModel.PromptPath ?? "",
                     imageModel.DepthMapPath ?? "",
                     imageModel.InputImagesPath ?? "",
+                    layerId.ToString(),
                     progress,
                     Context.ConnectionAborted);
 
@@ -116,7 +136,9 @@ namespace TextureGen3D.API.Hubs
             }
             catch (Exception ex)
             {
-                await Clients.Caller.SendAsync("GenerationError", ex.Message);
+                Console.Error.WriteLine($"ComfyUI Generation Error: {ex}");
+                Console.Error.WriteLine($"Stack trace:\n{ex.StackTrace}");
+                await Clients.Caller.SendAsync("GenerationError", ex.Message, ex.StackTrace);
             }
         }
     }

@@ -22,8 +22,8 @@ namespace TextureGen3D.Data.Repositories.Projects
                 layer.Created = DateTime.UtcNow;
 
             const string query = @"
-                INSERT INTO public.""ProjectMeshLayers"" (""Id"", ""ProjectId"", ""ProjectMeshId"", ""Name"", ""Index"", ""Created"")
-                VALUES (@Id, @ProjectId, @ProjectMeshId, @Name, @Index, @Created)
+                INSERT INTO public.""ProjectMeshLayers"" (""Id"", ""ProjectId"", ""ProjectMeshId"", ""Name"", ""Index"", ""CameraAngle"", ""Visible"", ""Created"")
+                VALUES (@Id, @ProjectId, @ProjectMeshId, @Name, @Index, @CameraAngle, @Visible, @Created)
                 RETURNING *";
             return await _dbConnection.QueryFirstAsync<ProjectMeshLayer>(query, layer);
         }
@@ -50,6 +50,24 @@ namespace TextureGen3D.Data.Repositories.Projects
         {
             const string query = @"UPDATE public.""ProjectMeshLayers"" SET ""Name"" = @name WHERE ""Id"" = @id AND ""ProjectId"" = @projectId";
             await _dbConnection.ExecuteAsync(query, new { id, projectId, name });
+        }
+
+        public async Task UpdateCameraAngleAsync(Guid id, Guid projectId, string cameraAngle)
+        {
+            const string query = @"UPDATE public.""ProjectMeshLayers"" SET ""CameraAngle"" = @cameraAngle WHERE ""Id"" = @id AND ""ProjectId"" = @projectId";
+            await _dbConnection.ExecuteAsync(query, new { id, projectId, cameraAngle });
+        }
+
+        public async Task UpdateVisibleAsync(Guid id, Guid projectId, bool visible)
+        {
+            const string query = @"UPDATE public.""ProjectMeshLayers"" SET ""Visible"" = @visible WHERE ""Id"" = @id AND ""ProjectId"" = @projectId";
+            await _dbConnection.ExecuteAsync(query, new { id, projectId, visible });
+        }
+
+        public async Task SetAllVisibleAsync(Guid meshId, Guid projectId, bool visible)
+        {
+            const string query = @"UPDATE public.""ProjectMeshLayers"" SET ""Visible"" = @visible WHERE ""ProjectMeshId"" = @meshId AND ""ProjectId"" = @projectId";
+            await _dbConnection.ExecuteAsync(query, new { meshId, projectId, visible });
         }
 
         public async Task UpdateIndexAsync(Guid id, Guid projectId, int index)

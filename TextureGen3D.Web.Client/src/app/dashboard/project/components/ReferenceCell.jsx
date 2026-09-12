@@ -1,8 +1,10 @@
 import React, { useState, useRef, useEffect, memo } from 'react';
+import { createPortal } from 'react-dom';
 import { ProjectReferences } from '@/api/user/projectReferences';
 
 const ReferenceCell = memo(function ReferenceCell({ ref_, projectId, token, onToggleActive, onDelete, onNewImage, onEditImage }) {
   const [menuOpen, setMenuOpen] = useState(false);
+  const [menuPos, setMenuPos] = useState({ top: 0, left: 0 });
   const menuRef = useRef(null);
   const thumbUrl = ProjectReferences({ token }).thumbUrl(projectId, ref_.id);
 
@@ -37,9 +39,20 @@ const ReferenceCell = memo(function ReferenceCell({ ref_, projectId, token, onTo
       />
 
       {/* 3-dot menu top-right */}
-      <div className="absolute top-0.5 right-0.5" ref={menuRef}>
+      <div className="absolute top-0.5 right-0.5">
         <button
-          onClick={(e) => { e.stopPropagation(); setMenuOpen(!menuOpen); }}
+          onClick={(e) => {
+            e.stopPropagation();
+            if (menuOpen) {
+              setMenuOpen(false);
+            } else {
+              const rect = e.currentTarget.getBoundingClientRect();
+              // Right-align the 112px (w-28) menu with the button's right edge
+              const left = Math.max(4, rect.right - 112);
+              setMenuPos({ top: rect.bottom + 2, left });
+              setMenuOpen(true);
+            }
+          }}
           className="p-0.5 rounded bg-black/50 text-white opacity-0 group-hover:opacity-100 transition hover:bg-black/70"
           aria-label="Reference menu"
         >
@@ -47,22 +60,6 @@ const ReferenceCell = memo(function ReferenceCell({ ref_, projectId, token, onTo
             <path d="M12 8c1.1 0 2-.9 2-2s-.9-2-2-2-2 .9-2 2 .9 2 2 2zm0 2c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm0 6c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2z" />
           </svg>
         </button>
-        {menuOpen && (
-          <div className="absolute right-0 top-5 z-10 w-28 rounded-lg border border-gray-200 dark:border-gray-600 bg-white dark:bg-gray-800 shadow-lg py-1">
-            <button
-              onClick={(e) => { e.stopPropagation(); setMenuOpen(false); onNewImage(); }}
-              className="w-full px-3 py-1.5 text-left text-xs text-gray-700 dark:text-gray-200 hover:bg-gray-100 dark:hover:bg-gray-700 transition"
-            >
-              New Image
-            </button>
-            <button
-              onClick={(e) => { e.stopPropagation(); setMenuOpen(false); onEditImage(); }}
-              className="w-full px-3 py-1.5 text-left text-xs text-gray-700 dark:text-gray-200 hover:bg-gray-100 dark:hover:bg-gray-700 transition"
-            >
-              Edit Image
-            </button>
-          </div>
-        )}
       </div>
 
       {/* Delete icon bottom-right (hover only) */}
@@ -75,6 +72,29 @@ const ReferenceCell = memo(function ReferenceCell({ ref_, projectId, token, onTo
           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
         </svg>
       </button>
+
+      {/* Dropdown menu rendered via portal at document.body level (escapes all overflow/transform containers) */}
+      {menuOpen && createPortal(
+        <div
+          ref={menuRef}
+          className="fixed z-50 w-28 rounded-lg border border-gray-200 dark:border-gray-600 bg-white dark:bg-gray-800 shadow-lg py-1"
+          style={{ top: menuPos.top, left: menuPos.left }}
+        >
+          <button
+            onClick={(e) => { e.stopPropagation(); setMenuOpen(false); onNewImage(); }}
+            className="w-full px-3 py-1.5 text-left text-xs text-gray-700 dark:text-gray-200 hover:bg-gray-100 dark:hover:bg-gray-700 transition"
+          >
+            New Image
+          </button>
+          <button
+            onClick={(e) => { e.stopPropagation(); setMenuOpen(false); onEditImage(); }}
+            className="w-full px-3 py-1.5 text-left text-xs text-gray-700 dark:text-gray-200 hover:bg-gray-100 dark:hover:bg-gray-700 transition"
+          >
+            Edit Image
+          </button>
+        </div>,
+        document.body
+      )}
     </div>
   );
 });

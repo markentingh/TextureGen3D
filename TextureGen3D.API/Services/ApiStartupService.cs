@@ -20,6 +20,7 @@ namespace TextureGen3D.API.Services
             // Register all IImageGeneration implementations — the controller/hub
             // selects the correct one based on the model's ModelKey.
             builder.Services.AddTransient<IImageGeneration, ImageGenerationForOpenAI>();
+            builder.Services.AddTransient<IImageGeneration, ImageGenerationForComfyUI>();
             builder.Services.AddTransient<ImageGenerationForComfyUI>();
             builder.Services.AddTransient<IImageUpscaler, ImageUpscaler>();
             builder.Services.AddTransient<IImageTokens>(sp => new ImageTokensForOpenAI(0m, 0m, 0m));
@@ -27,7 +28,10 @@ namespace TextureGen3D.API.Services
             builder.Services.AddScoped<IAITokenService, AITokenService>();
 
             // SignalR for real-time progress (ComfyUI)
-            builder.Services.AddSignalR();
+            builder.Services.AddSignalR(options =>
+            {
+                options.EnableDetailedErrors = true;
+            });
         }
     }
 }
