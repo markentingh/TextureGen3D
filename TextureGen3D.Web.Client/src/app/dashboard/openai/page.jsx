@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useMemo } from 'react';
-import Modal from '@/components/ui/modal';
+import { useModal } from '@/context/modal';
 import Icon from '@/components/ui/icon';
 import ButtonOutline from '@/components/ui/button-outline';
 import Button from '@/components/ui/button';
@@ -21,6 +21,93 @@ const LLM_TYPES = [
     { value: 1, label: 'Cloud' }
 ];
 
+function LlmModelForm({ editingModel, initialForm, onSave, onCancel }) {
+    const [form, setForm] = useState(initialForm);
+    const [error, setError] = useState(null);
+    const [saving, setSaving] = useState(false);
+
+    const handleFormChange = (field, value) => {
+        setForm(prev => ({ ...prev, [field]: value }));
+    };
+
+    const handleSave = async () => {
+        if (!form.name || !form.model || !form.endpoint) {
+            setError('Name, Model, and Endpoint are required');
+            return;
+        }
+        setSaving(true);
+        setError(null);
+        try {
+            await onSave(form, editingModel);
+        } catch (err) {
+            setError(err.message || 'Failed to save model');
+        } finally {
+            setSaving(false);
+        }
+    };
+
+    return (
+        <>
+            {error && <div className="mb-4 p-3 rounded bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200">{error}</div>}
+            <Input
+                label="Name"
+                name="name"
+                value={form.name}
+                onInput={(e) => handleFormChange('name', e.target.value)}
+            />
+            <Input
+                label="Model"
+                name="model"
+                value={form.model}
+                onInput={(e) => handleFormChange('model', e.target.value)}
+            />
+            <Input
+                label="Endpoint"
+                name="endpoint"
+                value={form.endpoint}
+                onInput={(e) => handleFormChange('endpoint', e.target.value)}
+            />
+            <Input
+                label="Private Key"
+                name="privateKey"
+                type="password"
+                value={form.privateKey}
+                onInput={(e) => handleFormChange('privateKey', e.target.value)}
+            />
+            <Select
+                label="Type"
+                name="type"
+                options={LLM_TYPES}
+                value={form.type}
+                onChange={(e) => handleFormChange('type', parseInt(e.target.value))}
+            />
+            <TextArea
+                label="Extra Body (JSON)"
+                name="extraBody"
+                value={form.extraBody}
+                rows={3}
+                onInput={(e) => handleFormChange('extraBody', e.target.value)}
+            />
+            <Checkbox
+                name="enabled"
+                label="Enabled"
+                checked={form.enabled}
+                onChange={(e) => handleFormChange('enabled', e.target.checked)}
+            />
+            <Checkbox
+                name="preferred"
+                label="Preferred"
+                checked={form.preferred}
+                onChange={(e) => handleFormChange('preferred', e.target.checked)}
+            />
+            <div className="buttons flex gap-3">
+                <Button onClick={handleSave} disabled={saving}>Save</Button>
+                <Button color="gray" className="cancel" onClick={onCancel}>Cancel</Button>
+            </div>
+        </>
+    );
+}
+
 export default function AdminOpenAI() {
     const session = useSession();
     const { getAll, add, update, setEnabled, setPreferred, delete: deleteModel, getImageModels, saveImageModel, toggleImageModelActive, deleteImageModel } = OpenAI(session);
@@ -37,15 +124,12 @@ export default function AdminOpenAI() {
         extraBody: ''
     });
 
+    const { showModal, hideModal } = useModal();
+
     const [models, setModels] = useState([]);
-    const [showModal, setShowModal] = useState(false);
-    const [editingModel, setEditingModel] = useState(null);
-    const [form, setForm] = useState(getEmptyForm);
-    const [error, setError] = useState(null);
     const [message, setMessage] = useState(null);
 
     const [imageModels, setImageModels] = useState([]);
-    const [showImageModal, setShowImageModal] = useState(false);
     const [editingImageModel, setEditingImageModel] = useState(null);
     const [imageError, setImageError] = useState(null);
 
@@ -66,15 +150,15 @@ export default function AdminOpenAI() {
     };
 
     const handleAdd = () => {
-        setEditingModel(null);
-        setForm(getEmptyForm());
-        setError(null);
-        setShowModal(true);
+        showModal({
+            title: 'Add LLM Model',
+            onClose: hideModal,
+            body: <LlmModelForm initialForm={getEmptyForm()} onSave={handleModelSave} onCancel={hideModal} />,
+        });
     };
 
     const handleEdit = (model) => {
-        setEditingModel(model);
-        setForm({
+        const initialForm = {
             modelId: model.modelId,
             name: model.name || '',
             model: model.model || '',
@@ -84,31 +168,24 @@ export default function AdminOpenAI() {
             enabled: !!model.enabled,
             preferred: !!model.preferred,
             extraBody: model.extraBody || ''
+        };
+        showModal({
+            title: 'Edit LLM Model',
+            onClose: hideModal,
+            body: <LlmModelForm editingModel={model} initialForm={initialForm} onSave={handleModelSave} onCancel={hideModal} />,
         });
-        setError(null);
-        setShowModal(true);
     };
 
-    const handleSave = () => {
-        if (!form.name || !form.model || !form.endpoint) {
-            setError('Name, Model, and Endpoint are required');
-            return;
-        }
-
-        setError(null);
+    const handleModelSave = async (form, editingModel) => {
         const payload = { ...form };
         const action = editingModel ? update : add;
-        action(payload).then(response => {
-            if (response.data.success) {
-                fetchModels();
-                setShowModal(false);
-            } else {
-                setError(response.data.message || 'Failed to save model');
-            }
-        }).catch(error => {
-            console.error('Error saving LLM model:', error);
-            setError('Failed to save model');
-        });
+        const response = await action(payload);
+        if (response.data.success) {
+            fetchModels();
+            hideModal();
+        } else {
+            throw new Error(response.data.message || 'Failed to save model');
+        }
     };
 
     const handleToggleEnabled = (model) => {
@@ -148,10 +225,6 @@ export default function AdminOpenAI() {
         });
     };
 
-    const handleFormChange = (field, value) => {
-        setForm(prev => ({ ...prev, [field]: value }));
-    };
-
     const fetchImageModels = () => {
         getImageModels().then(response => {
             if (response.data.success) {
@@ -166,20 +239,38 @@ export default function AdminOpenAI() {
     const handleImageModelClick = (model) => {
         setEditingImageModel(model);
         setImageError(null);
-        setShowImageModal(true);
+        showModal({
+            title: 'Edit Image Model',
+            className: 'max-w-[1000px] w-full',
+            onClose: hideModal,
+            body: <ImageGenerationModal
+                model={model}
+                onClose={hideModal}
+                onSave={handleImageModelSave}
+            />,
+        });
     };
 
     const handleAddImageModel = () => {
         setEditingImageModel(null);
         setImageError(null);
-        setShowImageModal(true);
+        showModal({
+            title: 'Add Image Model',
+            className: 'max-w-[1000px] w-full',
+            onClose: hideModal,
+            body: <ImageGenerationModal
+                model={null}
+                onClose={hideModal}
+                onSave={handleImageModelSave}
+            />,
+        });
     };
 
     const handleImageModelSave = (payload) => {
         saveImageModel(payload).then(response => {
             if (response.data.success) {
                 fetchImageModels();
-                setShowImageModal(false);
+                hideModal();
             } else {
                 setImageError(response.data.message || 'Failed to save image model');
             }
@@ -224,67 +315,6 @@ export default function AdminOpenAI() {
                 <Message type={message.type} onClose={() => setMessage(null)}>
                     {message.text}
                 </Message>
-            )}
-
-            {showModal && (
-                <Modal title={editingModel ? 'Edit LLM Model' : 'Add LLM Model'} onClose={() => setShowModal(false)}>
-                    {error && <div className="mb-4 p-3 rounded bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200">{error}</div>}
-                    <Input
-                        label="Name"
-                        name="name"
-                        value={form.name}
-                        onInput={(e) => handleFormChange('name', e.target.value)}
-                    />
-                    <Input
-                        label="Model"
-                        name="model"
-                        value={form.model}
-                        onInput={(e) => handleFormChange('model', e.target.value)}
-                    />
-                    <Input
-                        label="Endpoint"
-                        name="endpoint"
-                        value={form.endpoint}
-                        onInput={(e) => handleFormChange('endpoint', e.target.value)}
-                    />
-                    <Input
-                        label="Private Key"
-                        name="privateKey"
-                        type="password"
-                        value={form.privateKey}
-                        onInput={(e) => handleFormChange('privateKey', e.target.value)}
-                    />
-                    <Select
-                        label="Type"
-                        name="type"
-                        options={LLM_TYPES}
-                        value={form.type}
-                        onChange={(e) => handleFormChange('type', parseInt(e.target.value))}
-                    />
-                    <TextArea
-                        label="Extra Body (JSON)"
-                        name="extraBody"
-                        value={form.extraBody}
-                        rows={3}
-                        onInput={(e) => handleFormChange('extraBody', e.target.value)}
-                    />
-                    <Checkbox
-                        name="enabled"
-                        label="Enabled"
-                        checked={form.enabled}
-                        onChange={(e) => handleFormChange('enabled', e.target.checked)}
-                    />
-                    <Checkbox
-                        name="preferred"
-                        label="Preferred"
-                        checked={form.preferred}
-                        onChange={(e) => handleFormChange('preferred', e.target.checked)}
-                    />
-                    <div className="buttons flex gap-3">
-                        <Button onClick={handleSave}>Save</Button>
-                        <Button color="gray" className="cancel" onClick={() => setShowModal(false)}>Cancel</Button>
-                    </div>
-                </Modal>
             )}
 
             <div className="bg-white dark:bg-gray-800 rounded-lg shadow overflow-hidden">
@@ -422,15 +452,6 @@ export default function AdminOpenAI() {
                     </tbody>
                 </table>
             </div>
-
-            {showImageModal && (
-                <ImageGenerationModal
-                    show={showImageModal}
-                    model={editingImageModel}
-                    onClose={() => setShowImageModal(false)}
-                    onSave={handleImageModelSave}
-                />
-            )}
         </div>
     );
 

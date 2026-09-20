@@ -74,6 +74,7 @@ namespace TextureGen3D.API.Controllers
         {
             public Guid MeshId { get; set; }
             public string Name { get; set; } = "";
+            public string? CameraAngle { get; set; }
         }
 
         [HttpPost("{projectId}")]
@@ -96,6 +97,7 @@ namespace TextureGen3D.API.Controllers
                     ProjectMeshId = request.MeshId,
                     Name = request.Name,
                     Index = nextIndex,
+                    CameraAngle = request.CameraAngle ?? "",
                 };
                 var created = await _layerRepo.CreateAsync(layer);
                 return Json(new ApiResponse { success = true, data = created });
@@ -250,6 +252,36 @@ namespace TextureGen3D.API.Controllers
             }
         }
 
+        [HttpGet("{projectId}/mesh/{meshId}/{layerId}/mask")]
+        public async Task<IActionResult> GetMask(Guid projectId, Guid meshId, Guid layerId)
+        {
+            try
+            {
+                var data = await _imageService.GetProjectMeshLayerMaskAsync(projectId, meshId, layerId);
+                if (data == null) return NotFound();
+                return File(data, "image/png");
+            }
+            catch
+            {
+                return NotFound();
+            }
+        }
+
+        [HttpGet("{projectId}/mesh/{meshId}/{layerId}/mask-thumb")]
+        public async Task<IActionResult> GetMaskThumb(Guid projectId, Guid meshId, Guid layerId)
+        {
+            try
+            {
+                var data = await _imageService.GetProjectMeshLayerMaskThumbAsync(projectId, meshId, layerId);
+                if (data == null) return NotFound();
+                return File(data, "image/png");
+            }
+            catch
+            {
+                return NotFound();
+            }
+        }
+
         public class SaveImageRequest
         {
             public Guid MeshId { get; set; }
@@ -315,6 +347,57 @@ namespace TextureGen3D.API.Controllers
                 // Generate and save a thumbnail of the UV map
                 var uvThumbBytes = await _imageService.GenerateThumbnailAsync(uvmapBytes, 100);
                 await _imageService.SaveProjectMeshLayerUvMapThumbAsync(projectId, request.MeshId, layerId, uvThumbBytes);
+
+                return Json(new ApiResponse { success = true });
+            }
+            catch (Exception ex)
+            {
+                return Json(new ApiResponse { success = false, message = ex.Message });
+            }
+        }
+
+        public class SaveMaskItem
+        {
+            public Guid LayerId { get; set; }
+            public string Base64Mask { get; set; } = "";
+        }
+
+        public class SaveMasksRequest
+        {
+            public Guid MeshId { get; set; }
+            public List<SaveMaskItem> Masks { get; set; } = new();
+        }
+
+        /// <summary>
+        /// Batch-save mask.png files for layers painted with the mask brush.
+        /// Mask is a white canvas that the user paints black onto; black areas
+        /// hide the layer's UV map in the shader.
+        /// </summary>
+        [HttpPost("{projectId}/save-masks")]
+        public async Task<IActionResult> SaveMasks(Guid projectId, [FromBody] SaveMasksRequest request)
+        {
+            try
+            {
+                var userId = GetUserId();
+                if (userId == Guid.Empty)
+                    return Json(new ApiResponse { success = false, message = "Could not find user" });
+
+                var project = await _projectRepo.GetByIdAsync(projectId, userId);
+                if (project == null)
+                    return Json(new ApiResponse { success = false, message = "Project not found" });
+
+                foreach (var item in request.Masks)
+                {
+                    var base64 = item.Base64Mask;
+                    if (string.IsNullOrWhiteSpace(base64)) continue;
+                    if (base64.StartsWith("data:")) base64 = base64.Substring(base64.IndexOf(',') + 1);
+                    var maskBytes = Convert.FromBase64String(base64);
+
+                    await _imageService.SaveProjectMeshLayerMaskAsync(projectId, request.MeshId, item.LayerId, maskBytes);
+
+                    var maskThumbBytes = await _imageService.GenerateThumbnailAsync(maskBytes, 100);
+                    await _imageService.SaveProjectMeshLayerMaskThumbAsync(projectId, request.MeshId, item.LayerId, maskThumbBytes);
+                }
 
                 return Json(new ApiResponse { success = true });
             }

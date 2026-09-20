@@ -4,12 +4,13 @@ const ProjectMeshLayers = (args) => Api({ ...args }).endpoints(({ api }) => {
   const apiPath = '/api/project-mesh-layers';
   return {
     getByMesh: (projectId, meshId) => api.get(`${apiPath}/${projectId}/mesh/${meshId}`),
-    create: (projectId, meshId, name) => api.post(`${apiPath}/${projectId}`, { meshId, name }),
+    create: (projectId, meshId, name, cameraAngle) => api.post(`${apiPath}/${projectId}`, { meshId, name, cameraAngle }),
     updateName: (projectId, layerId, name) => api.post(`${apiPath}/${projectId}/${layerId}/update-name`, { name }),
     reorder: (projectId, meshId, orderedIds) => api.post(`${apiPath}/${projectId}/reorder`, { meshId, orderedIds }),
     delete: (projectId, layerId) => api.post(`${apiPath}/${projectId}/${layerId}/delete`),
     saveImage: (projectId, layerId, meshId, base64Image) => api.post(`${apiPath}/${projectId}/${layerId}/save-image`, { meshId, base64Image }),
     saveUvMap: (projectId, layerId, meshId, base64UvMap) => api.post(`${apiPath}/${projectId}/${layerId}/save-uvmap`, { meshId, base64UvMap }),
+    saveMasks: (projectId, meshId, masks) => api.post(`${apiPath}/${projectId}/save-masks`, { meshId, masks }),
     generate: (projectId, layerId, meshId, imageModelId, prompt, depthMap, cameraAngle, cameraAngleId) =>
       api.post(`${apiPath}/${projectId}/${layerId}/generate`, { meshId, imageModelId, prompt, depthMap, cameraAngle, cameraAngleId }),
     saveComfyUiResult: (projectId, layerId, meshId, generatedImage, depthMap) =>
@@ -26,6 +27,8 @@ const ProjectMeshLayers = (args) => Api({ ...args }).endpoints(({ api }) => {
     thumbUrl: (projectId, meshId, layerId) => `${apiPath}/${projectId}/mesh/${meshId}/${layerId}/thumb`,
     uvmapUrl: (projectId, meshId, layerId) => `${apiPath}/${projectId}/mesh/${meshId}/${layerId}/uvmap`,
     uvmapThumbUrl: (projectId, meshId, layerId) => `${apiPath}/${projectId}/mesh/${meshId}/${layerId}/uvmap-thumb`,
+    maskUrl: (projectId, meshId, layerId) => `${apiPath}/${projectId}/mesh/${meshId}/${layerId}/mask`,
+    maskThumbUrl: (projectId, meshId, layerId) => `${apiPath}/${projectId}/mesh/${meshId}/${layerId}/mask-thumb`,
   };
 });
 

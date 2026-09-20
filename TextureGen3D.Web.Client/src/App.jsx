@@ -2,6 +2,7 @@ import React from 'react';
 import { BrowserRouter as Router } from 'react-router-dom';
 import { ThemeProvider } from './context/theme';
 import { SessionProvider } from './context/session';
+import { ModalProvider } from './context/modal';
 import Routing from './routes/routing';
 
 function App() {
@@ -9,7 +10,9 @@ function App() {
     <ThemeProvider>
       <Router>
         <SessionProvider>
-          <Routing />
+          <ModalProvider>
+            <Routing />
+          </ModalProvider>
         </SessionProvider>
       </Router>
     </ThemeProvider>

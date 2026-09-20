@@ -1,5 +1,4 @@
 import React, { useState } from 'react';
-import Modal from '@/components/ui/modal';
 import Input from '@/components/forms/input';
 import Select from '@/components/forms/select';
 import ButtonOutline from '@/components/ui/button-outline';
@@ -129,7 +128,7 @@ function FeatureList({ features, setFeatures, label }) {
   );
 }
 
-export default function SubscriptionModal({ show, subscription, products, onSave, onClose }) {
+export default function SubscriptionModal({ subscription, products, onSave, onClose }) {
   const [form, setForm] = useState({
     id: subscription?.id || 0,
     title: subscription?.title || '',
@@ -152,8 +151,6 @@ export default function SubscriptionModal({ show, subscription, products, onSave
 
   const [monthlyFeatures, setMonthlyFeatures] = useState(parsedFeatures.monthly);
   const [yearlyFeatures, setYearlyFeatures] = useState(parsedFeatures.yearly);
-
-  if (!show) return null;
 
   const handleChange = (field) => (e) => {
     setForm(prev => ({ ...prev, [field]: e.target.value }));
@@ -178,11 +175,7 @@ export default function SubscriptionModal({ show, subscription, products, onSave
   const productOptions = products.map(p => ({ value: p.id, label: p.title }));
 
   return (
-    <Modal
-      title={subscription ? 'Edit Subscription' : 'Add Subscription'}
-      onClose={onClose}
-      className="w-full max-w-[900px] rounded-lg bg-white dark:bg-gray-800 shadow-xl"
-    >
+    <div className="w-full max-w-[900px] rounded-lg bg-white dark:bg-gray-800 shadow-xl">
       <div>
         <div className="grid grid-cols-1 gap-4">
           <Input label="Title" name="title" value={form.title} onChange={handleChange('title')} required autoFocus />
@@ -222,6 +215,6 @@ export default function SubscriptionModal({ show, subscription, products, onSave
           <ButtonOutline onClick={handleSave}>Save Changes</ButtonOutline>
         </div>
       </div>
-    </Modal>
+    </div>
   );
 }

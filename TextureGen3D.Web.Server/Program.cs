@@ -149,6 +149,7 @@ app.UseStaticFiles(new StaticFileOptions
 
 app.MapControllers();
 app.MapHub<ComfyUiHub>("/hubs/comfyui");
+app.MapHub<GradioHub>("/hubs/gradio");
 app.MapFallbackToFile("index.html");
 
 Console.WriteLine(

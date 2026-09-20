@@ -151,8 +151,13 @@ namespace TextureGen3D.API.Controllers
                     return Json(new ApiResponse { success = false, message = "Model not found" });
 
                 await _imageService.DeleteProjectModelAsync(projectId, modelId, model.Extension);
-                // Cascade delete: camera angles first (FK → meshes), then meshes, then model
+                // Cascade delete: camera angles first (FK → meshes), then meshes
+                // (FK cascades remove their layers + mesh references), then model
                 await _angleRepo.DeleteByModelIdAsync(modelId, projectId);
+                // Remove each mesh's on-disk folder (layer images, uvmaps, masks)
+                var meshes = await _meshRepo.GetByModelIdAsync(modelId, projectId);
+                foreach (var mesh in meshes)
+                    await _imageService.DeleteProjectMeshFolderAsync(projectId, mesh.Id);
                 await _meshRepo.DeleteByModelIdAsync(modelId, projectId);
                 await _modelRepo.DeleteAsync(modelId, projectId);
 

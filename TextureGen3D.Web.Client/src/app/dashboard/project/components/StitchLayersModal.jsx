@@ -1,5 +1,4 @@
 import React, { useState, useEffect } from 'react';
-import Modal from '@/components/ui/modal';
 import Select from '@/components/forms/select';
 import Spinner from '@/components/ui/spinner';
 
@@ -45,12 +44,7 @@ export default function StitchLayersModal({ layers, projectId, meshDbId, token, 
   const type0Models = imageModels.filter((m) => m.type === 0);
 
   return (
-    <Modal
-      title="Stitch All Layers Together"
-      onClose={onClose}
-      className="max-w-2xl"
-    >
-      <div className="space-y-4">
+    <div className="space-y-4">
         {error && (
           <div className="p-2 bg-red-50 dark:bg-red-900/20 text-red-700 dark:text-red-400 rounded text-sm">
             {error}
@@ -123,7 +117,6 @@ export default function StitchLayersModal({ layers, projectId, meshDbId, token, 
             'Stitch Selected Layers'
           )}
         </button>
-      </div>
-    </Modal>
+    </div>
   );
 }

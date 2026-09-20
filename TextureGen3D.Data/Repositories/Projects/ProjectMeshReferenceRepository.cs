@@ -34,6 +34,12 @@ namespace TextureGen3D.Data.Repositories.Projects
             return await _dbConnection.QueryAsync<ProjectMeshReference>(query, new { meshId, projectId });
         }
 
+        public async Task<IEnumerable<ProjectMeshReference>> GetByProjectIdAsync(Guid projectId)
+        {
+            const string query = @"SELECT * FROM public.""ProjectMeshReferences"" WHERE ""ProjectId"" = @projectId ORDER BY ""Created"" ASC";
+            return await _dbConnection.QueryAsync<ProjectMeshReference>(query, new { projectId });
+        }
+
         public async Task<ProjectMeshReference?> GetByMeshAndReferenceAsync(Guid meshId, Guid referenceId, Guid projectId)
         {
             const string query = @"SELECT * FROM public.""ProjectMeshReferences"" WHERE ""ProjectMeshId"" = @meshId AND ""ProjectReferenceId"" = @referenceId AND ""ProjectId"" = @projectId";

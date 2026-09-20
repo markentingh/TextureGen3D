@@ -1,17 +1,16 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { useSession } from '@/context/session';
+import { useModal } from '@/context/modal';
 import { Users } from '@/api/admin/users';
-import Modal from '@/components/ui/modal';
 import Input from '@/components/forms/input';
 import ButtonIcon from '@/components/ui/button-icon';
 import ButtonOutline from '@/components/ui/button-outline';
 import { List, Item } from '@/components/ui/list';
 import Icon from '@/components/ui/icon';
 
-export default function FindUser({ selectedUser, onSelect }) {
+function FindUserModalContent({ onSelect, onClose }) {
   const session = useSession();
   const api = Users(session);
-  const [showModal, setShowModal] = useState(false);
   const [query, setQuery] = useState('');
   const [users, setUsers] = useState([]);
   const [message, setMessage] = useState(null);
@@ -45,18 +44,6 @@ export default function FindUser({ selectedUser, onSelect }) {
     }
   };
 
-  const handleOpen = () => {
-    setShowModal(true);
-    setQuery('');
-    setUsers([]);
-    setMessage(null);
-    setLoading(false);
-  };
-
-  const handleClose = () => {
-    setShowModal(false);
-  };
-
   const handleChange = (e) => {
     const value = e.target.value;
     setQuery(value);
@@ -73,57 +60,72 @@ export default function FindUser({ selectedUser, onSelect }) {
 
   const handleSelect = (u) => {
     onSelect(u);
-    handleClose();
+    onClose();
   };
+
+  return (
+    <>
+      <div className="flex items-center gap-2 mb-4">
+        <Input
+          name="userSearch"
+          value={query}
+          onChange={handleChange}
+          onKeyDown={handleKeyDown}
+          placeholder="Search by email..."
+          autoFocus
+          className="flex-1"
+        />
+        <ButtonIcon name="search" onClick={() => { clearTimeout(debounceRef.current); search(query); }} title="Search" />
+      </div>
+      {message && (
+        <p className={`text-sm mb-2 ${message.type === 'error' ? 'text-red-600 dark:text-red-400' : 'text-gray-600 dark:text-gray-400'}`}>
+          {message.text}
+        </p>
+      )}
+      {!message && users.length === 0 && !loading && (
+        <p className="text-sm text-gray-600 dark:text-gray-400 mb-2">Search for users</p>
+      )}
+      {loading && (
+        <p className="text-sm text-gray-600 dark:text-gray-400 mb-2 flex items-center gap-2">
+          <Icon name="progress_activity" spin className="w-4 h-4" />
+          Searching...
+        </p>
+      )}
+      {users.length > 0 && (
+        <List inModal={true}>
+          {users.map((u) => (
+            <Item key={u.id} onClick={() => handleSelect(u)} className="cursor-pointer">
+              <div>
+                <p className="font-medium text-sm">{u.fullName}</p>
+                <p className="text-xs text-gray-500 dark:text-gray-400">{u.email}</p>
+              </div>
+            </Item>
+          ))}
+        </List>
+      )}
+    </>
+  );
+}
+
+export default function FindUser({ selectedUser, onSelect }) {
+  const { showModal, hideModal } = useModal();
 
   const label = selectedUser ? `${selectedUser.fullName} - ${selectedUser.email}` : 'No User Selected';
 
   return (
     <div className="flex items-center justify-between w-full gap-4">
       <span className="text-sm text-gray-700 dark:text-gray-300 truncate">{label}</span>
-      <ButtonOutline onClick={handleOpen} size="small">Find User</ButtonOutline>
-      {showModal && (
-        <Modal title="Find User" onClose={handleClose} className="max-w-md w-full">
-          <div className="flex items-center gap-2 mb-4">
-            <Input
-              name="userSearch"
-              value={query}
-              onChange={handleChange}
-              onKeyDown={handleKeyDown}
-              placeholder="Search by email..."
-              autoFocus
-              className="flex-1"
-            />
-            <ButtonIcon name="search" onClick={() => { clearTimeout(debounceRef.current); search(query); }} title="Search" />
-          </div>
-          {message && (
-            <p className={`text-sm mb-2 ${message.type === 'error' ? 'text-red-600 dark:text-red-400' : 'text-gray-600 dark:text-gray-400'}`}>
-              {message.text}
-            </p>
-          )}
-          {!message && users.length === 0 && !loading && (
-            <p className="text-sm text-gray-600 dark:text-gray-400 mb-2">Search for users</p>
-          )}
-          {loading && (
-            <p className="text-sm text-gray-600 dark:text-gray-400 mb-2 flex items-center gap-2">
-              <Icon name="progress_activity" spin className="w-4 h-4" />
-              Searching...
-            </p>
-          )}
-          {users.length > 0 && (
-            <List inModal={true}>
-              {users.map((u) => (
-                <Item key={u.id} onClick={() => handleSelect(u)} className="cursor-pointer">
-                  <div>
-                    <p className="font-medium text-sm">{u.fullName}</p>
-                    <p className="text-xs text-gray-500 dark:text-gray-400">{u.email}</p>
-                  </div>
-                </Item>
-              ))}
-            </List>
-          )}
-        </Modal>
-      )}
+      <ButtonOutline onClick={() => showModal({
+        title: 'Find User',
+        className: 'max-w-md w-full',
+        onClose: hideModal,
+        body: (
+          <FindUserModalContent
+            onSelect={onSelect}
+            onClose={hideModal}
+          />
+        ),
+      })} size="small">Find User</ButtonOutline>
     </div>
   );
 }

@@ -1,7 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { useSession } from '@/context/session';
 import { Users } from '@/api/admin/users';
-import Modal from '@/components/ui/modal';
 import Input from '@/components/forms/input';
 import ButtonOutline from '@/components/ui/button-outline';
 import Button from '@/components/ui/button';
@@ -68,7 +67,7 @@ export default function UserDetailsModal({ userId, user, onClose }) {
   };
 
   return (
-    <Modal title="User Details" onClose={onClose}>
+    <div>
       {message && (
         <Message type={message.type} onClose={() => setMessage(null)}>
           {message.text}
@@ -103,6 +102,6 @@ export default function UserDetailsModal({ userId, user, onClose }) {
           Cancel
         </Button>
       </div>
-    </Modal>
+    </div>
   );
 }

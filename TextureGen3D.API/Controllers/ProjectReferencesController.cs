@@ -18,6 +18,7 @@ namespace TextureGen3D.API.Controllers
         readonly IProjectRepository _projectRepo;
         readonly IProjectReferenceRepository _refRepo;
         readonly IProjectMeshReferenceRepository _meshRefRepo;
+        readonly IProjectCameraAngleRepository _angleRepo;
         readonly IImageGenerationModelRepository _imageGenModelRepo;
         readonly IImageService _imageService;
         readonly IImageGeneration _imageGeneration;
@@ -32,6 +33,7 @@ namespace TextureGen3D.API.Controllers
             IProjectRepository projectRepo,
             IProjectReferenceRepository refRepo,
             IProjectMeshReferenceRepository meshRefRepo,
+            IProjectCameraAngleRepository angleRepo,
             IImageGenerationModelRepository imageGenModelRepo,
             IImageService imageService,
             IImageGeneration imageGeneration,
@@ -40,6 +42,7 @@ namespace TextureGen3D.API.Controllers
             _projectRepo = projectRepo;
             _refRepo = refRepo;
             _meshRefRepo = meshRefRepo;
+            _angleRepo = angleRepo;
             _imageGenModelRepo = imageGenModelRepo;
             _imageService = imageService;
             _imageGeneration = imageGeneration;
@@ -249,6 +252,8 @@ namespace TextureGen3D.API.Controllers
 
                 // Delete all mesh reference records that point to this project reference
                 await _meshRefRepo.DeleteByReferenceIdAsync(referenceId, projectId);
+                // Null out the ProjectReferenceId on any camera angles using this reference
+                await _angleRepo.ClearReferenceByReferenceIdAsync(referenceId, projectId);
                 await _imageService.DeleteProjectReferenceAsync(projectId, referenceId, reference.Extension);
                 await _imageService.DeleteProjectReferenceThumbAsync(projectId, referenceId, reference.Extension);
                 await _refRepo.DeleteAsync(referenceId, projectId);

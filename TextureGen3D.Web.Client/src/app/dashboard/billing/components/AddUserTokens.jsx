@@ -1,10 +1,9 @@
 import React, { useState, useEffect, useMemo } from 'react';
-import Modal from '@/components/ui/modal';
 import Select from '@/components/forms/select';
 import ButtonOutline from '@/components/ui/button-outline';
 import Spinner from '@/components/ui/spinner';
 
-export default function AddUserTokens({ show, appUserId, api, onClose, onAdded }) {
+export default function AddUserTokens({ appUserId, api, onClose, onAdded }) {
   const [products, setProducts] = useState([]);
   const [selectedProductId, setSelectedProductId] = useState('');
   const [loading, setLoading] = useState(false);
@@ -12,7 +11,6 @@ export default function AddUserTokens({ show, appUserId, api, onClose, onAdded }
   const [message, setMessage] = useState(null);
 
   useEffect(() => {
-    if (!show) return;
     setLoadingProducts(true);
     setMessage(null);
     api.getProducts()
@@ -23,7 +21,7 @@ export default function AddUserTokens({ show, appUserId, api, onClose, onAdded }
       })
       .catch(() => setProducts([]))
       .finally(() => setLoadingProducts(false));
-  }, [show, api]);
+  }, [api]);
 
   const productOptions = useMemo(
     () =>
@@ -73,10 +71,8 @@ export default function AddUserTokens({ show, appUserId, api, onClose, onAdded }
     }
   };
 
-  if (!show) return null;
-
   return (
-    <Modal title="Add Tokens" onClose={onClose} className="max-w-lg w-full">
+    <>
       {message && (
         <p className={`text-sm mb-4 ${message.type === 'error' ? 'text-red-600 dark:text-red-400' : 'text-green-600'}`}>
           {message.text}
@@ -115,6 +111,6 @@ export default function AddUserTokens({ show, appUserId, api, onClose, onAdded }
           </div>
         </>
       )}
-    </Modal>
+    </>
   );
 }

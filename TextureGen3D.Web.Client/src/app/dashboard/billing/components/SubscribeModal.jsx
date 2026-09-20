@@ -1,10 +1,9 @@
 import React, { useMemo, useState } from 'react';
-import Modal from '@/components/ui/modal';
 import FindUser from '@/components/ui/find-user';
 import Select from '@/components/forms/select';
 import ButtonOutline from '@/components/ui/button-outline';
 
-export default function SubscribeModal({ show, subscriptions, products, api, onClose, onStarted }) {
+export default function SubscribeModal({ subscriptions, products, api, onClose, onStarted }) {
   const [selectedUser, setSelectedUser] = useState(null);
   const [selectedPlan, setSelectedPlan] = useState('');
   const [loading, setLoading] = useState(false);
@@ -60,10 +59,8 @@ export default function SubscribeModal({ show, subscriptions, products, api, onC
     }
   };
 
-  if (!show) return null;
-
   return (
-    <Modal title="Subscribe User" onClose={onClose} className="max-w-lg w-full">
+    <div className="max-w-lg w-full">
       {message && (
         <p className="text-sm text-red-600 dark:text-red-400 mb-4">{message.text}</p>
       )}
@@ -85,6 +82,6 @@ export default function SubscribeModal({ show, subscriptions, products, api, onC
           </ButtonOutline>
         </div>
       )}
-    </Modal>
+    </div>
   );
 }

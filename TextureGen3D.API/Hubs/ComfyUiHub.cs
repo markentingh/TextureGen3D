@@ -18,6 +18,7 @@ namespace TextureGen3D.API.Hubs
         readonly IProjectMeshReferenceRepository _meshRefRepo;
         readonly IProjectReferenceRepository _refRepo;
         readonly IProjectCameraAngleRepository _angleRepo;
+        readonly IProjectRepository _projectRepo;
         readonly IImageService _imageService;
 
         public ComfyUiHub(
@@ -26,6 +27,7 @@ namespace TextureGen3D.API.Hubs
             IProjectMeshReferenceRepository meshRefRepo,
             IProjectReferenceRepository refRepo,
             IProjectCameraAngleRepository angleRepo,
+            IProjectRepository projectRepo,
             IImageService imageService)
         {
             _comfyUiService = comfyUiService;
@@ -33,6 +35,7 @@ namespace TextureGen3D.API.Hubs
             _meshRefRepo = meshRefRepo;
             _refRepo = refRepo;
             _angleRepo = angleRepo;
+            _projectRepo = projectRepo;
             _imageService = imageService;
         }
 
@@ -102,14 +105,27 @@ namespace TextureGen3D.API.Hubs
                     }
                 }
 
+                // Prepend the image model's prompt to the user prompt
+                var fullPrompt = string.IsNullOrWhiteSpace(imageModel.Prompt)
+                    ? prompt
+                    : $"{imageModel.Prompt}\n\n{prompt}";
+
                 var genRequest = new ImageGenerationRequest
                 {
-                    Prompt = prompt,
+                    Prompt = fullPrompt,
                     Model = imageModel.Model,
                     Width = 1024,
                     Height = 1024,
                     InputImages = inputImages,
                 };
+
+                // Fetch the project seed to inject into the workflow
+                var appUserClaim = Context.User?.Claims.FirstOrDefault(c => c.Type == "AppUser");
+                var userId = appUserClaim != null && Guid.TryParse(appUserClaim.Value, out var uid) ? uid : Guid.Empty;
+                var project = await _projectRepo.GetByIdAsync(projectId, userId);
+                int? seed = project?.Seed;
+                Console.WriteLine($"[ComfyUiHub] Project {projectId} user {userId} seed: {(seed.HasValue ? seed.Value.ToString() : "none")}");
+                await Clients.Caller.SendAsync("SeedUsed", seed);
 
                 var progress = new Progress<(int value, string? message)>(p =>
                 {
@@ -126,8 +142,11 @@ namespace TextureGen3D.API.Hubs
                     imageModel.PromptPath ?? "",
                     imageModel.DepthMapPath ?? "",
                     imageModel.InputImagesPath ?? "",
+                    imageModel.SeedPath ?? "",
+                    seed,
                     layerId.ToString(),
                     progress,
+                    (workflowJson) => { _ = Clients.Caller.SendAsync("WorkflowJson", workflowJson); },
                     Context.ConnectionAborted);
 
                 // Send the generated image back as base64
@@ -139,6 +158,24 @@ namespace TextureGen3D.API.Hubs
                 Console.Error.WriteLine($"ComfyUI Generation Error: {ex}");
                 Console.Error.WriteLine($"Stack trace:\n{ex.StackTrace}");
                 await Clients.Caller.SendAsync("GenerationError", ex.Message, ex.StackTrace);
+            }
+        }
+
+        /// <summary>
+        /// Called by the client to cancel the currently running ComfyUI workflow.
+        /// POSTs to ComfyUI's /interrupt endpoint to stop the running job.
+        /// </summary>
+        public async Task CancelGeneration()
+        {
+            try
+            {
+                Console.WriteLine("[ComfyUiHub] CancelGeneration requested");
+                await _comfyUiService.InterruptAsync();
+                await Clients.Caller.SendAsync("GenerationError", "Generation cancelled by user.", null);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[ComfyUiHub] CancelGeneration failed: {ex.Message}");
             }
         }
     }

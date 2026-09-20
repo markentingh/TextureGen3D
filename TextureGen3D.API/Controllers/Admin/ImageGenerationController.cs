@@ -1,7 +1,9 @@
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.Options;
 using TextureGen3D.API.Models;
 using TextureGen3D.API.Models.ImageGeneration;
+using TextureGen3D.API.Services;
 using TextureGen3D.Auth.Policies;
 using TextureGen3D.Data.Entities;
 using TextureGen3D.Data.Interfaces;
@@ -18,15 +20,18 @@ namespace TextureGen3D.API.Controllers.Admin
         readonly IImageGenerationModelRepository _repo;
         readonly IProjectImageGenerationRepository _projectImageGenRepo;
         readonly IDbConnection _dbConnection;
+        readonly ImageGenerationOptions _imageGenOptions;
 
         public ImageGenerationController(
             IImageGenerationModelRepository repo,
             IProjectImageGenerationRepository projectImageGenRepo,
-            IDbConnection dbConnection)
+            IDbConnection dbConnection,
+            IOptions<ImageGenerationOptions> imageGenOptions)
         {
             _repo = repo;
             _projectImageGenRepo = projectImageGenRepo;
             _dbConnection = dbConnection;
+            _imageGenOptions = imageGenOptions.Value;
         }
 
         [HttpGet("get-models")]
@@ -53,6 +58,9 @@ namespace TextureGen3D.API.Controllers.Admin
                     promptPath = m.PromptPath,
                     depthMapPath = m.DepthMapPath,
                     inputImagesPath = m.InputImagesPath,
+                    seedPath = m.SeedPath,
+                    prompt = m.Prompt,
+                    endpointUrl = m.EndpointUrl,
                     active = m.Active
                 }).ToList();
 
@@ -95,6 +103,9 @@ namespace TextureGen3D.API.Controllers.Admin
                         existing.PromptPath = request.PromptPath;
                         existing.DepthMapPath = request.DepthMapPath;
                         existing.InputImagesPath = request.InputImagesPath;
+                        existing.SeedPath = request.SeedPath;
+                        existing.Prompt = request.Prompt;
+                        existing.EndpointUrl = request.EndpointUrl;
                         existing.Active = request.Active;
                         await _repo.UpdateAsync(existing);
                     }
@@ -118,6 +129,9 @@ namespace TextureGen3D.API.Controllers.Admin
                         PromptPath = request.PromptPath,
                         DepthMapPath = request.DepthMapPath,
                         InputImagesPath = request.InputImagesPath,
+                        SeedPath = request.SeedPath,
+                        Prompt = request.Prompt,
+                        EndpointUrl = request.EndpointUrl,
                         Active = request.Active
                     };
                     await _repo.CreateAsync(model);
@@ -233,6 +247,101 @@ namespace TextureGen3D.API.Controllers.Admin
                 }).ToList();
 
                 return Json(new ApiResponse { success = true, data = items });
+            }
+            catch (Exception ex)
+            {
+                return Json(new ApiResponse { success = false, message = ex.Message });
+            }
+        }
+
+        [HttpGet("gradio-endpoints")]
+        public async Task<IActionResult> GetGradioEndpoints()
+        {
+            try
+            {
+                if (!_imageGenOptions.Models.TryGetValue("gradio", out var gradioConfig))
+                    return Json(new ApiResponse { success = false, message = "Gradio model configuration not found" });
+
+                var endpoint = gradioConfig.Endpoint.TrimEnd('/');
+                var openapiUrl = $"{endpoint}/gradio_api/openapi.json";
+
+                using var httpClient = new HttpClient();
+                httpClient.Timeout = TimeSpan.FromSeconds(30);
+                var response = await httpClient.GetAsync(openapiUrl);
+                if (!response.IsSuccessStatusCode)
+                    return Json(new ApiResponse { success = false, message = $"Failed to fetch Gradio OpenAPI spec: {response.StatusCode}" });
+
+                var json = await response.Content.ReadAsStringAsync();
+                var openapi = System.Text.Json.JsonSerializer.Deserialize<System.Text.Json.JsonElement>(json);
+
+                // Extract POST endpoints under /gradio_api/call/ (excluding {event_id} result fetchers)
+                var endpoints = new List<object>();
+                if (openapi.TryGetProperty("paths", out var paths))
+                {
+                    foreach (var pathProp in paths.EnumerateObject())
+                    {
+                        var path = pathProp.Name;
+                        if (!path.StartsWith("/gradio_api/call/") || path.Contains("event_id"))
+                            continue;
+
+                        if (!pathProp.Value.TryGetProperty("post", out var post))
+                            continue;
+
+                        // Extract parameters from requestBody
+                        var parameters = new List<string>();
+                        if (post.TryGetProperty("requestBody", out var requestBody) &&
+                            requestBody.TryGetProperty("content", out var content) &&
+                            content.TryGetProperty("application/json", out var appJson) &&
+                            appJson.TryGetProperty("schema", out var schema) &&
+                            schema.TryGetProperty("properties", out var props))
+                        {
+                            foreach (var paramProp in props.EnumerateObject())
+                            {
+                                parameters.Add(paramProp.Name);
+                            }
+                        }
+
+                        // Display path without /gradio_api/call/ prefix
+                        var displayPath = path.Substring("/gradio_api/call/".Length);
+
+                        endpoints.Add(new
+                        {
+                            path = displayPath,
+                            fullPath = path,
+                            parameters
+                        });
+                    }
+                }
+
+                return Json(new ApiResponse { success = true, data = endpoints });
+            }
+            catch (Exception ex)
+            {
+                return Json(new ApiResponse { success = false, message = ex.Message });
+            }
+        }
+
+        [HttpGet("gradio-health")]
+        public async Task<IActionResult> GradioHealth()
+        {
+            try
+            {
+                if (!_imageGenOptions.Models.TryGetValue("gradio", out var gradioConfig))
+                    return Json(new ApiResponse { success = false, message = "Gradio model configuration not found" });
+
+                var endpoint = gradioConfig.Endpoint.TrimEnd('/');
+                var healthUrl = $"{endpoint}/gradio_api/openapi.json";
+
+                using var httpClient = new HttpClient();
+                httpClient.Timeout = TimeSpan.FromSeconds(5);
+                var response = await httpClient.GetAsync(healthUrl);
+                if (response.IsSuccessStatusCode)
+                    return Json(new ApiResponse { success = true });
+                return Json(new ApiResponse { success = false, message = $"Gradio server returned {response.StatusCode}" });
+            }
+            catch (TaskCanceledException)
+            {
+                return Json(new ApiResponse { success = false, message = "Gradio server timed out" });
             }
             catch (Exception ex)
             {

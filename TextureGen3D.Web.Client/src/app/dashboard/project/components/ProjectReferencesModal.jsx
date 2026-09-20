@@ -1,12 +1,12 @@
 import React, { useState, useRef, useEffect } from 'react';
-import Modal from '@/components/ui/modal';
-import ConfirmModal from '@/components/ui/confirm-modal';
 import ButtonIcon from '@/components/ui/button-icon';
 import Spinner from '@/components/ui/spinner';
 import { ProjectReferences } from '@/api/user/projectReferences';
 import { ProjectMeshReferences } from '@/api/user/projectMeshReferences';
+import { useModal } from '@/context/modal';
 
 export default function ProjectReferencesModal({ projectId, token, meshId, cameraAngleMode, selectedRefId, onSelectReference, onClose, onAdded, onDeleted, onProjectReferencesChanged }) {
+  const { showConfirmModal } = useModal();
   const [projectRefs, setProjectRefs] = useState([]);
   const [meshRefIds, setMeshRefIds] = useState(new Set());
   const [loading, setLoading] = useState(true);
@@ -121,8 +121,6 @@ export default function ProjectReferencesModal({ projectId, token, meshId, camer
     }
   };
 
-  const [deleteTarget, setDeleteTarget] = useState(null);
-
   const handleDeleteProjectRef = async (refId) => {
     try {
       const api = ProjectReferences({ token });
@@ -138,104 +136,99 @@ export default function ProjectReferencesModal({ projectId, token, meshId, camer
   const refApi = ProjectReferences({ token });
 
   return (
-    <Modal title="Project References" onClose={onClose} className="max-w-[1000px]">
-      <div className="space-y-3">
-        {loading ? (
-          <div className="flex justify-center py-8">
-            <Spinner className="text-2xl" />
-          </div>
-        ) : (
-          <>
-            <p className="text-xs text-gray-500 dark:text-gray-400">
-              Click a thumbnail to {cameraAngleMode ? 'set it as the reference for this camera angle' : meshId ? 'toggle it for this mesh' : 'select it'}. Click the trash icon to delete from the project.
-            </p>
+    <div className="space-y-3">
+      {loading ? (
+        <div className="flex justify-center py-8">
+          <Spinner className="text-2xl" />
+        </div>
+      ) : (
+        <>
+          <p className="text-xs text-gray-500 dark:text-gray-400">
+            Click a thumbnail to {cameraAngleMode ? 'set it as the reference for this camera angle' : meshId ? 'toggle it for this mesh' : 'select it'}. Click the trash icon to delete from the project.
+          </p>
+          <div
+            onDrop={handleDrop}
+            onDragOver={handleDragOver}
+            onDragLeave={handleDragLeave}
+            className={`grid grid-cols-5 gap-2 p-2 rounded-lg transition ${
+              dragOver ? 'bg-purple-50 dark:bg-purple-900/20 ring-2 ring-purple-500' : ''
+            }`}
+          >
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept=".png,.jpg,.jpeg,.webp"
+              multiple
+              onChange={handleFileSelect}
+              className="hidden"
+            />
+            {/* Upload cell */}
             <div
-              onDrop={handleDrop}
-              onDragOver={handleDragOver}
-              onDragLeave={handleDragLeave}
-              className={`grid grid-cols-5 gap-2 p-2 rounded-lg transition ${
-                dragOver ? 'bg-purple-50 dark:bg-purple-900/20 ring-2 ring-purple-500' : ''
+              onClick={() => !uploading && fileInputRef.current?.click()}
+              className={`relative border-2 border-dashed rounded-lg flex flex-col items-center justify-center cursor-pointer transition ${
+                uploading ? 'opacity-50 pointer-events-none' : 'border-gray-300 dark:border-gray-600 hover:border-purple-400 dark:hover:border-purple-500'
               }`}
+              style={{ width: 150, height: 150 }}
             >
-              <input
-                ref={fileInputRef}
-                type="file"
-                accept=".png,.jpg,.jpeg,.webp"
-                multiple
-                onChange={handleFileSelect}
-                className="hidden"
-              />
-              {/* Upload cell */}
-              <div
-                onClick={() => !uploading && fileInputRef.current?.click()}
-                className={`relative border-2 border-dashed rounded-lg flex flex-col items-center justify-center cursor-pointer transition ${
-                  uploading ? 'opacity-50 pointer-events-none' : 'border-gray-300 dark:border-gray-600 hover:border-purple-400 dark:hover:border-purple-500'
-                }`}
-                style={{ width: 150, height: 150 }}
-              >
-                {uploading ? (
-                  <Spinner className="text-xs" />
-                ) : (
-                  <>
-                    <svg className="w-5 h-5 text-gray-400 dark:text-gray-500 mb-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
-                    </svg>
-                    <span className="text-[8px] text-gray-400 dark:text-gray-500 text-center leading-tight px-1">Drag & drop</span>
-                  </>
-                )}
-              </div>
-
-              {projectRefs.map((ref) => {
-                const isSelected = cameraAngleMode
-                  ? selectedRefId === ref.id
-                  : meshRefIds.has(ref.id);
-                return (
-                  <div
-                    key={ref.id}
-                    onClick={() => cameraAngleMode ? onSelectReference?.(ref.id) : handleToggleMeshRef(ref.id)}
-                    className={`relative rounded-lg overflow-hidden border-2 cursor-pointer transition group ${
-                      isSelected ? 'border-purple-500 ring-1 ring-purple-500' : 'border-gray-200 dark:border-gray-600 hover:border-purple-300'
-                    }`}
-                    style={{ width: 150, height: 150 }}
-                  >
-                    <img
-                      src={refApi.thumbUrl(projectId, ref.id)}
-                      alt={ref.filename}
-                      className="w-full h-full object-cover"
-                      draggable={false}
-                    />
-                    {isSelected && (
-                      <div className="absolute top-0.5 left-0.5 w-3.5 h-3.5 rounded bg-purple-600 text-white flex items-center justify-center">
-                        <svg className="w-2.5 h-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={3} d="M5 13l4 4L19 7" />
-                        </svg>
-                      </div>
-                    )}
-                    <div className="absolute bottom-0.5 right-0.5 opacity-0 group-hover:opacity-100 transition">
-                      <ButtonIcon
-                        name="delete"
-                        color="red"
-                        title="Delete from project"
-                        onClick={(e) => { e.stopPropagation(); setDeleteTarget(ref.id); }}
-                        className="w-6 h-6"
-                      />
-                    </div>
-                  </div>
-                );
-              })}
+              {uploading ? (
+                <Spinner className="text-xs" />
+              ) : (
+                <>
+                  <svg className="w-5 h-5 text-gray-400 dark:text-gray-500 mb-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
+                  </svg>
+                  <span className="text-[8px] text-gray-400 dark:text-gray-500 text-center leading-tight px-1">Drag & drop</span>
+                </>
+              )}
             </div>
-          </>
-        )}
-      </div>
-      <ConfirmModal
-        show={!!deleteTarget}
-        title="Delete Reference"
-        message="Do you really want to delete this reference image? It will be removed from the server and this cannot be undone."
-        confirmLabel="Delete"
-        confirmColor="red"
-        onConfirm={() => { const t = deleteTarget; setDeleteTarget(null); if (t) handleDeleteProjectRef(t); }}
-        onClose={() => setDeleteTarget(null)}
-      />
-    </Modal>
+
+            {projectRefs.map((ref) => {
+              const isSelected = cameraAngleMode
+                ? selectedRefId === ref.id
+                : meshRefIds.has(ref.id);
+              return (
+                <div
+                  key={ref.id}
+                  onClick={() => cameraAngleMode ? onSelectReference?.(ref.id) : handleToggleMeshRef(ref.id)}
+                  className={`relative rounded-lg overflow-hidden border-2 cursor-pointer transition group ${
+                    isSelected ? 'border-purple-500 ring-1 ring-purple-500' : 'border-gray-200 dark:border-gray-600 hover:border-purple-300'
+                  }`}
+                  style={{ width: 150, height: 150 }}
+                >
+                  <img
+                    src={refApi.thumbUrl(projectId, ref.id)}
+                    alt={ref.filename}
+                    className="w-full h-full object-cover"
+                    draggable={false}
+                  />
+                  {isSelected && (
+                    <div className="absolute top-0.5 left-0.5 w-3.5 h-3.5 rounded bg-purple-600 text-white flex items-center justify-center">
+                      <svg className="w-2.5 h-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={3} d="M5 13l4 4L19 7" />
+                      </svg>
+                    </div>
+                  )}
+                  <div className="absolute bottom-0.5 right-0.5 opacity-0 group-hover:opacity-100 transition">
+                    <ButtonIcon
+                      name="delete"
+                      color="red"
+                      title="Delete from project"
+                      onClick={(e) => { e.stopPropagation(); showConfirmModal({
+                        title: 'Delete Reference',
+                        message: 'Do you really want to delete this reference image? It will be removed from the server and this cannot be undone.',
+                        confirmLabel: 'Delete',
+                        confirmColor: 'red',
+                        onConfirm: () => handleDeleteProjectRef(ref.id),
+                      }); }}
+                      className="w-6 h-6"
+                    />
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </>
+      )}
+    </div>
   );
 }

@@ -1,17 +1,14 @@
 import React, { useState } from 'react';
-import Modal from '@/components/ui/modal';
 import Input from '@/components/forms/input';
 import ButtonOutline from '@/components/ui/button-outline';
 
-export default function ProductModal({ show, product, onSave, onClose }) {
+export default function ProductModal({ product, onSave, onClose }) {
   const [form, setForm] = useState({
     id: product?.id || 0,
     title: product?.title || '',
     price: product?.price ? (product.price / 100).toFixed(2) : '0.00',
     tokens: product?.tokens || 0
   });
-
-  if (!show) return null;
 
   const handleChange = (field) => (e) => {
     setForm(prev => ({ ...prev, [field]: e.target.value }));
@@ -26,10 +23,7 @@ export default function ProductModal({ show, product, onSave, onClose }) {
   };
 
   return (
-    <Modal
-      title={product ? 'Edit Product' : 'Add Product'}
-      onClose={onClose}
-    >
+    <div>
       <div>
         <div className="grid grid-cols-1 gap-4">
           <Input label="Title" name="title" value={form.title} onChange={handleChange('title')} required autoFocus />
@@ -41,6 +35,6 @@ export default function ProductModal({ show, product, onSave, onClose }) {
           <ButtonOutline onClick={handleSave}>Save</ButtonOutline>
         </div>
       </div>
-    </Modal>
+    </div>
   );
 }

@@ -1,17 +1,18 @@
-import React, { useState, useRef, useCallback } from 'react';
+import React, { useState, useRef, useCallback, useEffect } from 'react';
 import * as signalR from '@microsoft/signalr';
 import { useProject } from '@/context/project';
 import { Projects } from '@/api/user/projects';
 import { ProjectMeshes } from '@/api/user/projectMeshes';
 import { ProjectCameraAngles } from '@/api/user/projectCameraAngles';
-import { ProjectMeshReferences } from '@/api/user/projectMeshReferences';
-import { ProjectReferences } from '@/api/user/projectReferences';
-import ReferenceCell from './ReferenceCell';
-import ReferenceModal from './ReferenceModal';
-import ProjectReferencesModal from './ProjectReferencesModal';
+import { OpenAI } from '@/api/admin/openai';
+import ReferenceImagesSection from './ReferenceImagesSection';
+import CameraAngleReferencesModal from './CameraAngleReferencesModal';
+import { generateAngleThumbnail } from '@/helpers/camera-angle';
+import { useModal } from '@/context/modal';
 import Icon from '@/components/ui/icon';
 import TextArea from '@/components/forms/textarea';
 import Select from '@/components/forms/select';
+import Input from '@/components/forms/input';
 import ToggleButtons from '@/components/ui/toggle-buttons';
 
 export default function GenerateImagesPanel({ showPanel, setShowPanel }) {
@@ -28,7 +29,6 @@ export default function GenerateImagesPanel({ showPanel, setShowPanel }) {
     angleRefView,
     setAngleRefView,
     meshRefView,
-    setMeshRefView,
     prompt,
     setPrompt,
     meshPrompts,
@@ -37,15 +37,15 @@ export default function GenerateImagesPanel({ showPanel, setShowPanel }) {
     setGenerationMode,
     projectRefs,
     setProjectRefs,
-    meshReferences,
-    setMeshReferences,
     imageModels,
     refImageModels,
     selectedModelId,
     setSelectedModelId,
     setProject,
+    project,
     imageModelOptions,
     isComfyUI,
+    isGradio,
     generating,
     setGenerating,
     comfyProgress,
@@ -59,17 +59,164 @@ export default function GenerateImagesPanel({ showPanel, setShowPanel }) {
     layerThumbVersion,
     setLayerThumbVersion,
     meshLayers,
+    addMeshLayer,
     viewerRef,
     promptDebounceRef,
     layerApi,
     loadMeshLayers,
     refreshLayerTextures,
-    refreshMeshRefView,
   } = useProject();
+  const { showModal, hideModal } = useModal();
 
-  const [refModal, setRefModal] = useState(null);
-  const [projectRefsModal, setProjectRefsModal] = useState(false);
   const [currentGeneratingAngleId, setCurrentGeneratingAngleId] = useState(null);
+  const seedDebounceRef = useRef(null);
+  const activeHubConnectionRef = useRef(null);
+  const cancelRequestedRef = useRef(false);
+
+  // ── Camera angle checkboxes (persisted to localStorage) ──
+  const storageKey = `cameraAnglesUsed:${id}`;
+  const [usedAngleIds, setUsedAngleIds] = useState(() => {
+    try {
+      const stored = localStorage.getItem(storageKey);
+      if (stored !== null) {
+        const ids = stored.split(',').filter(Boolean);
+        return new Set(ids);
+      }
+    } catch { /* ignore */ }
+    return null; // null = not yet initialized (default to all checked)
+  });
+
+  // Sync usedAngleIds with cameraAngles: new angles are checked by default
+  useEffect(() => {
+    if (!cameraAngles.length) return;
+    if (usedAngleIds === null) {
+      // No localStorage — check all by default
+      setUsedAngleIds(new Set(cameraAngles.map((a) => a.id)));
+    } else {
+      // Add any new angles that aren't in the set yet (checked by default)
+      const newIds = cameraAngles.filter((a) => !usedAngleIds.has(a.id));
+      if (newIds.length > 0) {
+        setUsedAngleIds((prev) => {
+          const next = new Set(prev);
+          newIds.forEach((a) => next.add(a.id));
+          return next;
+        });
+      }
+    }
+  }, [cameraAngles]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const toggleAngleUsed = (angleId) => {
+    setUsedAngleIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(angleId)) next.delete(angleId);
+      else next.add(angleId);
+      try {
+        localStorage.setItem(storageKey, Array.from(next).join(','));
+      } catch { /* ignore */ }
+      return next;
+    });
+  };
+
+  // ── Gradio server reachability — checked on Generate click only ──
+  const [gradioOffline, setGradioOffline] = useState(false);
+
+  // ── Shared SignalR generation helper (ComfyUI + Gradio) ──
+  // Both hubs expose the same GenerateImage method and events.
+  const generateViaHub = useCallback(
+    async ({ hubUrl, hubName, layer, meshDbId, fullPrompt, angleId, angleNum, totalAngles }) => {
+      return new Promise((resolve, reject) => {
+        const connection = new signalR.HubConnectionBuilder()
+          .withUrl(hubUrl, { accessTokenFactory: () => token })
+          .withAutomaticReconnect()
+          .configureLogging(signalR.LogLevel.Information)
+          .withServerTimeout(1000 * 60 * 60)
+          .withKeepAliveInterval(15000)
+          .build();
+        activeHubConnectionRef.current = connection;
+
+        connection.on('ProgressUpdate', (value, message) => {
+          setComfyProgress(value);
+          if (angleNum && totalAngles) {
+            setComfyMessage(`Image ${angleNum}/${totalAngles}: ${message || 'Generating...'}`);
+          } else if (message) {
+            setComfyMessage(message);
+          }
+        });
+        connection.on('SeedUsed', (seed) => {
+          console.log(`[${hubName}] Seed used${angleNum ? ` (angle ${angleNum})` : ''}: ${seed ?? 'none'}`);
+        });
+        connection.on('GenerationComplete', async (base64Image) => {
+          try {
+            const saveRes = await layerApi.saveComfyUiResult(
+              id,
+              layer.id,
+              meshDbId,
+              base64Image
+            );
+            if (!saveRes.data?.success) throw new Error(`Failed to save ${hubName} result`);
+            activeHubConnectionRef.current = null;
+            await connection.stop();
+            resolve(base64Image);
+          } catch (err) {
+            activeHubConnectionRef.current = null;
+            await connection.stop();
+            reject(err);
+          }
+        });
+        connection.on('GenerationError', async (errorMsg, stackTrace) => {
+          console.error(`${hubName} Generation Error${angleNum ? ` (angle ${angleNum})` : ''}:`, errorMsg);
+          if (stackTrace) console.error('Stack trace:', stackTrace);
+          activeHubConnectionRef.current = null;
+          await connection.stop();
+          reject(new Error(errorMsg));
+        });
+        connection
+          .start()
+          .then(() => {
+            console.log(`[${hubName}] Connection started, invoking GenerateImage...`);
+            connection.invoke(
+              'GenerateImage',
+              parseInt(selectedModelId),
+              fullPrompt,
+              id,
+              meshDbId,
+              layer.id,
+              angleId || null
+            );
+          })
+          .catch((err) => {
+            console.error(`[${hubName}] Connection error:`, err);
+            activeHubConnectionRef.current = null;
+            connection.stop();
+            reject(err);
+          });
+      });
+    },
+    [token, id, selectedModelId, layerApi, setComfyProgress, setComfyMessage]
+  );
+
+  // ── Cancel generation ──
+  const handleCancelGeneration = async () => {
+    cancelRequestedRef.current = true;
+    const conn = activeHubConnectionRef.current;
+    if (conn) {
+      activeHubConnectionRef.current = null;
+      try {
+        // Fire-and-forget: don't await, since the server is busy with GenerateImage
+        // and the GenerationError callback will fire once cancellation completes
+        conn.invoke('CancelGeneration').catch(() => {});
+      } catch { /* ignore */ }
+      try {
+        await conn.stop();
+      } catch { /* ignore */ }
+    }
+    setGenerating(false);
+    setGeneratingAngleIds(new Set());
+    setCompletedAngleIds(new Set());
+    setCurrentGeneratingAngleId(null);
+    setComfyProgress(0);
+    setComfyMessage('');
+  };
 
   // ── handleImageModelChange ──
   const handleImageModelChange = async (e) => {
@@ -82,9 +229,32 @@ export default function GenerateImagesPanel({ showPanel, setShowPanel }) {
     }
     try {
       const projectsApi = Projects({ token });
-      await projectsApi.updateImageModel({ id, imageModelId: modelId || null });
+      await projectsApi.updateImageModel({ id, imageModelId: modelId ? parseInt(modelId, 10) : null });
     } catch (err) {
       console.error('Failed to save preferred image model:', err);
+    }
+  };
+
+  // ── handleSeedChange ──
+  const handleSeedChange = (e) => {
+    const raw = e.target.value.replace(/[^0-9]/g, '');
+    const val = raw === '' ? 0 : parseInt(raw, 10);
+    setProject((prev) => prev ? { ...prev, seed: val } : prev);
+    if (seedDebounceRef.current) clearTimeout(seedDebounceRef.current);
+    seedDebounceRef.current = setTimeout(async () => {
+      try {
+        const projectsApi = Projects({ token });
+        await projectsApi.updateSeed({ id, seed: val });
+      } catch (err) {
+        console.error('Failed to save seed:', err);
+      }
+    }, 2000);
+  };
+
+  // ── handleSeedKeyPress ──
+  const handleSeedKeyPress = (e) => {
+    if (!/[0-9]/.test(e.key) && e.key !== 'Backspace' && e.key !== 'Delete' && e.key !== 'ArrowLeft' && e.key !== 'ArrowRight' && e.key !== 'Tab') {
+      e.preventDefault();
     }
   };
 
@@ -202,7 +372,7 @@ export default function GenerateImagesPanel({ showPanel, setShowPanel }) {
   };
 
   // ── handleAddStandardAngles ──
-  const handleAddStandardAngles = async () => {
+  const doAddStandardAngles = async () => {
     if (!viewerRef.current || !selectedMesh) return;
     const meshDbId = meshDbIds[selectedMesh.key];
     if (!meshDbId) return;
@@ -223,7 +393,7 @@ export default function GenerateImagesPanel({ showPanel, setShowPanel }) {
 
       const newAngles = [];
       for (const angle of standardAngles) {
-        const thumb = viewerRef.current.captureThumbnail(75, angle.rotation);
+        const thumb = generateAngleThumbnail(selectedMesh?.object, angle.rotation, 75);
         const res = await anglesApi.create(id, {
           modelId: selectedMesh.modelId,
           meshId: meshDbId,
@@ -251,6 +421,66 @@ export default function GenerateImagesPanel({ showPanel, setShowPanel }) {
     } catch (err) {
       console.error('Failed to add standard angles:', err);
     }
+  };
+
+  const handleAddStandardAngles = () => {
+    if (cameraAngles.length === 0) {
+      doAddStandardAngles();
+    } else {
+      showModal({
+        title: 'Add Standard Angles',
+        onClose: hideModal,
+        body: (
+          <>
+            <p className="text-gray-700 dark:text-gray-300 mb-6">
+              Adding standard angles will remove all of your existing camera angles. Do you really want to do this?
+            </p>
+            <div className="flex gap-3 justify-end">
+              <button
+                onClick={hideModal}
+                className="px-4 py-2 border-2 border-gray-400 text-gray-600 dark:text-gray-300 dark:border-gray-500 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition font-medium text-sm"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => {
+                  hideModal();
+                  doAddStandardAngles();
+                }}
+                className="px-4 py-2 border-2 border-green-600 text-green-600 dark:text-green-400 dark:border-green-500 rounded-lg hover:bg-green-600 hover:text-white dark:hover:bg-green-600 dark:hover:text-white transition font-medium text-sm"
+              >
+                Add Standard Angles
+              </button>
+            </div>
+          </>
+        ),
+      });
+    }
+  };
+
+  // ── handleOpenCameraAngleReferences ──
+  const handleOpenCameraAngleReferences = () => {
+    showModal({
+      title: 'Camera Angle References',
+      className: 'max-w-[1000px]',
+      onClose: hideModal,
+      body: (
+        <CameraAngleReferencesModal
+          onClose={hideModal}
+          projectId={id}
+          token={token}
+          cameraAngles={cameraAngles}
+          selectedMesh={selectedMesh}
+          meshDbIds={meshDbIds}
+          refImageModels={refImageModels}
+          projectRefs={projectRefs}
+          setProjectRefs={setProjectRefs}
+          setCameraAngles={setCameraAngles}
+          setAngleRefView={setAngleRefView}
+          selectedAngleId={selectedAngleId}
+        />
+      ),
+    });
   };
 
   // ── handleRemoveCameraAngle ──
@@ -287,8 +517,25 @@ export default function GenerateImagesPanel({ showPanel, setShowPanel }) {
   const handleGenerate = async () => {
     if (!selectedMesh || !selectedModelId) return;
     if (generationMode === 'angles' && cameraAngles.length === 0) return;
+    cancelRequestedRef.current = false;
     const activeRefs = generationMode === 'angles' ? angleRefView : meshRefView;
-    if (!prompt.trim() && activeRefs.filter((r) => r.active).length === 0) return;
+    // In angles mode, references are always considered active (no checkbox to toggle)
+    const hasActiveRefs = generationMode === 'angles'
+      ? activeRefs.length > 0
+      : activeRefs.filter((r) => r.active).length > 0;
+    if (!prompt.trim() && !hasActiveRefs) return;
+
+    if (isGradio) {
+      try {
+        const { getGradioHealth } = OpenAI({ token });
+        const res = await getGradioHealth();
+        if (!res.data?.success) throw new Error('unreachable');
+        setGradioOffline(false);
+      } catch {
+        setGradioOffline(true);
+        return;
+      }
+    }
 
     setGenerating(true);
     setComfyProgress(0);
@@ -302,75 +549,32 @@ export default function GenerateImagesPanel({ showPanel, setShowPanel }) {
     try {
       if (generationMode === 'single') {
         const layerNum = meshLayers.length + 1;
-        const layerRes = await layerApi.create(id, meshDbId, `Layer ${layerNum}`);
-        if (!layerRes.data?.success) throw new Error('Failed to create layer');
-        const layer = layerRes.data.data;
-
-        const depthMap = viewerRef.current?.captureDepthMap(1024);
-        if (!depthMap) throw new Error('Failed to generate depth map');
-
         const cameraAngle = viewerRef.current?.getCameraAngle
           ? viewerRef.current.getCameraAngle()
           : null;
         const cameraAngleJson = cameraAngle ? JSON.stringify(cameraAngle) : '';
+        const layerRes = await layerApi.create(id, meshDbId, `Layer ${layerNum}`, cameraAngleJson);
+        if (!layerRes.data?.success) throw new Error('Failed to create layer');
+        const layer = layerRes.data.data;
+        addMeshLayer(meshDbId, layer);
 
-        const fullPrompt = `Apply the image references to a 3D model using the provided depth map. The first image is a depth map of the 3D model from the current camera angle. Remove all shadows, reflections, highlights, and specularity. Maintain absolute pixel-per-pixel structural identity, shape, and spatial alignment with the original image, displaying only raw base color. Flat albedo texture map, completely unlit, diffuse-only illumination, uniform exposure, no directional light.\n\n${meshPrompts[meshDbId] || ''}`;
+        const depthMap = viewerRef.current?.captureDepthMap(1024);
+        if (!depthMap) throw new Error('Failed to generate depth map');
+
+        const fullPrompt = meshPrompts[meshDbId] || '';
 
         let generatedImage;
 
-        if (isComfyUI) {
+        if (isComfyUI || isGradio) {
+          const hubUrl = isComfyUI ? '/hubs/comfyui' : '/hubs/gradio';
+          const hubName = isComfyUI ? 'ComfyUI' : 'Gradio';
           await layerApi.saveDepthMap(id, layer.id, meshDbId, depthMap);
-          generatedImage = await new Promise((resolve, reject) => {
-            const connection = new signalR.HubConnectionBuilder()
-              .withUrl('/hubs/comfyui', { accessTokenFactory: () => token })
-              .withAutomaticReconnect()
-              .configureLogging(signalR.LogLevel.Warning)
-              .withServerTimeout(1000 * 60 * 60)
-              .withKeepAliveInterval(15000)
-              .build();
-
-            connection.on('ProgressUpdate', (value, message) => {
-              setComfyProgress(value);
-              if (message) setComfyMessage(message);
-            });
-            connection.on('GenerationComplete', async (base64Image) => {
-              try {
-                const saveRes = await layerApi.saveComfyUiResult(
-                  id,
-                  layer.id,
-                  meshDbId,
-                  base64Image
-                );
-                if (!saveRes.data?.success) throw new Error('Failed to save ComfyUI result');
-                await connection.stop();
-                resolve(base64Image);
-              } catch (err) {
-                await connection.stop();
-                reject(err);
-              }
-            });
-            connection.on('GenerationError', async (errorMsg, stackTrace) => {
-              console.error('ComfyUI Generation Error:', errorMsg);
-              if (stackTrace) console.error('Stack trace:', stackTrace);
-              await connection.stop();
-              reject(new Error(errorMsg));
-            });
-            connection
-              .start()
-              .then(() =>
-                connection.invoke(
-                  'GenerateImage',
-                  parseInt(selectedModelId),
-                  fullPrompt,
-                  id,
-                  meshDbId,
-                  layer.id
-                )
-              )
-              .catch((err) => {
-                connection.stop();
-                reject(err);
-              });
+          generatedImage = await generateViaHub({
+            hubUrl,
+            hubName,
+            layer,
+            meshDbId,
+            fullPrompt,
           });
         } else {
           const genRes = await layerApi.generate(
@@ -403,24 +607,45 @@ export default function GenerateImagesPanel({ showPanel, setShowPanel }) {
           await refreshLayerTextures(updatedLayers);
         }
       } else {
-        const angles = [...cameraAngles];
+        const angles = [...cameraAngles].filter((a) => usedAngleIds?.has(a.id) ?? true);
         const totalAngles = angles.length;
+        if (totalAngles === 0) {
+          setGenerating(false);
+          return;
+        }
         setGeneratingAngleIds(new Set(angles.map((a) => a.id)));
         setCompletedAngleIds(new Set());
 
+        // Capture the user's prompt before the loop — setSelectedAngleId during
+        // the loop triggers an effect that overwrites `prompt` with the angle's prompt,
+        // which we don't want to send to Gradio/ComfyUI.
+        const userPrompt = prompt;
+
         for (let i = 0; i < totalAngles; i++) {
+          if (cancelRequestedRef.current) break;
+
           const angle = angles[i];
           const angleNum = i + 1;
 
           setComfyProgress(0);
           setComfyMessage(`Image ${angleNum}/${totalAngles}: Starting...`);
           setCurrentGeneratingAngleId(angle.id);
+          // Select this angle so its reference image shows in the Image References section
+          setSelectedAngleId(angle.id);
+          if (angle.projectReferenceId) {
+            const ref = projectRefs.find((r) => r.id === angle.projectReferenceId);
+            setAngleRefView(ref ? [{ ...ref, active: true }] : []);
+          } else {
+            setAngleRefView([]);
+          }
 
           const layerNum = meshLayers.length + i + 1;
-          const layerRes = await layerApi.create(id, meshDbId, `Layer ${layerNum}`);
+          const cameraAngleJson = JSON.stringify(angle.rotation);
+          const layerRes = await layerApi.create(id, meshDbId, `Layer ${layerNum}`, cameraAngleJson);
           if (!layerRes.data?.success)
             throw new Error(`Failed to create layer for angle ${angleNum}`);
           const layer = layerRes.data.data;
+          addMeshLayer(meshDbId, layer);
 
           viewerRef.current?.setCameraRotation(angle.rotation);
           await new Promise((r) => setTimeout(r, 50));
@@ -429,68 +654,23 @@ export default function GenerateImagesPanel({ showPanel, setShowPanel }) {
           if (!depthMap)
             throw new Error(`Failed to generate depth map for angle ${angleNum}`);
 
-          const cameraAngleJson = JSON.stringify(angle.rotation);
-          const fullPrompt = `${prompt}\n\nApply the image references to a 3D model using the provided depth map. The first image is a depth map of the 3D model from the current camera angle. Remove all shadows, reflections, highlights, and specularity. Maintain absolute pixel-per-pixel structural identity, shape, and spatial alignment with the original image, displaying only raw base color. Flat albedo texture map, completely unlit, diffuse-only illumination, uniform exposure, no directional light.`;
+          const fullPrompt = userPrompt;
 
           let generatedImage;
 
-          if (isComfyUI) {
+          if (isComfyUI || isGradio) {
+            const hubUrl = isComfyUI ? '/hubs/comfyui' : '/hubs/gradio';
+            const hubName = isComfyUI ? 'ComfyUI' : 'Gradio';
             await layerApi.saveDepthMap(id, layer.id, meshDbId, depthMap);
-            generatedImage = await new Promise((resolve, reject) => {
-              const connection = new signalR.HubConnectionBuilder()
-                .withUrl('/hubs/comfyui', { accessTokenFactory: () => token })
-                .withAutomaticReconnect()
-                .configureLogging(signalR.LogLevel.Warning)
-                .withServerTimeout(600000)
-                .withKeepAliveInterval(15000)
-                .build();
-
-              connection.on('ProgressUpdate', (value, message) => {
-                setComfyProgress(value);
-                setComfyMessage(
-                  `Image ${angleNum}/${totalAngles}: ${message || 'Generating...'}`
-                );
-              });
-              connection.on('GenerationComplete', async (base64Image) => {
-                try {
-                  const saveRes = await layerApi.saveComfyUiResult(
-                    id,
-                    layer.id,
-                    meshDbId,
-                    base64Image
-                  );
-                  if (!saveRes.data?.success)
-                    throw new Error('Failed to save ComfyUI result');
-                  await connection.stop();
-                  resolve(base64Image);
-                } catch (err) {
-                  await connection.stop();
-                  reject(err);
-                }
-              });
-              connection.on('GenerationError', async (errorMsg, stackTrace) => {
-                console.error(`ComfyUI Generation Error (angle ${angleNum}):`, errorMsg);
-                if (stackTrace) console.error('Stack trace:', stackTrace);
-                await connection.stop();
-                reject(new Error(errorMsg));
-              });
-              connection
-                .start()
-                .then(() =>
-                  connection.invoke(
-                    'GenerateImage',
-                    parseInt(selectedModelId),
-                    fullPrompt,
-                    id,
-                    meshDbId,
-                    layer.id,
-                    angle.id
-                  )
-                )
-                .catch((err) => {
-                  connection.stop();
-                  reject(err);
-                });
+            generatedImage = await generateViaHub({
+              hubUrl,
+              hubName,
+              layer,
+              meshDbId,
+              fullPrompt,
+              angleId: angle.id,
+              angleNum,
+              totalAngles,
             });
           } else {
             setComfyMessage(`Image ${angleNum}/${totalAngles}: Generating...`);
@@ -510,6 +690,8 @@ export default function GenerateImagesPanel({ showPanel, setShowPanel }) {
               );
             generatedImage = genRes.data.data?.image;
           }
+
+          if (cancelRequestedRef.current) break;
 
           if (generatedImage) {
             try {
@@ -549,71 +731,6 @@ export default function GenerateImagesPanel({ showPanel, setShowPanel }) {
     }
   };
 
-  // ── Reference handlers ──
-  const handleRefDelete = async (ref) => {
-    if (!ref.meshRefId) return;
-    try {
-      const meshRefApi = ProjectMeshReferences({ token });
-      await meshRefApi.delete(id, ref.meshRefId);
-      const meshDbId = selectedMesh ? meshDbIds[selectedMesh.key] : null;
-      if (meshDbId) {
-        setMeshReferences((prev) => ({
-          ...prev,
-          [meshDbId]: (prev[meshDbId] || []).filter(
-            (mr) => mr.projectReferenceId !== ref.id
-          ),
-        }));
-      }
-      setMeshRefView((prev) => prev.filter((r) => r.id !== ref.id));
-    } catch (err) {
-      console.error('Failed to remove reference from mesh:', err);
-    }
-  };
-
-  const handleRefToggleActive = async (ref) => {
-    if (!ref.meshRefId) return;
-    const newActive = !ref.active;
-    setMeshRefView((prev) =>
-      prev.map((r) => (r.id === ref.id ? { ...r, active: newActive } : r))
-    );
-    try {
-      const meshRefApi = ProjectMeshReferences({ token });
-      await meshRefApi.updateActive(id, ref.meshRefId, newActive);
-    } catch (err) {
-      setMeshRefView((prev) =>
-        prev.map((r) => (r.id === ref.id ? { ...r, active: !newActive } : r))
-      );
-      console.error('Failed to update reference active state:', err);
-    }
-  };
-
-  const handleModalMeshRefChanged = async () => {
-    if (!selectedMesh) return;
-    const meshDbId = meshDbIds[selectedMesh.key];
-    if (!meshDbId) return;
-    try {
-      const meshRefApi = ProjectMeshReferences({ token });
-      const res = await meshRefApi.getByMesh(id, meshDbId);
-      if (res.data?.success) {
-        setMeshReferences((prev) => ({ ...prev, [meshDbId]: res.data.data || [] }));
-      }
-    } catch {
-      /* ignore */
-    }
-  };
-
-  const handleModalProjectRefsChanged = async () => {
-    try {
-      const refApi = ProjectReferences({ token });
-      const res = await refApi.getByProject(id);
-      if (res.data?.success) {
-        setProjectRefs(res.data.data || []);
-      }
-    } catch {
-      /* ignore */
-    }
-  };
-
   if (!showPanel || models.length === 0) return null;
 
   return (
@@ -638,11 +755,18 @@ export default function GenerateImagesPanel({ showPanel, setShowPanel }) {
               <label className="text-xs font-medium text-gray-700 dark:text-gray-300">Camera Angles</label>
               <div className="flex items-center gap-1">
                 <button
+                  onClick={handleOpenCameraAngleReferences}
+                  className="p-1 rounded hover:bg-gray-100 dark:hover:bg-gray-700 text-gray-500 dark:text-gray-400 leading-none"
+                  title="Generate camera angle references"
+                >
+                  <Icon name="burst_mode" className="w-4 h-4 !text-[16px] !leading-4 block overflow-hidden" />
+                </button>
+                <button
                   onClick={handleAddStandardAngles}
-                  className="p-1 rounded hover:bg-gray-100 dark:hover:bg-gray-700 text-gray-500 dark:text-gray-400"
+                  className="p-1 rounded hover:bg-gray-100 dark:hover:bg-gray-700 text-gray-500 dark:text-gray-400 leading-none"
                   title="Add standard angles"
                 >
-                  <Icon name="360" className="w-4 h-4" />
+                  <Icon name="360" className="w-4 h-4 !text-[16px] !leading-4 block overflow-hidden" />
                 </button>
                 <button
                   onClick={handleAddCameraAngle}
@@ -669,6 +793,15 @@ export default function GenerateImagesPanel({ showPanel, setShowPanel }) {
                       className={`relative group rounded-lg border overflow-hidden cursor-pointer transition ${selectedAngleId === angle.id ? 'border-purple-500 ring-2 ring-purple-500' : 'border-gray-200 dark:border-gray-600 hover:ring-2 hover:ring-purple-500'}`}
                       style={{ background: 'radial-gradient(circle at center, #2a2a5e, #1a1a2e)' }}
                     >
+                      {/* Checkbox overlay (top-left) */}
+                      <input
+                        type="checkbox"
+                        checked={usedAngleIds?.has(angle.id) ?? true}
+                        onChange={(e) => { e.stopPropagation(); toggleAngleUsed(angle.id); }}
+                        onClick={(e) => e.stopPropagation()}
+                        className="absolute top-1 left-1 z-10 w-4 h-4 cursor-pointer accent-purple-500"
+                        title="Include in batch generation"
+                      />
                       <div
                         className="w-full mt-2 aspect-square bg-center bg-cover bg-no-repeat"
                         style={{
@@ -723,55 +856,10 @@ export default function GenerateImagesPanel({ showPanel, setShowPanel }) {
           />
         </div>
 
-        <div>
-          <label className="block text-xs font-medium text-gray-700 dark:text-gray-300 mb-1">Image References</label>
-          <div className={`grid grid-cols-3 gap-x-1 gap-y-3 p-1 rounded-lg w-fit transition`}>
-            {(generationMode === 'angles' ? angleRefView : meshRefView).map((ref) => (
-              <ReferenceCell
-                key={ref.id}
-                ref_={ref}
-                projectId={id}
-                token={token}
-                onToggleActive={() => handleRefToggleActive(ref)}
-                onDelete={() => {
-                  if (generationMode === 'angles' && selectedAngleId) {
-                    (async () => {
-                      try {
-                        const anglesApi = ProjectCameraAngles({ token });
-                        await anglesApi.updateReference(id, selectedAngleId, null);
-                        setCameraAngles((prev) => prev.map((a) => a.id === selectedAngleId ? { ...a, projectReferenceId: null } : a));
-                        setAngleRefView([]);
-                      } catch (err) {
-                        console.error('Failed to remove reference from camera angle:', err);
-                      }
-                    })();
-                  } else {
-                    handleRefDelete(ref);
-                  }
-                }}
-                onNewImage={() => setRefModal({ reference: ref, mode: 'new', isAngleRef: generationMode === 'angles', angleId: selectedAngleId })}
-                onEditImage={() => setRefModal({ reference: ref, mode: 'edit' })}
-              />
-            ))}
-            {(generationMode === 'single' || angleRefView.length === 0) && (
-              <div
-                onClick={() => setProjectRefsModal(true)}
-                className={`relative border-2 border-dashed rounded-lg flex flex-col items-center justify-center cursor-pointer transition border-gray-300 dark:border-gray-600 hover:border-purple-400 dark:hover:border-purple-500`}
-                style={{ width: 100, height: 80 }}
-              >
-                <>
-                  <svg className="w-5 h-5 text-gray-400 dark:text-gray-500 mb-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
-                  </svg>
-                  <span className="text-[8px] text-gray-400 dark:text-gray-500 text-center leading-tight px-1">Add</span>
-                </>
-              </div>
-            )}
-          </div>
-        </div>
+        <ReferenceImagesSection angleMode={generationMode === 'angles'} />
 
         <div>
-          <label className="block text-xs font-medium text-gray-700 dark:text-gray-300 mb-1">Model</label>
+          <label className="block text-xs font-medium text-gray-700 dark:text-gray-300 mb-1">Projection Image Model</label>
           <Select
             value={selectedModelId}
             onChange={handleImageModelChange}
@@ -795,69 +883,43 @@ export default function GenerateImagesPanel({ showPanel, setShowPanel }) {
             </div>
           </div>
         )}
-        <button
-          onClick={handleGenerate}
-          disabled={generating || !selectedMesh || (generationMode === 'angles' && cameraAngles.length === 0) || (!prompt.trim() && (generationMode === 'angles' ? angleRefView : meshRefView).filter((r) => r.active).length === 0) || !selectedModelId}
-          className="w-full px-4 py-2 border-2 border-green-600 text-green-600 dark:text-green-500 dark:border-green-500 rounded-lg hover:bg-green-600 hover:text-white dark:hover:bg-green-600 dark:hover:text-white disabled:opacity-50 disabled:cursor-not-allowed transition font-medium text-sm"
-        >
-          {generating ? 'Generating...' : (generationMode === 'angles' ? 'Generate Images' : 'Generate Image')}
-        </button>
+        {isGradio && gradioOffline && (
+          <div className="mb-2 px-3 py-2 rounded-lg bg-red-100 dark:bg-red-900/40 text-red-700 dark:text-red-300 text-xs font-medium text-center">
+            Gradio server is non-responsive
+          </div>
+        )}
+        <div className="flex gap-2">
+          <Input
+            type="number"
+            name="seed"
+            value={project?.seed ?? 0}
+            onChange={handleSeedChange}
+            onKeyPress={handleSeedKeyPress}
+            formPadding={false}
+            className="w-[6em]"
+            placeholder="Seed"
+            title="Seed value for image generation"
+          />
+          <button
+            onClick={handleGenerate}
+            disabled={generating || !selectedMesh || (generationMode === 'angles' && (cameraAngles.length === 0 || (usedAngleIds?.size ?? cameraAngles.length) === 0)) || (!prompt.trim() && (generationMode === 'angles' ? angleRefView.length === 0 : meshRefView.filter((r) => r.active).length === 0)) || !selectedModelId}
+            className="flex-1 px-4 py-2 border-2 border-green-600 text-green-600 dark:text-green-500 dark:border-green-500 rounded-lg hover:bg-green-600 hover:text-white dark:hover:bg-green-600 dark:hover:text-white disabled:opacity-50 disabled:cursor-not-allowed transition font-medium text-sm"
+          >
+            {generating ? 'Generating...' : (generationMode === 'angles' ? 'Generate Images' : 'Generate Image')}
+          </button>
+          {generating && (
+            <button
+              onClick={handleCancelGeneration}
+              className="flex-shrink-0 px-3 py-2 border-2 border-red-600 text-red-600 dark:text-red-500 dark:border-red-500 rounded-lg hover:bg-red-600 hover:text-white dark:hover:bg-red-600 dark:hover:text-white transition font-medium text-sm"
+              title="Cancel generation"
+            >
+              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+              </svg>
+            </button>
+          )}
+        </div>
       </div>
-
-      {refModal && (
-        <ReferenceModal
-          reference={refModal.reference}
-          projectId={id}
-          token={token}
-          imageModels={refImageModels}
-          mode={refModal.mode}
-          onClose={() => setRefModal(null)}
-          onSaved={async (savedRef) => {
-            await handleModalProjectRefsChanged();
-            refreshMeshRefView();
-            if (refModal.isAngleRef && refModal.angleId && savedRef?.id) {
-              try {
-                const anglesApi = ProjectCameraAngles({ token });
-                await anglesApi.updateReference(id, refModal.angleId, savedRef.id);
-                setCameraAngles((prev) => prev.map((a) => a.id === refModal.angleId ? { ...a, projectReferenceId: savedRef.id } : a));
-                setAngleRefView([{ ...savedRef, active: true }]);
-              } catch (err) {
-                console.error('Failed to update camera angle reference:', err);
-              }
-            }
-          }}
-        />
-      )}
-
-      {projectRefsModal && (
-        <ProjectReferencesModal
-          projectId={id}
-          token={token}
-          meshId={selectedMesh ? meshDbIds[selectedMesh.key] : null}
-          cameraAngleMode={generationMode === 'angles' && !!selectedAngleId}
-          selectedRefId={generationMode === 'angles' ? (cameraAngles.find((a) => a.id === selectedAngleId)?.projectReferenceId || null) : null}
-          onSelectReference={async (refId) => {
-            if (!selectedAngleId) return;
-            try {
-              const anglesApi = ProjectCameraAngles({ token });
-              await anglesApi.updateReference(id, selectedAngleId, refId);
-              setCameraAngles((prev) => prev.map((a) => a.id === selectedAngleId ? { ...a, projectReferenceId: refId } : a));
-              const ref = projectRefs.find((r) => r.id === refId);
-              setAngleRefView(ref ? [{ ...ref, active: true }] : []);
-              setProjectRefsModal(false);
-            } catch (err) {
-              console.error('Failed to set camera angle reference:', err);
-            }
-          }}
-          onClose={() => setProjectRefsModal(false)}
-          onAdded={handleModalMeshRefChanged}
-          onDeleted={handleModalMeshRefChanged}
-          onProjectReferencesChanged={async () => {
-            await handleModalProjectRefsChanged();
-            handleModalMeshRefChanged();
-          }}
-        />
-      )}
     </div>
   );
 }

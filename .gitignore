@@ -13,6 +13,7 @@ appsettings.*.json
 RECOVER_*
 *.jfm
 **/storage
+**/venv
 
 
 # Build results

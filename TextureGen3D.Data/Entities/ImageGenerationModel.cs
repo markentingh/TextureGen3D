@@ -18,6 +18,9 @@ namespace TextureGen3D.Data.Entities
         public string? PromptPath { get; set; }
         public string? DepthMapPath { get; set; }
         public string? InputImagesPath { get; set; }
+        public string? SeedPath { get; set; }
+        public string? Prompt { get; set; }
+        public string? EndpointUrl { get; set; }
         public bool Active { get; set; } = true;
         public DateTime DateCreated { get; set; }
         public DateTime DateUpdated { get; set; }

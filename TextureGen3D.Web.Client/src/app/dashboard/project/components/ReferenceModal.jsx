@@ -1,5 +1,4 @@
 import React, { useState, useRef, useEffect } from 'react';
-import Modal from '@/components/ui/modal';
 import Select from '@/components/forms/select';
 import Spinner from '@/components/ui/spinner';
 import { ProjectReferences } from '@/api/user/projectReferences';
@@ -68,12 +67,7 @@ export default function ReferenceModal({ reference, projectId, token, imageModel
     : '';
 
   return (
-    <Modal
-      title={mode === 'edit' ? 'Edit Reference' : 'New Reference'}
-      onClose={onClose}
-      className="max-w-[1200px]"
-    >
-      <div className="space-y-4">
+    <div className="space-y-4">
         {error && (
           <div className="p-2 bg-red-50 dark:bg-red-900/20 text-red-700 dark:text-red-400 rounded text-sm">
             {error}
@@ -174,7 +168,6 @@ export default function ReferenceModal({ reference, projectId, token, imageModel
             </>
           )}
         </div>
-      </div>
-    </Modal>
+    </div>
   );
 }

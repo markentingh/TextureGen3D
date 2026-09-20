@@ -1,14 +1,16 @@
 import React, { useState, useRef, useCallback, useEffect } from 'react';
 import * as THREE from 'three';
+import { GLTFExporter } from 'three/examples/jsm/exporters/GLTFExporter.js';
+import { generateAngleThumbnails } from '@/helpers/camera-angle';
 import { useProject } from '@/context/project';
 import { ProjectModels } from '@/api/user/projectModels';
 import { ProjectMeshes } from '@/api/user/projectMeshes';
 import Icon from '@/components/ui/icon';
 import Spinner from '@/components/ui/spinner';
 import ToggleButtons from '@/components/ui/toggle-buttons';
-import ConfirmModal from '@/components/ui/confirm-modal';
-import Modal from '@/components/ui/modal';
+import { useModal } from '@/context/modal';
 import StitchLayersModal from './StitchLayersModal';
+import MaskThumb from './MaskThumb';
 
 export default function RightSidebar() {
   const {
@@ -32,9 +34,11 @@ export default function RightSidebar() {
     setAllMeshLayers,
     layerApi,
     layerThumbVersion,
+    maskThumbVersions,
+    selectedLayerId,
+    setSelectedLayerId,
     imageModels,
     viewerRef,
-    pendingLayersRef,
     meshPrompts,
     setMeshPrompts,
     cameraAngles,
@@ -54,9 +58,11 @@ export default function RightSidebar() {
     loadProject,
     parseUploadedFile,
     loadMeshLayers,
+    removeMeshLayer,
     refreshLayerTextures,
     formatTriangleCount,
   } = useProject();
+  const { showModal, hideModal, showConfirmModal } = useModal();
 
   // ── Local state ──
   const [editingLayerId, setEditingLayerId] = useState(null);
@@ -64,8 +70,6 @@ export default function RightSidebar() {
   const [showStitchModal, setShowStitchModal] = useState(false);
   const [layerMenuOpenId, setLayerMenuOpenId] = useState(null);
   const [layerMenuPos, setLayerMenuPos] = useState({ top: 0, right: 0 });
-  const [deleteLayerTarget, setDeleteLayerTarget] = useState(null);
-  const [showLayerLimitModal, setShowLayerLimitModal] = useState(false);
   const dragLayerIndexRef = useRef(null);
   const [uploading, setUploading] = useState(false);
   const [uploadError, setUploadError] = useState(null);
@@ -81,86 +85,46 @@ export default function RightSidebar() {
     return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
   };
 
-  // ── generateAngleThumbnails ──
-  const generateAngleThumbnails = useCallback(
-    async (mesh, angles) => {
-      if (!mesh?.object || angles.length === 0) return [];
+  // ── getAngleThumbForLayer ──
+  // Match a layer's CameraAngle (JSON rotation string) to a camera angle's thumbnail
+  const getAngleThumbForLayer = (layer) => {
+    if (!layer.cameraAngle) return null;
+    try {
+      const layerRot = JSON.parse(layer.cameraAngle);
+      const rotKey = JSON.stringify(layerRot);
+      return cameraAngles.find((a) => JSON.stringify(a.rotation) === rotKey)?.thumbnail || null;
+    } catch {
+      return null;
+    }
+  };
 
-      const size = 75;
-      const thumbRenderer = new THREE.WebGLRenderer({
-        antialias: true,
-        alpha: true,
-        preserveDrawingBuffer: true,
-      });
-      thumbRenderer.setPixelRatio(window.devicePixelRatio);
-      thumbRenderer.setSize(size, size);
-      thumbRenderer.setClearColor(0x000000, 0);
+  // ── handleMeshDownload ──
+  const handleMeshDownload = useCallback(
+    async (mesh, event) => {
+      event.stopPropagation();
+      if (!mesh?.object) return;
 
-      const thumbScene = new THREE.Scene();
-      thumbScene.background = null;
-      const thumbCamera = new THREE.PerspectiveCamera(50, 1, 0.1, 1000);
+      const exporter = new GLTFExporter();
+      const clone = mesh.object.clone(true);
 
-      const ambient = new THREE.AmbientLight(0xffffff, 1.0);
-      thumbScene.add(ambient);
-      const dirLight1 = new THREE.DirectionalLight(0xffffff, 1.2);
-      dirLight1.position.set(5, 10, 7);
-      thumbScene.add(dirLight1);
-      const dirLight2 = new THREE.DirectionalLight(0xffffff, 0.8);
-      dirLight2.position.set(-5, -3, -7);
-      thumbScene.add(dirLight2);
-      const dirLight3 = new THREE.DirectionalLight(0xffffff, 0.5);
-      dirLight3.position.set(0, -8, 5);
-      thumbScene.add(dirLight3);
-
-      const thumbMesh = mesh.object.clone(true);
-      thumbMesh.traverse((child) => {
-        if (child.isMesh) {
-          if (child.material) {
-            if (Array.isArray(child.material)) child.material.forEach((m) => m.dispose());
-            else child.material.dispose();
-          }
-          child.material = new THREE.MeshNormalMaterial({ side: THREE.DoubleSide });
-        }
-      });
-      thumbScene.add(thumbMesh);
-
-      const box = new THREE.Box3().setFromObject(thumbMesh);
-      const center = box.getCenter(new THREE.Vector3());
-      const size3 = box.getSize(new THREE.Vector3());
-      const maxDim = Math.max(size3.x, size3.y, size3.z) || 1;
-      thumbMesh.position.sub(center);
-
-      const thumbnails = [];
-      for (const angle of angles) {
-        const rotation = JSON.parse(angle.rotation || '{}');
-        thumbCamera.rotation.set(
-          THREE.MathUtils.degToRad(rotation.x || 0),
-          THREE.MathUtils.degToRad(rotation.y || 0),
-          THREE.MathUtils.degToRad(rotation.z || 0)
-        );
-        thumbCamera.updateMatrixWorld();
-        const distance =
-          (maxDim / 2) / Math.tan((thumbCamera.fov * Math.PI / 180) / 2) * 1.4;
-        const forward = new THREE.Vector3(0, 0, -1);
-        forward.applyQuaternion(thumbCamera.quaternion);
-        thumbCamera.position.copy(forward).multiplyScalar(-distance);
-        thumbCamera.updateProjectionMatrix();
-        thumbRenderer.clear();
-        thumbRenderer.render(thumbScene, thumbCamera);
-        thumbnails.push(thumbRenderer.domElement.toDataURL('image/png'));
-      }
-
-      thumbScene.traverse((obj) => {
-        if (obj.geometry) obj.geometry.dispose();
-        if (obj.material) {
-          if (Array.isArray(obj.material)) obj.material.forEach((m) => m.dispose());
-          else obj.material.dispose();
-        }
-      });
-      thumbRenderer.dispose();
-      thumbRenderer.forceContextLoss();
-
-      return thumbnails;
+      exporter.parse(
+        clone,
+        (result) => {
+          const blob = new Blob([result], { type: 'model/gltf-binary' });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = `${(mesh.name || 'mesh').replace(/[^a-zA-Z0-9_-]/g, '_')}.glb`;
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+          URL.revokeObjectURL(url);
+        },
+        (error) => {
+          console.error('GLB export failed:', error);
+        },
+        { binary: true }
+      );
     },
     []
   );
@@ -169,7 +133,6 @@ export default function RightSidebar() {
   const handleMeshSelect = useCallback(
     async (mesh) => {
       setSelectedMesh(mesh);
-
       const meshDbId = meshDbIds[mesh.key];
       if (meshDbId) {
         setPrompt(meshPrompts[meshDbId] || '');
@@ -177,9 +140,7 @@ export default function RightSidebar() {
         setPrompt('');
       }
 
-      loadMeshLayers(meshDbId).then((layers) => {
-        pendingLayersRef.current = layers;
-      });
+      loadMeshLayers(meshDbId);
 
       if (meshDbId) {
         const savedAngles = allCameraAngles[meshDbId] || [];
@@ -232,11 +193,9 @@ export default function RightSidebar() {
       meshPrompts,
       setPrompt,
       loadMeshLayers,
-      pendingLayersRef,
       allCameraAngles,
       thumbnailCache,
       setThumbnailCache,
-      generateAngleThumbnails,
       setCameraAngles,
       setSelectedAngleId,
       generationMode,
@@ -310,6 +269,38 @@ export default function RightSidebar() {
     setDragOver(false);
   };
 
+  // ── handleDeleteModelClick — confirm modal, then delete ──
+  const handleDeleteModelClick = (model) => {
+    showModal({
+      title: 'Delete 3D Model',
+      onClose: hideModal,
+      body: (
+        <>
+          <p className="text-gray-700 dark:text-gray-300 mb-6">
+            Do you really want to delete this 3D model {model.filename}? All related meshes will be deleted as well.
+          </p>
+          <div className="flex gap-3 justify-end">
+            <button
+              onClick={hideModal}
+              className="px-4 py-2 border-2 border-gray-400 text-gray-600 dark:text-gray-300 dark:border-gray-500 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition font-medium text-sm"
+            >
+              Cancel
+            </button>
+            <button
+              onClick={() => {
+                hideModal();
+                handleDeleteModel(model.id);
+              }}
+              className="px-4 py-2 border-2 border-green-600 text-green-600 dark:text-green-400 dark:border-green-500 rounded-lg hover:bg-green-600 hover:text-white dark:hover:bg-green-600 dark:hover:text-white transition font-medium text-sm"
+            >
+              Delete 3D Model
+            </button>
+          </div>
+        </>
+      ),
+    });
+  };
+
   // ── handleDeleteModel ──
   const handleDeleteModel = async (modelId) => {
     try {
@@ -342,7 +333,13 @@ export default function RightSidebar() {
     const meshDbId = meshDbIds[selectedMesh.key];
     if (!meshDbId) return;
     if (meshLayers.length >= 16) {
-      setShowLayerLimitModal(true);
+      showConfirmModal({
+        title: 'Layer limit reached',
+        message: 'You already have 16 layers on this mesh, which is the maximum supported by the shader. Remove an existing layer before adding a new one.',
+        confirmLabel: 'OK',
+        confirmColor: 'gray',
+        showCancel: false,
+      });
       return;
     }
     const layerNum = meshLayers.length + 1;
@@ -381,8 +378,8 @@ export default function RightSidebar() {
     );
     setMeshLayers(updatedLayers);
     try {
-      await layerApi.toggleVisible(id, layer.id, newVisible);
       await refreshLayerTextures(updatedLayers);
+      await layerApi.toggleVisible(id, layer.id, newVisible);
     } catch (err) {
       console.error('Failed to toggle layer visibility:', err);
       setMeshLayers(meshLayers);
@@ -393,7 +390,7 @@ export default function RightSidebar() {
     if (!layer || !selectedMesh) return;
     const meshDbId = meshDbIds[selectedMesh.key];
     if (!meshDbId) return;
-    setMeshLayers((prev) => prev.filter((l) => l.id !== layer.id));
+    removeMeshLayer(meshDbId, layer.id);
     try {
       await layerApi.delete(id, layer.id);
       const updatedLayers = await loadMeshLayers(meshDbId);
@@ -484,13 +481,34 @@ export default function RightSidebar() {
   };
 
   const handleDeleteLayerClick = (layer) => {
-    setDeleteLayerTarget(layer);
-  };
-
-  const confirmDeleteLayer = async () => {
-    const layer = deleteLayerTarget;
-    setDeleteLayerTarget(null);
-    if (layer) await handleDeleteLayer(layer);
+    showModal({
+      title: 'Delete Layer',
+      onClose: hideModal,
+      body: (
+        <>
+          <p className="text-gray-700 dark:text-gray-300 mb-6">
+            Do you really want to delete this mesh layer? This cannot be undone.
+          </p>
+          <div className="flex gap-3 justify-end">
+            <button
+              onClick={hideModal}
+              className="px-4 py-2 border-2 border-gray-400 text-gray-600 dark:text-gray-300 dark:border-gray-500 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition font-medium text-sm"
+            >
+              Cancel
+            </button>
+            <button
+              onClick={() => {
+                hideModal();
+                handleDeleteLayer(layer);
+              }}
+              className="px-4 py-2 border-2 border-red-600 text-red-600 dark:text-red-400 dark:border-red-500 rounded-lg hover:bg-red-600 hover:text-white dark:hover:bg-red-600 dark:hover:text-white transition font-medium text-sm"
+            >
+              Delete Layer
+            </button>
+          </div>
+        </>
+      ),
+    });
   };
 
   return (
@@ -535,6 +553,14 @@ export default function RightSidebar() {
                   <span className="text-xs text-gray-400 dark:text-gray-500 flex-shrink-0 tabular-nums">
                     {mesh.triangles.toLocaleString()} tris
                   </span>
+                  <button
+                    onClick={(e) => handleMeshDownload(mesh, e)}
+                    className="ml-2 p-1 rounded text-gray-400 hover:text-purple-600 dark:hover:text-purple-400 transition flex-shrink-0"
+                    aria-label="Download mesh as GLB"
+                    title="Download mesh as GLB"
+                  >
+                    <Icon name="download" className="text-base" />
+                  </button>
                 </li>
               );
             })}
@@ -581,37 +607,37 @@ export default function RightSidebar() {
                       onDragStart={(e) => handleLayerDragStart(e, index)}
                       onDragOver={(e) => e.preventDefault()}
                       onDrop={(e) => handleLayerDrop(e, index)}
-                      className="px-2 py-2 group hover:bg-gray-50 dark:hover:bg-gray-700/50 transition"
+                      onClick={() => setSelectedLayerId(layer.id)}
+                      className={`px-2 py-2 group cursor-pointer transition ${
+                        selectedLayerId === layer.id
+                          ? 'bg-purple-50 dark:bg-purple-900/30 outline-none ring-2 ring-purple-500 ring-inset'
+                          : 'hover:bg-gray-50 dark:hover:bg-gray-700/50'
+                      }`}
+                      style={selectedLayerId === layer.id ? { boxShadow: 'inset 0 0 0 2px #a855f7' } : undefined}
                     >
-                      {/* Top row: drag handle + thumbnail + (name + edit + 3-dots) aligned to top */}
                       <div className="flex items-start gap-2">
-                        {/* Drag handle — centered vertically against the 75px thumbnail */}
+                        {/* Drag handle */}
                         <span
                           className="cursor-grab active:cursor-grabbing text-gray-300 dark:text-gray-600 hover:text-gray-500 dark:hover:text-gray-400 flex-shrink-0"
-                          style={{ height: 75, display: 'flex', alignItems: 'center' }}
+                          style={{ height: 70, display: 'flex', alignItems: 'center' }}
                           title="Drag to reorder"
                         >
                           <Icon name="drag_indicator" className="text-base" />
                         </span>
 
-                        {/* 75x75 UV map thumbnail container */}
-                        <div
-                          className="flex-shrink-0 rounded border border-gray-200 dark:border-gray-600 overflow-hidden bg-gray-100 dark:bg-gray-700"
-                          style={{ width: 75, height: 75 }}
-                        >
-                          {layer.hasImage !== false && (
-                            <img
-                              src={`${layerApi.uvmapThumbUrl(id, meshDbIds[selectedMesh.key], layer.id)}?r=${Math.random()}`}
-                              alt={layer.name}
-                              className="w-full h-full object-cover"
-                            />
-                          )}
-                        </div>
-
-                        {/* Right column: name row + visibility icon below */}
+                        {/* Content column: name row + thumbs row */}
                         <div className="min-w-0 flex-1 flex flex-col">
-                          {/* Name + edit + 3-dots row (top-aligned) */}
+                          {/* Row 1: eye toggle + name + edit + 3-dots */}
                           <div className="flex items-center gap-1">
+                            <button
+                              onClick={() => handleToggleLayerVisible(layer)}
+                              className={`flex-shrink-0 translate-y-1 pr-1 transition ${layer.visible !== false ? 'text-gray-500 hover:text-gray-700 dark:hover:text-gray-300' : 'text-gray-300 dark:text-gray-600 hover:text-gray-500'}`}
+                              aria-label={layer.visible !== false ? 'Hide layer' : 'Show layer'}
+                              title={layer.visible !== false ? 'Hide layer' : 'Show layer'}
+                            >
+                              <Icon name={layer.visible !== false ? 'visibility' : 'visibility_off'} className="text-2xl" />
+                            </button>
+
                             <div className="min-w-0 flex-1">
                               {editingLayerId === layer.id ? (
                                 <input
@@ -634,7 +660,7 @@ export default function RightSidebar() {
                               )}
                             </div>
 
-                            {/* Edit icon (same row as name, far right) */}
+                            {/* Edit icon */}
                             <button
                               onClick={() => handleEditLayerName(layer)}
                               className="flex-shrink-0 text-gray-400 hover:text-purple-600 dark:hover:text-purple-400 transition"
@@ -666,16 +692,50 @@ export default function RightSidebar() {
                             </div>
                           </div>
 
-                          {/* Bottom row: visibility toggle (left) + trash icon (right) */}
+                          {/* Row 2: UV map thumb + camera angle thumb + mask thumb + delete */}
                           <div className="flex items-center justify-between mt-1">
-                            <button
-                              onClick={() => handleToggleLayerVisible(layer)}
-                              className={`flex-shrink-0 transition ${layer.visible !== false ? 'text-gray-500 hover:text-gray-700 dark:hover:text-gray-300' : 'text-gray-300 dark:text-gray-600 hover:text-gray-500'}`}
-                              aria-label={layer.visible !== false ? 'Hide layer' : 'Show layer'}
-                              title={layer.visible !== false ? 'Hide layer' : 'Show layer'}
-                            >
-                              <Icon name={layer.visible !== false ? 'visibility' : 'visibility_off'} className="text-2xl" />
-                            </button>
+                            <div className="flex items-center gap-2">
+                              {/* UV map thumb */}
+                              <div
+                                className="flex-shrink-0 rounded border border-gray-200 dark:border-gray-600 overflow-hidden bg-gray-100 dark:bg-gray-700"
+                                style={{ width: 47, height: 47 }}
+                              >
+                                {layer.hasImage !== false && (
+                                  <img
+                                    src={`${layerApi.uvmapThumbUrl(id, meshDbIds[selectedMesh.key], layer.id)}?r=${layerThumbVersion}`}
+                                    alt={layer.name}
+                                    className="w-full h-full object-cover"
+                                    onLoad={(e) => { e.target.style.display = ''; }}
+                                    onError={(e) => { e.target.style.display = 'none'; }}
+                                  />
+                                )}
+                              </div>
+
+                              {/* Mask thumb — inverted mask on the alpha channel of a white image */}
+                              <MaskThumb
+                                url={`${layerApi.maskThumbUrl(id, meshDbIds[selectedMesh.key], layer.id)}?r=${maskThumbVersions?.[layer.id] ?? 0}`}
+                                version={maskThumbVersions?.[layer.id] ?? 0}
+                                size={47}
+                              />
+
+                              {/* Camera angle thumb */}
+                              {(() => {
+                                const angleThumb = getAngleThumbForLayer(layer);
+                                return angleThumb ? (
+                                  <div
+                                    className="flex-shrink-0 rounded border border-gray-200 dark:border-gray-600 overflow-hidden bg-gray-100 dark:bg-gray-700"
+                                    style={{ width: 47, height: 47 }}
+                                  >
+                                    <img
+                                      src={angleThumb}
+                                      alt="Camera angle"
+                                      className="w-full h-full object-cover"
+                                    />
+                                  </div>
+                                ) : null;
+                              })()}
+                            </div>
+
                             <button
                               onClick={() => handleDeleteLayerClick(layer)}
                               className="flex-shrink-0 text-gray-400 hover:text-red-600 dark:hover:text-red-400 transition"
@@ -804,7 +864,7 @@ export default function RightSidebar() {
                       </svg>
                     </a>
                     <button
-                      onClick={() => { if (confirm('Delete this model?')) handleDeleteModel(model.id); }}
+                      onClick={() => handleDeleteModelClick(model)}
                       className="p-1.5 text-gray-500 hover:text-red-600 dark:hover:text-red-400 transition"
                       aria-label="Delete"
                     >
@@ -821,42 +881,6 @@ export default function RightSidebar() {
       </div>
 
       {/* ── Modals ── */}
-
-      <ConfirmModal
-        show={showLayerLimitModal}
-        title="Layer limit reached"
-        message="You already have 16 layers on this mesh, which is the maximum supported by the shader. Remove an existing layer before adding a new one."
-        confirmLabel="OK"
-        confirmColor="gray"
-        showCancel={false}
-        onConfirm={() => setShowLayerLimitModal(false)}
-        onClose={() => setShowLayerLimitModal(false)}
-      />
-
-      {deleteLayerTarget && (
-        <Modal
-          title="Delete Layer"
-          onClose={() => setDeleteLayerTarget(null)}
-        >
-          <p className="text-gray-700 dark:text-gray-300 mb-6">
-            Do you really want to delete this mesh layer? This cannot be undone.
-          </p>
-          <div className="flex gap-3 justify-end">
-            <button
-              onClick={() => setDeleteLayerTarget(null)}
-              className="px-4 py-2 border-2 border-gray-400 text-gray-600 dark:text-gray-300 dark:border-gray-500 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition font-medium text-sm"
-            >
-              Cancel
-            </button>
-            <button
-              onClick={confirmDeleteLayer}
-              className="px-4 py-2 border-2 border-red-600 text-red-600 dark:text-red-400 dark:border-red-500 rounded-lg hover:bg-red-600 hover:text-white dark:hover:bg-red-600 dark:hover:text-white transition font-medium text-sm"
-            >
-              Delete Layer
-            </button>
-          </div>
-        </Modal>
-      )}
 
       {showStitchModal && selectedMesh && (
         <StitchLayersModal

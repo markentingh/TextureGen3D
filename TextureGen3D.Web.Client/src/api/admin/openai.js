@@ -16,7 +16,9 @@ const OpenAI = (args) => Api({ ...args }).endpoints(({ api }) => {
     toggleImageModelActive: (id, active) => api.post(`${imgPath}/toggle-active`, { id, active }),
     deleteImageModel: (id) => api.post(`${imgPath}/delete-model`, { id }),
     getImageGenerations: (start = 0, length = 25) => api.get(`${imgPath}/get-generations?start=${start}&length=${length}`),
-    getDailyCosts: (range = "30days") => api.get(`${imgPath}/get-daily-costs?range=${range}`)
+    getDailyCosts: (range = "30days") => api.get(`${imgPath}/get-daily-costs?range=${range}`),
+    getGradioEndpoints: () => api.get(`${imgPath}/gradio-endpoints`),
+    getGradioHealth: () => api.get(`${imgPath}/gradio-health`)
   };
 });
 

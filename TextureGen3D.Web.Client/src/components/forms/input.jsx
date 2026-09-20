@@ -44,6 +44,7 @@ export default function Input({
           onInput={onInput}
           disabled={disabled}
           placeholder={placeholder}
+          title={title}
           required={required}
           className={`w-full ${prefix ? 'pl-7' : 'px-3'} py-2 border rounded bg-white dark:bg-gray-700 focus:outline-none focus:ring-2 focus:ring-primary-500 ${
             error

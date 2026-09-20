@@ -11,6 +11,18 @@ const ProjectCameraAngles = (args) => Api({ ...args }).endpoints(({ api }) => {
     delete: (projectId, angleId) => api.post(`${apiPath}/${projectId}/${angleId}/delete`),
     deleteAll: (projectId) => api.post(`${apiPath}/${projectId}/delete-all`),
     deleteAllByMesh: (projectId, meshId) => api.post(`${apiPath}/${projectId}/mesh/${meshId}/delete-all`),
+    generateReference: (projectId, angleId, referenceId, modelId, pngBase64, prompt = '') =>
+      api.post(
+        `${apiPath}/${projectId}/${angleId}/generate-reference?referenceId=${referenceId}&modelId=${modelId}${prompt ? `&userPrompt=${encodeURIComponent(prompt)}` : ''}`,
+        pngBase64,
+        { headers: { 'Content-Type': 'text/plain' } }
+      ),
+    previewReference: (projectId, angleId, referenceId, modelId, pngBase64, prompt = '') =>
+      api.post(
+        `${apiPath}/${projectId}/${angleId}/preview-reference?referenceId=${referenceId}&modelId=${modelId}${prompt ? `&userPrompt=${encodeURIComponent(prompt)}` : ''}`,
+        pngBase64,
+        { headers: { 'Content-Type': 'text/plain' } }
+      ),
   };
 });
 

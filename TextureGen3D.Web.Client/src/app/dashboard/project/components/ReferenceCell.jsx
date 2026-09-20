@@ -2,7 +2,7 @@ import React, { useState, useRef, useEffect, memo } from 'react';
 import { createPortal } from 'react-dom';
 import { ProjectReferences } from '@/api/user/projectReferences';
 
-const ReferenceCell = memo(function ReferenceCell({ ref_, projectId, token, onToggleActive, onDelete, onNewImage, onEditImage }) {
+const ReferenceCell = memo(function ReferenceCell({ ref_, projectId, token, onToggleActive, onDelete, onNewImage, onEditImage, onPreview, showCheckbox = true }) {
   const [menuOpen, setMenuOpen] = useState(false);
   const [menuPos, setMenuPos] = useState({ top: 0, left: 0 });
   const menuRef = useRef(null);
@@ -19,8 +19,9 @@ const ReferenceCell = memo(function ReferenceCell({ ref_, projectId, token, onTo
 
   return (
     <div
-      className="relative rounded-lg overflow-hidden border border-gray-200 dark:border-gray-600 group"
-      style={{ width: 90, height: 80 }}
+      onClick={(e) => { if (onPreview) onPreview(ref_); }}
+      className={`relative rounded-lg overflow-hidden border border-gray-200 dark:border-gray-600 group ${onPreview ? 'cursor-pointer' : ''}`}
+      style={{ width: 90, height: 90 }}
     >
       <img
         src={thumbUrl}
@@ -30,13 +31,16 @@ const ReferenceCell = memo(function ReferenceCell({ ref_, projectId, token, onTo
       />
 
       {/* Checkbox top-left */}
-      <input
-        type="checkbox"
-        checked={ref_.active}
-        onChange={onToggleActive}
-        className="absolute top-0.5 left-0.5 w-3.5 h-3.5 rounded border-gray-300 text-purple-600 focus:ring-purple-500 cursor-pointer bg-white/80"
-        title={ref_.active ? 'Active' : 'Inactive'}
-      />
+      {showCheckbox && (
+        <input
+          type="checkbox"
+          checked={ref_.active}
+          onChange={onToggleActive}
+          onClick={(e) => e.stopPropagation()}
+          className="absolute top-0.5 left-0.5 w-3.5 h-3.5 rounded border-gray-300 text-purple-600 focus:ring-purple-500 cursor-pointer bg-white/80"
+          title={ref_.active ? 'Active' : 'Inactive'}
+        />
+      )}
 
       {/* 3-dot menu top-right */}
       <div className="absolute top-0.5 right-0.5">

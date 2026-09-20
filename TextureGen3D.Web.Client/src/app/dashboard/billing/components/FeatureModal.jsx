@@ -1,16 +1,13 @@
 import React, { useState } from 'react';
-import Modal from '@/components/ui/modal';
 import Input from '@/components/forms/input';
 import Select from '@/components/forms/select';
 import ButtonOutline from '@/components/ui/button-outline';
 import Icon from '@/components/ui/icon';
 import { ICON_OPTIONS, getIconName } from '@/helpers/icons';
 
-export default function FeatureModal({ show, feature, onSave, onClose }) {
+export default function FeatureModal({ feature, onSave, onClose }) {
   const [text, setText] = useState(feature?.text || '');
   const [icon, setIcon] = useState(feature?.icon || 'dot');
-
-  if (!show) return null;
 
   const handleSave = () => {
     if (!text.trim()) return;
@@ -18,10 +15,7 @@ export default function FeatureModal({ show, feature, onSave, onClose }) {
   };
 
   return (
-    <Modal
-      title={feature ? 'Edit Feature' : 'Add Feature'}
-      onClose={onClose}
-    >
+    <div>
       <div>
         <div className="grid grid-cols-1 gap-4">
           <Input label="Feature" name="text" value={text} onChange={(e) => setText(e.target.value)} required autoFocus />
@@ -40,6 +34,6 @@ export default function FeatureModal({ show, feature, onSave, onClose }) {
           <ButtonOutline onClick={handleSave}>Save</ButtonOutline>
         </div>
       </div>
-    </Modal>
+    </div>
   );
 }

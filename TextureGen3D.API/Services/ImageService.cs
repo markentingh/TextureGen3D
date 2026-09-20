@@ -43,10 +43,15 @@ namespace TextureGen3D.API.Services
         Task SaveProjectMeshLayerUvMapThumbAsync(Guid projectId, Guid meshId, Guid layerId, byte[] fileData);
         Task<byte[]> GetProjectMeshLayerUvMapThumbAsync(Guid projectId, Guid meshId, Guid layerId);
         Task DeleteProjectMeshLayerUvMapThumbAsync(Guid projectId, Guid meshId, Guid layerId);
+        Task SaveProjectMeshLayerMaskAsync(Guid projectId, Guid meshId, Guid layerId, byte[] fileData);
+        Task<byte[]> GetProjectMeshLayerMaskAsync(Guid projectId, Guid meshId, Guid layerId);
+        Task SaveProjectMeshLayerMaskThumbAsync(Guid projectId, Guid meshId, Guid layerId, byte[] fileData);
+        Task<byte[]> GetProjectMeshLayerMaskThumbAsync(Guid projectId, Guid meshId, Guid layerId);
         Task SaveProjectMeshLayerDepthMapAsync(Guid projectId, Guid meshId, Guid layerId, byte[] fileData);
         Task<byte[]> GetProjectMeshLayerDepthMapAsync(Guid projectId, Guid meshId, Guid layerId);
         Task DeleteProjectMeshLayerDepthMapAsync(Guid projectId, Guid meshId, Guid layerId);
         Task DeleteProjectMeshLayerFolderAsync(Guid projectId, Guid meshId, Guid layerId);
+        Task DeleteProjectMeshFolderAsync(Guid projectId, Guid meshId);
     }
 
     public class ImageService : IImageService
@@ -400,6 +405,34 @@ namespace TextureGen3D.API.Services
             await DeleteFromFileSystemAsync(relativePath);
         }
 
+        public async Task SaveProjectMeshLayerMaskAsync(Guid projectId, Guid meshId, Guid layerId, byte[] fileData)
+        {
+            var relativePath = Path.Combine("projects", projectId.ToString(), "meshes", meshId.ToString(), layerId.ToString(), "mask.png");
+            if (_activeStorage == "azure") { await SaveToAzureBlobAsync(relativePath, fileData); return; }
+            await SaveToFileSystemAsync(relativePath, fileData);
+        }
+
+        public async Task<byte[]> GetProjectMeshLayerMaskAsync(Guid projectId, Guid meshId, Guid layerId)
+        {
+            var relativePath = Path.Combine("projects", projectId.ToString(), "meshes", meshId.ToString(), layerId.ToString(), "mask.png");
+            if (_activeStorage == "azure") return await GetFromAzureBlobAsync(relativePath);
+            return await GetFromFileSystemAsync(relativePath);
+        }
+
+        public async Task SaveProjectMeshLayerMaskThumbAsync(Guid projectId, Guid meshId, Guid layerId, byte[] fileData)
+        {
+            var relativePath = Path.Combine("projects", projectId.ToString(), "meshes", meshId.ToString(), layerId.ToString(), "mask_thumb.png");
+            if (_activeStorage == "azure") { await SaveToAzureBlobAsync(relativePath, fileData); return; }
+            await SaveToFileSystemAsync(relativePath, fileData);
+        }
+
+        public async Task<byte[]> GetProjectMeshLayerMaskThumbAsync(Guid projectId, Guid meshId, Guid layerId)
+        {
+            var relativePath = Path.Combine("projects", projectId.ToString(), "meshes", meshId.ToString(), layerId.ToString(), "mask_thumb.png");
+            if (_activeStorage == "azure") return await GetFromAzureBlobAsync(relativePath);
+            return await GetFromFileSystemAsync(relativePath);
+        }
+
         public async Task SaveProjectMeshLayerDepthMapAsync(Guid projectId, Guid meshId, Guid layerId, byte[] fileData)
         {
             var relativePath = Path.Combine("projects", projectId.ToString(), "meshes", meshId.ToString(), layerId.ToString(), "depthmap.jpg");
@@ -424,6 +457,28 @@ namespace TextureGen3D.API.Services
         public async Task DeleteProjectMeshLayerFolderAsync(Guid projectId, Guid meshId, Guid layerId)
         {
             var folderPath = Path.Combine("projects", projectId.ToString(), "meshes", meshId.ToString(), layerId.ToString());
+
+            if (_activeStorage == "azure")
+            {
+                // Azure blob storage has no real folders — delete all blobs with this prefix
+                var blobServiceClient = new BlobServiceClient(GetAzureConnectionString());
+                var containerClient = blobServiceClient.GetBlobContainerClient(GetAzureContainerName());
+                var prefix = folderPath.Replace('\\', '/') + "/";
+                await foreach (var blob in containerClient.GetBlobsAsync(prefix: prefix))
+                {
+                    await containerClient.DeleteBlobIfExistsAsync(blob.Name);
+                }
+                return;
+            }
+
+            var fullPath = GetFileSystemPath(folderPath);
+            if (Directory.Exists(fullPath))
+                Directory.Delete(fullPath, recursive: true);
+        }
+
+        public async Task DeleteProjectMeshFolderAsync(Guid projectId, Guid meshId)
+        {
+            var folderPath = Path.Combine("projects", projectId.ToString(), "meshes", meshId.ToString());
 
             if (_activeStorage == "azure")
             {

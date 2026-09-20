@@ -40,6 +40,12 @@ namespace TextureGen3D.Data.Repositories.Projects
             return await _dbConnection.QueryAsync<ProjectMeshLayer>(query, new { meshId, projectId });
         }
 
+        public async Task<IEnumerable<ProjectMeshLayer>> GetByProjectIdAsync(Guid projectId)
+        {
+            const string query = @"SELECT * FROM public.""ProjectMeshLayers"" WHERE ""ProjectId"" = @projectId ORDER BY ""Index"" ASC";
+            return await _dbConnection.QueryAsync<ProjectMeshLayer>(query, new { projectId });
+        }
+
         public async Task<int> GetNextIndexAsync(Guid meshId, Guid projectId)
         {
             const string query = @"SELECT COALESCE(MAX(""Index""), -1) + 1 FROM public.""ProjectMeshLayers"" WHERE ""ProjectMeshId"" = @meshId AND ""ProjectId"" = @projectId";

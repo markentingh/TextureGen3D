@@ -6,6 +6,7 @@ namespace TextureGen3D.Data.Interfaces.Projects
     {
         Task<ProjectMeshReference> CreateAsync(ProjectMeshReference meshRef);
         Task<IEnumerable<ProjectMeshReference>> GetByMeshIdAsync(Guid meshId, Guid projectId);
+        Task<IEnumerable<ProjectMeshReference>> GetByProjectIdAsync(Guid projectId);
         Task<ProjectMeshReference?> GetByMeshAndReferenceAsync(Guid meshId, Guid referenceId, Guid projectId);
         Task UpdateActiveAsync(Guid id, Guid projectId, bool active);
         Task DeleteAsync(Guid id, Guid projectId);

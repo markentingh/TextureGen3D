@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { useSession } from '@/context/session';
 import { OpenAI } from '@/api/admin/openai';
-import Modal from '@/components/ui/modal';
+import { useModal } from '@/context/modal';
 import Carousel from '@/components/ui/carousel';
 import BarChart from '@/components/ui/bar-chart';
 import ProductImagePreview from '@/app/dashboard/project/components/ProductImagePreview';
@@ -62,16 +62,12 @@ export default function ImageGenerationsTab() {
   const { getImageGenerations, getDailyCosts } = OpenAI(session);
   const PAGE_SIZE = 25;
 
+  const { showModal, hideModal } = useModal();
   const [generations, setGenerations] = useState([]);
   const [totalCount, setTotalCount] = useState(0);
   const [loading, setLoading] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
   const [hasMore, setHasMore] = useState(true);
-  const [selectedGen, setSelectedGen] = useState(null);
-  const [previewImages, setPreviewImages] = useState([]);
-  const [previewIndex, setPreviewIndex] = useState(0);
-  const [showPreview, setShowPreview] = useState(false);
-  const [selectedUserId, setSelectedUserId] = useState(null);
   const [dailyCosts, setDailyCosts] = useState(null);
   const [costRange, setCostRange] = useState('30days');
   const scrollRef = useRef(null);
@@ -121,14 +117,45 @@ export default function ImageGenerationsTab() {
   }, [hasMore, loadingMore, loading, generations.length, fetchGenerations]);
 
   const handleRowClick = (gen) => {
-    setSelectedGen(gen);
+    showModal({
+      title: 'Image Generation Details',
+      className: 'w-[800px] max-w-full',
+      onClose: hideModal,
+      body: (
+        <ImageGenerationDetail
+          gen={gen}
+          onCarouselImageClick={(src, index) => {
+            const fullSizeImages = buildFullSizeImages(gen);
+            showModal({
+              title: gen.userEmail || 'Image Preview',
+              className: 'max-w-none w-[95vw]',
+              onClose: hideModal,
+              body: (
+                <ProductImagePreview
+                  images={fullSizeImages}
+                  alt="Image Preview"
+                  defaultIndex={index}
+                />
+              ),
+            });
+          }}
+          onUserClick={(e, userId) => {
+            e.preventDefault();
+            e.stopPropagation();
+            if (userId) {
+              showModal({
+                title: 'User Details',
+                onClose: hideModal,
+                body: (
+                  <UserDetailsModal userId={userId} onClose={hideModal} />
+                ),
+              });
+            }
+          }}
+        />
+      ),
+    });
   };
-
-  const handleUserClick = useCallback((e, userId) => {
-    e.preventDefault();
-    e.stopPropagation();
-    if (userId) setSelectedUserId(userId);
-  }, []);
 
   const buildCarouselImages = (gen) => {
     const images = [];
@@ -160,14 +187,6 @@ export default function ImageGenerationsTab() {
     } catch { /* ignore */ }
 
     return images;
-  };
-
-  const handleCarouselImageClick = (src, index) => {
-    if (!selectedGen) return;
-    const fullSizeImages = buildFullSizeImages(selectedGen);
-    setPreviewImages(fullSizeImages);
-    setPreviewIndex(index);
-    setShowPreview(true);
   };
 
   return (
@@ -370,30 +389,6 @@ export default function ImageGenerationsTab() {
           </div>
         )}
       </div>
-
-      {selectedGen && (
-        <Modal title="Image Generation Details" onClose={() => setSelectedGen(null)} className="w-[800px] max-w-full">
-          <ImageGenerationDetail
-            gen={selectedGen}
-            onCarouselImageClick={handleCarouselImageClick}
-            onUserClick={handleUserClick}
-          />
-        </Modal>
-      )}
-
-      {showPreview && previewImages.length > 0 && (
-        <ProductImagePreview
-          show={showPreview}
-          images={previewImages}
-          alt="Image Preview"
-          defaultIndex={previewIndex}
-          onClose={() => setShowPreview(false)}
-        />
-      )}
-
-      {selectedUserId && (
-        <UserDetailsModal userId={selectedUserId} onClose={() => setSelectedUserId(null)} />
-      )}
     </div>
   );
 }

@@ -19,6 +19,9 @@ namespace TextureGen3D.API.Controllers
         readonly IProjectCameraAngleRepository _angleRepo;
         readonly IImageGenerationModelRepository _imageGenRepo;
         readonly IImageService _imageService;
+        readonly IProjectReferenceRepository _refRepo;
+        readonly IProjectMeshReferenceRepository _meshRefRepo;
+        readonly IProjectMeshLayerRepository _layerRepo;
 
         public ProjectsController(
             IProjectRepository projectRepo,
@@ -26,7 +29,10 @@ namespace TextureGen3D.API.Controllers
             IProjectMeshRepository meshRepo,
             IProjectCameraAngleRepository angleRepo,
             IImageGenerationModelRepository imageGenRepo,
-            IImageService imageService)
+            IImageService imageService,
+            IProjectReferenceRepository refRepo,
+            IProjectMeshReferenceRepository meshRefRepo,
+            IProjectMeshLayerRepository layerRepo)
         {
             _projectRepo = projectRepo;
             _modelRepo = modelRepo;
@@ -34,6 +40,9 @@ namespace TextureGen3D.API.Controllers
             _angleRepo = angleRepo;
             _imageGenRepo = imageGenRepo;
             _imageService = imageService;
+            _refRepo = refRepo;
+            _meshRefRepo = meshRefRepo;
+            _layerRepo = layerRepo;
         }
 
         [HttpGet]
@@ -131,20 +140,43 @@ namespace TextureGen3D.API.Controllers
                 if (project == null)
                     return Json(new ApiResponse { success = false, message = "Project not found" });
 
+                // Generate a seed if the project doesn't have one
+                if (!project.Seed.HasValue)
+                {
+                    project.Seed = Random.Shared.Next(0, 10000000);
+                    await _projectRepo.UpdateSeedAsync(id, userId, project.Seed.Value);
+                }
+
                 // Fetch all project data in parallel
                 var modelsTask = _modelRepo.GetByProjectIdAsync(id);
                 var meshesTask = _meshRepo.GetByProjectIdAsync(id);
                 var anglesTask = _angleRepo.GetByProjectIdAsync(id);
                 var imageModelsTask = _imageGenRepo.GetActiveAsync();
                 var hasThumbTask = _imageService.HasProjectThumbAsync(id);
+                var refsTask = _refRepo.GetByProjectIdAsync(id);
+                var meshRefsTask = _meshRefRepo.GetByProjectIdAsync(id);
+                var layersTask = _layerRepo.GetByProjectIdAsync(id);
 
-                await Task.WhenAll(modelsTask, meshesTask, anglesTask, imageModelsTask, hasThumbTask);
+                await Task.WhenAll(modelsTask, meshesTask, anglesTask, imageModelsTask, hasThumbTask, refsTask, meshRefsTask, layersTask);
 
                 var models = await modelsTask;
                 var meshes = await meshesTask;
                 var angles = await anglesTask;
                 var imageModels = await imageModelsTask;
                 var hasThumb = await hasThumbTask;
+                var references = await refsTask;
+                var meshReferences = await meshRefsTask;
+                var layers = await layersTask;
+
+                // Group mesh references by mesh id for the frontend
+                var meshRefsByMesh = meshReferences
+                    .GroupBy(mr => mr.ProjectMeshId)
+                    .ToDictionary(g => g.Key, g => g.AsEnumerable());
+
+                // Group layers by mesh id for the frontend
+                var layersByMesh = layers
+                    .GroupBy(l => l.ProjectMeshId)
+                    .ToDictionary(g => g.Key, g => g.AsEnumerable());
 
                 return Json(new ApiResponse
                 {
@@ -161,11 +193,15 @@ namespace TextureGen3D.API.Controllers
                             project.Status,
                             project.Created,
                             project.ImageModelId,
+                            project.Seed,
                             hasThumb
                         },
                         models,
                         meshes,
                         angles,
+                        references,
+                        meshReferences = meshRefsByMesh,
+                        layers = layersByMesh,
                         imageModels = imageModels.Select(m => new
                         {
                             id = m.Id,
@@ -309,6 +345,24 @@ namespace TextureGen3D.API.Controllers
                     return Json(new ApiResponse { success = false, message = "Could not find user" });
 
                 await _projectRepo.UpdateImageModelAsync(request.Id, userId, request.ImageModelId);
+                return Json(new ApiResponse { success = true });
+            }
+            catch (Exception ex)
+            {
+                return Json(new ApiResponse { success = false, message = ex.Message });
+            }
+        }
+
+        [HttpPost("update-seed")]
+        public async Task<IActionResult> UpdateSeed([FromBody] UpdateProjectSeedRequest request)
+        {
+            try
+            {
+                var userId = GetUserId();
+                if (userId == Guid.Empty)
+                    return Json(new ApiResponse { success = false, message = "Could not find user" });
+
+                await _projectRepo.UpdateSeedAsync(request.Id, userId, request.Seed);
                 return Json(new ApiResponse { success = true });
             }
             catch (Exception ex)

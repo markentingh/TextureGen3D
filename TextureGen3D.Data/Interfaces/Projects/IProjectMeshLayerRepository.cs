@@ -7,6 +7,7 @@ namespace TextureGen3D.Data.Interfaces.Projects
         Task<ProjectMeshLayer> CreateAsync(ProjectMeshLayer layer);
         Task<ProjectMeshLayer?> GetByIdAsync(Guid id, Guid projectId);
         Task<IEnumerable<ProjectMeshLayer>> GetByMeshIdAsync(Guid meshId, Guid projectId);
+        Task<IEnumerable<ProjectMeshLayer>> GetByProjectIdAsync(Guid projectId);
         Task<int> GetNextIndexAsync(Guid meshId, Guid projectId);
         Task UpdateNameAsync(Guid id, Guid projectId, string name);
         Task UpdateCameraAngleAsync(Guid id, Guid projectId, string cameraAngle);

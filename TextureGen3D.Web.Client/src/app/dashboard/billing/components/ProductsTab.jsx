@@ -1,14 +1,13 @@
 import React, { useState, useEffect, useCallback } from 'react';
+import { useModal } from '@/context/modal';
 import ButtonOutline from '@/components/ui/button-outline';
 import ButtonIcon from '@/components/ui/button-icon';
 import Icon from '@/components/ui/icon';
 import ProductModal from './ProductModal';
 
 export default function ProductsTab({ api, showMessage }) {
+  const { showModal, hideModal } = useModal();
   const [products, setProducts] = useState([]);
-  const [editing, setEditing] = useState(null);
-  const [showModal, setShowModal] = useState(false);
-  const [modalKey, setModalKey] = useState(0);
 
   const load = useCallback(async () => {
     const res = await api.getProducts();
@@ -21,8 +20,7 @@ export default function ProductsTab({ api, showMessage }) {
     const res = await api.saveProduct(product);
     if (res.data.success) {
       showMessage('info', 'Product saved successfully.');
-      setShowModal(false);
-      setEditing(null);
+      hideModal();
       load();
     } else {
       showMessage('error', res.data.message || 'Failed to save product.');
@@ -41,19 +39,12 @@ export default function ProductsTab({ api, showMessage }) {
     <div>
       <div className="tool-bar mb-4">
         <div className="right-side">
-          <ButtonOutline onClick={() => { setEditing(null); setModalKey(k => k + 1); setShowModal(true); }}>
+          <ButtonOutline onClick={() => showModal({ title: 'Add Product', body: <ProductModal product={null} onSave={handleSave} onClose={hideModal} /> })}>
             <Icon name="add" />
             <span className="ml-2">Add Product</span>
           </ButtonOutline>
         </div>
       </div>
-      <ProductModal
-        key={modalKey}
-        show={showModal}
-        product={editing}
-        onSave={handleSave}
-        onClose={() => { setShowModal(false); setEditing(null); }}
-      />
       <div className="bg-white dark:bg-gray-800 rounded-lg shadow overflow-hidden">
         <table className="w-full text-left border-collapse">
           <thead className="bg-gray-100 dark:bg-gray-700">
@@ -72,7 +63,7 @@ export default function ProductsTab({ api, showMessage }) {
                 <td className="px-4 py-3">{p.tokens.toLocaleString()}</td>
                 <td className="px-4 py-3">
                   <div className="flex items-center gap-2">
-                    <ButtonIcon name="edit" onClick={() => { setEditing(p); setModalKey(k => k + 1); setShowModal(true); }} title="Edit" />
+                    <ButtonIcon name="edit" onClick={() => showModal({ title: 'Edit Product', body: <ProductModal product={p} onSave={handleSave} onClose={hideModal} /> })} title="Edit" />
                     <ButtonIcon name="delete" color="red" onClick={() => handleArchive(p.id)} title="Archive" />
                   </div>
                 </td>

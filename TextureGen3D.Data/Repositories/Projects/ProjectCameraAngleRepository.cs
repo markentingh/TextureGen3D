@@ -58,6 +58,12 @@ namespace TextureGen3D.Data.Repositories.Projects
             await _dbConnection.ExecuteAsync(query, new { id, projectId, projectReferenceId });
         }
 
+        public async Task ClearReferenceByReferenceIdAsync(Guid projectReferenceId, Guid projectId)
+        {
+            const string query = @"UPDATE public.""ProjectCameraAngles"" SET ""ProjectReferenceId"" = NULL WHERE ""ProjectReferenceId"" = @projectReferenceId AND ""ProjectId"" = @projectId";
+            await _dbConnection.ExecuteAsync(query, new { projectReferenceId, projectId });
+        }
+
         public async Task DeleteAsync(Guid id, Guid projectId)
         {
             const string query = @"DELETE FROM public.""ProjectCameraAngles"" WHERE ""Id"" = @id AND ""ProjectId"" = @projectId";

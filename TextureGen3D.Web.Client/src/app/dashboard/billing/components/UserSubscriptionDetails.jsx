@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import Modal from '@/components/ui/modal';
+import { useModal } from '@/context/modal';
 import Spinner from '@/components/ui/spinner';
 import Pagination from '@/components/ui/pagination';
 import ButtonOutline from '@/components/ui/button-outline';
@@ -7,14 +7,14 @@ import AddUserTokens from './AddUserTokens';
 
 const PAGE_SIZE = 10;
 
-export default function UserSubscriptionDetails({ show, appUserId, api, onClose }) {
+export default function UserSubscriptionDetails({ appUserId, api, onClose }) {
+  const { showModal, hideModal } = useModal();
   const [details, setDetails] = useState(null);
   const [tokens, setTokens] = useState([]);
   const [tokenTotal, setTokenTotal] = useState(0);
   const [tokenPage, setTokenPage] = useState(1);
   const [loadingDetails, setLoadingDetails] = useState(false);
   const [loadingTokens, setLoadingTokens] = useState(false);
-  const [showAddTokens, setShowAddTokens] = useState(false);
 
   const loadDetails = useCallback(async () => {
     if (!appUserId) return;
@@ -56,11 +56,11 @@ export default function UserSubscriptionDetails({ show, appUserId, api, onClose 
   }, [appUserId, api]);
 
   useEffect(() => {
-    if (show && appUserId) {
+    if (appUserId) {
       loadDetails();
       loadTokens(1);
     }
-  }, [show, appUserId, loadDetails, loadTokens]);
+  }, [appUserId, loadDetails, loadTokens]);
 
   const totalPages = Math.ceil(tokenTotal / PAGE_SIZE);
 
@@ -82,10 +82,8 @@ export default function UserSubscriptionDetails({ show, appUserId, api, onClose 
 
   const formatTokens = (n) => (n || 0).toLocaleString();
 
-  if (!show) return null;
-
   return (
-    <Modal title="User Subscription Details" onClose={onClose} className="max-w-3xl w-full">
+    <>
       {/* Subscription details section */}
       {loadingDetails ? (
         <div className="flex justify-center py-8">
@@ -137,7 +135,19 @@ export default function UserSubscriptionDetails({ show, appUserId, api, onClose 
       {/* AI Tokens table */}
       <div className="flex items-center justify-between mb-3">
         <h4 className="text-sm font-semibold text-gray-700 dark:text-gray-300">AI Token History</h4>
-        <ButtonOutline size="small" onClick={() => setShowAddTokens(true)}>+ Add Tokens</ButtonOutline>
+        <ButtonOutline size="small" onClick={() => showModal({
+          title: 'Add Tokens',
+          className: 'max-w-lg w-full',
+          onClose: hideModal,
+          body: (
+            <AddUserTokens
+              appUserId={appUserId}
+              api={api}
+              onClose={hideModal}
+              onAdded={() => loadTokens(1)}
+            />
+          ),
+        })}>+ Add Tokens</ButtonOutline>
       </div>
       {loadingTokens ? (
         <div className="flex justify-center py-8">
@@ -184,13 +194,6 @@ export default function UserSubscriptionDetails({ show, appUserId, api, onClose 
       ) : (
         <p className="text-sm text-gray-500 dark:text-gray-400 py-4">No AI token records found.</p>
       )}
-      <AddUserTokens
-        show={showAddTokens}
-        appUserId={appUserId}
-        api={api}
-        onClose={() => setShowAddTokens(false)}
-        onAdded={() => loadTokens(1)}
-      />
-    </Modal>
+    </>
   );
 }

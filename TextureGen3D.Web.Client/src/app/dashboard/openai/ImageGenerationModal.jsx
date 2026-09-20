@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
-import Modal from '@/components/ui/modal';
+import { useSession } from '@/context/session';
+import { OpenAI } from '@/api/admin/openai';
 import Input from '@/components/forms/input';
 import Select from '@/components/forms/select';
 import TextArea from '@/components/forms/textarea';
@@ -78,7 +79,7 @@ function estimateTokens(form, calc) {
     }
 }
 
-export default function ImageGenerationModal({ show, model, onClose, onSave }) {
+export default function ImageGenerationModal({ model, onClose, onSave }) {
     const [form, setForm] = useState({
         modelKey: '',
         name: '',
@@ -96,6 +97,9 @@ export default function ImageGenerationModal({ show, model, onClose, onSave }) {
         promptPath: '',
         depthMapPath: '',
         inputImagesPath: '',
+        seedPath: '',
+        prompt: '',
+        endpointUrl: '',
         active: true
     });
     const [calc, setCalc] = useState({
@@ -109,7 +113,17 @@ export default function ImageGenerationModal({ show, model, onClose, onSave }) {
     const [message, setMessage] = useState(null);
     const workflowTextareaRef = useRef(null);
 
+    // Gradio state
+    const session = useSession();
+    const { getGradioEndpoints } = useMemo(() => OpenAI(session), [session]);
+    const [gradioEndpoints, setGradioEndpoints] = useState([]);
+    const [selectedGradioEndpoint, setSelectedGradioEndpoint] = useState(null);
+    const [gradioLoading, setGradioLoading] = useState(false);
+    const [gradioError, setGradioError] = useState(null);
+    const [gradioParamMappings, setGradioParamMappings] = useState({}); // paramName -> 'Depth Map' | 'Reference Image'
+
     const isComfyUI = form.model.toLowerCase() === 'comfyui';
+    const isGradio = form.model.toLowerCase() === 'gradio';
 
     useEffect(() => {
         if (model) {
@@ -130,6 +144,9 @@ export default function ImageGenerationModal({ show, model, onClose, onSave }) {
                 promptPath: model.promptPath || '',
                 depthMapPath: model.depthMapPath || '',
                 inputImagesPath: model.inputImagesPath || '',
+                seedPath: model.seedPath || '',
+                prompt: model.prompt || '',
+                endpointUrl: model.endpointUrl || '',
                 active: model.active !== false
             });
         } else {
@@ -150,14 +167,50 @@ export default function ImageGenerationModal({ show, model, onClose, onSave }) {
                 promptPath: '',
                 depthMapPath: '',
                 inputImagesPath: '',
+                seedPath: '',
+                prompt: '',
+                endpointUrl: '',
                 active: true
             });
         }
         setError(null);
         setMessage(null);
-    }, [model, show]);
+    }, [model]);
 
-    if (!show) return null;
+    // Initialize Gradio endpoint + parameter mappings from saved DB values when form loads
+    useEffect(() => {
+        const isGradioModel = form.model?.toLowerCase() === 'gradio';
+        if (isGradioModel && form.endpointUrl) {
+            const fullPath = form.endpointUrl;
+            const displayPath = fullPath.replace('/gradio_api/call/', '');
+            // Reconstruct parameter list and mappings from saved DB columns
+            const params = [];
+            const mappings = {};
+            if (form.depthMapPath) {
+                params.push(form.depthMapPath);
+                mappings[form.depthMapPath] = 'Depth Map';
+            }
+            if (form.inputImagesPath) {
+                params.push(form.inputImagesPath);
+                mappings[form.inputImagesPath] = 'Reference Image';
+            }
+            if (form.promptPath) {
+                params.push(form.promptPath);
+                mappings[form.promptPath] = 'Prompt';
+            }
+            if (form.seedPath) {
+                params.push(form.seedPath);
+                mappings[form.seedPath] = 'Seed';
+            }
+            setSelectedGradioEndpoint({ fullPath, path: displayPath, parameters: params });
+            setGradioParamMappings(mappings);
+        } else if (!isGradioModel) {
+            // Reset Gradio state when switching to a non-Gradio model
+            setSelectedGradioEndpoint(null);
+            setGradioParamMappings({});
+            setGradioEndpoints([]);
+        }
+    }, [form.endpointUrl, form.model, form.depthMapPath, form.inputImagesPath, form.promptPath, form.seedPath]); // eslint-disable-line react-hooks/exhaustive-deps
 
     const handleChange = (field, value) => {
         setForm(prev => ({ ...prev, [field]: value }));
@@ -165,6 +218,44 @@ export default function ImageGenerationModal({ show, model, onClose, onSave }) {
 
     const handleCalcChange = (field, value) => {
         setCalc(prev => ({ ...prev, [field]: value }));
+    };
+
+    const handleFetchGradioEndpoints = async () => {
+        setGradioLoading(true);
+        setGradioError(null);
+        try {
+            const res = await getGradioEndpoints();
+            if (res.data?.success) {
+                setGradioEndpoints(res.data.data || []);
+                setSelectedGradioEndpoint(null);
+                setGradioParamMappings({});
+            } else {
+                setGradioError(res.data?.message || 'Failed to fetch Gradio endpoints');
+            }
+        } catch (err) {
+            setGradioError(err.message || 'Failed to fetch Gradio endpoints');
+        } finally {
+            setGradioLoading(false);
+        }
+    };
+
+    const handleGradioEndpointClick = (endpoint) => {
+        setSelectedGradioEndpoint(endpoint);
+        // Initialize param mappings with empty values
+        const mappings = {};
+        for (const param of endpoint.parameters) {
+            mappings[param] = '';
+        }
+        setGradioParamMappings(mappings);
+    };
+
+    const handleGradioCancelEndpoint = () => {
+        setSelectedGradioEndpoint(null);
+        setGradioParamMappings({});
+    };
+
+    const handleGradioParamChange = (paramName, value) => {
+        setGradioParamMappings(prev => ({ ...prev, [paramName]: value }));
     };
 
     const handleSave = () => {
@@ -178,6 +269,21 @@ export default function ImageGenerationModal({ show, model, onClose, onSave }) {
         }
 
         setError(null);
+
+        // For Gradio models, resolve the parameter mappings to DepthMapPath / InputImagesPath / PromptPath / SeedPath
+        let depthMapPath = form.depthMapPath;
+        let inputImagesPath = form.inputImagesPath;
+        let promptPath = form.promptPath;
+        let seedPath = form.seedPath;
+        if (isGradio) {
+            for (const [paramName, mapping] of Object.entries(gradioParamMappings)) {
+                if (mapping === 'Depth Map') depthMapPath = paramName;
+                else if (mapping === 'Reference Image') inputImagesPath = paramName;
+                else if (mapping === 'Prompt') promptPath = paramName;
+                else if (mapping === 'Seed') seedPath = paramName;
+            }
+        }
+
         const payload = {
             id: model?.id || 0,
             modelKey: form.modelKey,
@@ -191,10 +297,13 @@ export default function ImageGenerationModal({ show, model, onClose, onSave }) {
             cp2k: parseFloat(form.cp2k) || 0,
             cp4k: parseFloat(form.cp4k) || 0,
             cp8k: parseFloat(form.cp8k) || 0,
-            workflowJson: form.model.toLowerCase() === 'comfyui' ? form.workflowJson : null,
-            promptPath: form.model.toLowerCase() === 'comfyui' ? form.promptPath : null,
-            depthMapPath: form.model.toLowerCase() === 'comfyui' ? form.depthMapPath : null,
-            inputImagesPath: form.model.toLowerCase() === 'comfyui' ? form.inputImagesPath : null,
+            workflowJson: isComfyUI ? form.workflowJson : null,
+            promptPath: isComfyUI || isGradio ? promptPath : null,
+            depthMapPath: isComfyUI || isGradio ? depthMapPath : null,
+            inputImagesPath: isComfyUI || isGradio ? inputImagesPath : null,
+            seedPath: isComfyUI || isGradio ? seedPath : null,
+            prompt: isComfyUI ? form.prompt : null,
+            endpointUrl: isGradio ? (selectedGradioEndpoint?.fullPath || form.endpointUrl || null) : null,
             active: form.active
         };
 
@@ -237,7 +346,7 @@ export default function ImageGenerationModal({ show, model, onClose, onSave }) {
     }
 
     return (
-        <Modal title={model ? 'Edit Image Generation Model' : 'Add Image Generation Model'} onClose={onClose} className="w-full max-w-[1000px] rounded-lg bg-white dark:bg-gray-800 shadow-xl">
+        <div className="w-full max-w-[1000px] rounded-lg bg-white dark:bg-gray-800 shadow-xl">
             {error && (
                 <div className="mb-4 p-3 rounded bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200">{error}</div>
             )}
@@ -380,6 +489,84 @@ export default function ImageGenerationModal({ show, model, onClose, onSave }) {
                         checked={form.active}
                         onChange={(e) => handleChange('active', e.target.checked)}
                     />
+                    {isGradio && (
+                        <div className="space-y-3">
+                            <ButtonOutline
+                                color="blue"
+                                onClick={handleFetchGradioEndpoints}
+                                disabled={gradioLoading}
+                            >
+                                {gradioLoading ? 'Loading...' : 'Get Gradio API Endpoints'}
+                            </ButtonOutline>
+                            {gradioError && (
+                                <div className="p-2 rounded bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200 text-sm">
+                                    {gradioError}
+                                </div>
+                            )}
+                            {(gradioEndpoints.length > 0 || selectedGradioEndpoint) && (
+                                <div className="space-y-2">
+                                    <h4 className="text-sm font-semibold text-gray-700 dark:text-gray-300">Gradio API Endpoints</h4>
+                                    <div className="space-y-1">
+                                        {/* Show fetched endpoints, or just the selected one if not fetched yet */}
+                                        {(gradioEndpoints.length > 0
+                                            ? gradioEndpoints.filter((ep) => !selectedGradioEndpoint || selectedGradioEndpoint.fullPath === ep.fullPath)
+                                            : [selectedGradioEndpoint]
+                                        ).map((ep) => {
+                                            const isSelected = selectedGradioEndpoint?.fullPath === ep.fullPath;
+                                            return (
+                                                <div
+                                                    key={ep.fullPath}
+                                                    onClick={() => !isSelected && handleGradioEndpointClick(ep)}
+                                                    className={`flex items-center justify-between px-3 py-2 rounded-lg border transition text-sm ${
+                                                        isSelected
+                                                            ? 'border-purple-500 bg-purple-50 dark:bg-purple-900/30 text-purple-700 dark:text-purple-300'
+                                                            : 'border-gray-200 dark:border-gray-600 hover:border-gray-300 dark:hover:border-gray-500 cursor-pointer'
+                                                    }`}
+                                                >
+                                                    <span>{ep.path}</span>
+                                                    {isSelected && (
+                                                        <ButtonOutline
+                                                            color="gray"
+                                                            size="small"
+                                                            onClick={(e) => { e.stopPropagation(); handleGradioCancelEndpoint(); }}
+                                                        >
+                                                            Cancel
+                                                        </ButtonOutline>
+                                                    )}
+                                                </div>
+                                            );
+                                        })}
+                                    </div>
+                                </div>
+                            )}
+                            {selectedGradioEndpoint && (
+                                <div className="space-y-2">
+                                    <h4 className="text-sm font-semibold text-gray-700 dark:text-gray-300">API Parameters</h4>
+                                    <div className="space-y-2">
+                                        {selectedGradioEndpoint.parameters.map((param) => (
+                                            <div key={param} className="flex items-center gap-3">
+                                                <span className="flex-1 text-sm text-gray-700 dark:text-gray-300">{param}</span>
+                                                <div className="w-48">
+                                                    <Select
+                                                        name={`gradio-param-${param}`}
+                                                        options={[
+                                                            { value: '', label: '-- Select --' },
+                                                            { value: 'Depth Map', label: 'Depth Map' },
+                                                            { value: 'Reference Image', label: 'Reference Image' },
+                                                            { value: 'Prompt', label: 'Prompt' },
+                                                            { value: 'Seed', label: 'Seed' }
+                                                        ]}
+                                                        value={gradioParamMappings[param] || ''}
+                                                        onChange={(e) => handleGradioParamChange(param, e.target.value)}
+                                                    />
+                                                </div>
+                                            </div>
+                                        ))}
+                                    </div>
+                                </div>
+                            )}
+                        </div>
+                    )}
                     {isComfyUI && (
                         <div className="space-y-2">
                             <div className="mb-4">
@@ -414,6 +601,25 @@ export default function ImageGenerationModal({ show, model, onClose, onSave }) {
                                 value={form.inputImagesPath}
                                 onInput={(e) => handleChange('inputImagesPath', e.target.value)}
                             />
+                            <Input
+                                label="Seed JSON Path"
+                                name="seedPath"
+                                value={form.seedPath}
+                                onInput={(e) => handleChange('seedPath', e.target.value)}
+                            />
+                            <div className="mb-4">
+                                <label htmlFor="prompt" className="block text-sm font-medium mb-1">
+                                    Prompt
+                                </label>
+                                <textarea
+                                    id="prompt"
+                                    name="prompt"
+                                    rows={6}
+                                    value={form.prompt}
+                                    onInput={(e) => handleChange('prompt', e.target.value)}
+                                    className="w-full px-3 py-2 border rounded bg-white dark:bg-gray-700 focus:outline-none focus:ring-2 focus:ring-primary-500 resize-y border-gray-300 dark:border-gray-600 font-mono text-sm"
+                                />
+                            </div>
                         </div>
                     )}
                 </div>
@@ -496,6 +702,6 @@ export default function ImageGenerationModal({ show, model, onClose, onSave }) {
                     Save Changes
                 </ButtonOutline>
             </div>
-        </Modal>
+        </div>
     );
 }

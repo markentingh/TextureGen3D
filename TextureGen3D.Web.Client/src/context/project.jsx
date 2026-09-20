@@ -5,8 +5,6 @@ import { useSession } from '@/context/session';
 import { Projects } from '@/api/user/projects';
 import { ProjectModels } from '@/api/user/projectModels';
 import { ProjectMeshes } from '@/api/user/projectMeshes';
-import { ProjectReferences } from '@/api/user/projectReferences';
-import { ProjectMeshReferences } from '@/api/user/projectMeshReferences';
 import { ProjectMeshLayers } from '@/api/user/projectMeshLayers';
 import {
   parseModel,
@@ -57,6 +55,7 @@ export function ProjectProvider({ children }) {
   const [imageModels, setImageModels] = useState([]);
   const [refImageModels, setRefImageModels] = useState([]);
   const [selectedModelId, setSelectedModelId] = useState('');
+  const [inpaintModelId, setInpaintModelId] = useState('');
 
   // ── Generation ──
   const [generating, setGenerating] = useState(false);
@@ -84,6 +83,37 @@ export function ProjectProvider({ children }) {
   // ── Layers ──
   const [meshLayers, setMeshLayers] = useState([]);
   const [allMeshLayers, setAllMeshLayers] = useState({});
+  const allMeshLayersRef = useRef({});
+  useEffect(() => { allMeshLayersRef.current = allMeshLayers; }, [allMeshLayers]);
+
+  // ── Mask brush ──
+  const [maskTool, setMaskTool] = useState('pointer'); // 'pointer' | 'brush' | 'eraser' | 'inpaint'
+  const [inpaintPrompt, setInpaintPrompt] = useState('');
+  const [inpaintSign, setInpaintSign] = useState('add'); // 'add' (white) | 'subtract' (black)
+  const [ctrlHeld, setCtrlHeld] = useState(false); // Ctrl inverts the inpaint sign while held
+  const [brushSize, setBrushSize] = useState(50);      // 1-300 (mask pixels, diameter)
+  const [brushHardness, setBrushHardness] = useState(50); // 0-100
+  const [brushSpread, setBrushSpread] = useState(0);   // 0-100 (screen px between stamps)
+  const [brushOpacity, setBrushOpacity] = useState(100); // 1-100 (stamp alpha %)
+  const [selectedLayerId, setSelectedLayerId] = useState(null);
+  const [modifiedLayerIds, setModifiedLayerIds] = useState(new Set());
+  const [maskThumbVersions, setMaskThumbVersions] = useState({});
+
+  const selectedLayerIdRef = useRef(null);
+  useEffect(() => { selectedLayerIdRef.current = selectedLayerId; }, [selectedLayerId]);
+  const selectedMeshRef = useRef(null);
+  useEffect(() => { selectedMeshRef.current = selectedMesh; }, [selectedMesh]);
+  const meshDbIdsRef = useRef({});
+  useEffect(() => { meshDbIdsRef.current = meshDbIds; }, [meshDbIds]);
+  // Map<layerId, meshDbId> — meshId captured at paint time so saves land in
+  // the right folder even if the user switches meshes before the timer fires
+  const modifiedLayerIdsRef = useRef(new Map());
+  const maskSaveTimerRef = useRef(null);
+  // layerId -> { a, b, front, initialized } — ping-pong WebGLRenderTargets;
+  // front.texture feeds the layer shader's mask sampler
+  const layerMasksRef = useRef(new Map());
+  // Consumed by ModelViewer pointer handlers (stable ref, mutated in place)
+  const maskPaintConfigRef = useRef({});
 
   // ── Refs ──
   const viewerRef = useRef(null);
@@ -130,72 +160,401 @@ export function ProjectProvider({ children }) {
     [imageModels]
   );
 
+  const inpaintModelOptions = useMemo(
+    () =>
+      refImageModels.map((m) => ({
+        value: m.id?.toString() || m.modelKey || m.name,
+        label: m.name || m.model || m.modelKey,
+      })),
+    [refImageModels]
+  );
+
   const selectedImageModel = useMemo(
     () => imageModels.find((m) => String(m.id) === String(selectedModelId)),
     [imageModels, selectedModelId]
   );
-  const isComfyUI = selectedImageModel?.modelKey?.toLowerCase() === 'comfyui';
+  const isComfyUI = selectedImageModel?.model?.toLowerCase() === 'comfyui';
+  const isGradio = selectedImageModel?.model?.toLowerCase() === 'gradio';
 
   // ── Shared utilities (used by multiple components) ──
+
+  // Returns the layer's mask entry, creating a 1024x1024 ping-pong render
+  // target pair on first use. Called by ModelViewer when the brush first
+  // touches a layer, and by refreshLayerTextures when loading saved masks.
+  const getOrCreateLayerMask = useCallback((layerId) => {
+    let entry = layerMasksRef.current.get(layerId);
+    if (!entry) {
+      const opts = { minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter, depthBuffer: false };
+      const a = new THREE.WebGLRenderTarget(1024, 1024, opts);
+      const b = new THREE.WebGLRenderTarget(1024, 1024, opts);
+      entry = { a, b, front: a, initialized: false };
+      layerMasksRef.current.set(layerId, entry);
+      // Bind into the live shader if the layer is already textured
+      viewerRef.current?.bindLayerMask?.(layerId, entry.front.texture);
+    }
+    return entry;
+  }, []);
+
+  const markMaskModified = useCallback((layerId) => {
+    const meshDbId = selectedMeshRef.current ? meshDbIdsRef.current[selectedMeshRef.current.key] : null;
+    const prev = modifiedLayerIdsRef.current.get(layerId);
+    if (prev) return; // already tracked with a valid meshId
+    modifiedLayerIdsRef.current.set(layerId, meshDbId);
+    setModifiedLayerIds(new Set(modifiedLayerIdsRef.current.keys()));
+  }, []);
+
+  const cancelMaskSaveTimer = useCallback(() => {
+    if (maskSaveTimerRef.current) {
+      clearTimeout(maskSaveTimerRef.current);
+      maskSaveTimerRef.current = null;
+    }
+  }, []);
+
+  const saveModifiedMasks = useCallback(async () => {
+    const entries = Array.from(modifiedLayerIdsRef.current.entries());
+    if (entries.length === 0) return;
+
+    // Group by meshId so each mask lands in its own mesh folder
+    const byMesh = new Map();
+    for (const [layerId, meshDbId] of entries) {
+      if (!meshDbId) {
+        console.warn(`[mask save] layer ${layerId} skipped — no meshId recorded at paint time`);
+        continue;
+      }
+      const entry = layerMasksRef.current.get(layerId);
+      if (!entry) continue;
+      let dataUrl = null;
+      try {
+        dataUrl = viewerRef.current?.maskToDataURL?.(entry);
+      } catch (err) {
+        console.error(`[mask save] readback failed for layer ${layerId}:`, err);
+      }
+      if (!dataUrl) continue; // stays marked — retried on the next save
+      if (!byMesh.has(meshDbId)) byMesh.set(meshDbId, []);
+      byMesh.get(meshDbId).push({ layerId, base64Mask: dataUrl });
+    }
+
+    if (byMesh.size === 0) {
+      setModifiedLayerIds(new Set(modifiedLayerIdsRef.current.keys()));
+      return;
+    }
+
+    // Clear flags incrementally as each mesh's POST lands — a mid-flight
+    // failure (or unload) keeps unsaved layers marked for retry/stash.
+    const savedLayerIds = [];
+    try {
+      for (const [meshDbId, masks] of byMesh) {
+        await layerApi.saveMasks(id, meshDbId, masks);
+        for (const m of masks) {
+          modifiedLayerIdsRef.current.delete(m.layerId);
+          savedLayerIds.push(m.layerId);
+        }
+      }
+    } catch (err) {
+      console.error('Failed to save layer masks:', err);
+    }
+    // Refresh only the thumbnails whose masks were actually uploaded
+    if (savedLayerIds.length > 0) {
+      setMaskThumbVersions((prev) => {
+        const next = { ...prev };
+        for (const layerId of savedLayerIds) next[layerId] = (next[layerId] || 0) + 1;
+        return next;
+      });
+    }
+    setModifiedLayerIds(new Set(modifiedLayerIdsRef.current.keys()));
+  }, [id, layerApi]);
+
+  const scheduleMaskSave = useCallback(() => {
+    cancelMaskSaveTimer();
+    maskSaveTimerRef.current = setTimeout(saveModifiedMasks, 5000);
+  }, [cancelMaskSaveTimer, saveModifiedMasks]);
+
+  // ── Pending-mask stash ──
+  // A refresh/close within the 5s debounce would otherwise lose strokes.
+  // On unload, read back modified masks synchronously and stash them in
+  // localStorage; on next load they're POSTed before the mask fetch runs.
+
+  const stashUnsavedMasks = useCallback(() => {
+    const entries = Array.from(modifiedLayerIdsRef.current.entries());
+    const key = `pendingMasks:${id}`;
+    try {
+      const stash = {};
+      for (const [layerId, meshDbId] of entries) {
+        if (!meshDbId) continue;
+        const entry = layerMasksRef.current.get(layerId);
+        if (!entry) continue;
+        const dataUrl = viewerRef.current?.maskToDataURL?.(entry);
+        if (!dataUrl) continue;
+        (stash[meshDbId] = stash[meshDbId] || []).push({ layerId, base64Mask: dataUrl });
+      }
+      if (Object.keys(stash).length > 0) {
+        localStorage.setItem(key, JSON.stringify(stash));
+      } else {
+        localStorage.removeItem(key);
+      }
+    } catch {
+      /* storage full/blocked */
+    }
+  }, [id]);
+
+  useEffect(() => {
+    const flush = () => stashUnsavedMasks();
+    window.addEventListener('pagehide', flush);
+    window.addEventListener('beforeunload', flush);
+    return () => {
+      window.removeEventListener('pagehide', flush);
+      window.removeEventListener('beforeunload', flush);
+    };
+  }, [stashUnsavedMasks]);
+
+  // Replay stashed masks once the project is loaded (POST before the mask
+  // fetch in refreshLayerTextures reads mask.png from disk).
+  useEffect(() => {
+    if (!id || !token) return;
+    const key = `pendingMasks:${id}`;
+    let stash = null;
+    try {
+      stash = JSON.parse(localStorage.getItem(key) || 'null');
+    } catch {
+      stash = null;
+    }
+    if (!stash || Object.keys(stash).length === 0) return;
+    (async () => {
+      const remaining = {};
+      const postedLayerIds = [];
+      for (const [meshDbId, masks] of Object.entries(stash)) {
+        try {
+          await layerApi.saveMasks(id, meshDbId, masks);
+          for (const m of masks) postedLayerIds.push(m.layerId);
+        } catch {
+          remaining[meshDbId] = masks;
+        }
+      }
+      try {
+        if (Object.keys(remaining).length > 0) {
+          localStorage.setItem(key, JSON.stringify(remaining));
+        } else {
+          localStorage.removeItem(key);
+        }
+      } catch {
+        /* ignore */
+      }
+      if (postedLayerIds.length > 0) {
+        setMaskThumbVersions((prev) => {
+          const next = { ...prev };
+          for (const layerId of postedLayerIds) next[layerId] = (next[layerId] || 0) + 1;
+          return next;
+        });
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [id, token]);
+
+  // Ctrl inverts the inpaint +/- toggle while held
+  useEffect(() => {
+    const down = (e) => { if (e.key === 'Control') setCtrlHeld(true); };
+    const up = (e) => { if (e.key === 'Control') setCtrlHeld(false); };
+    const blur = () => setCtrlHeld(false);
+    window.addEventListener('keydown', down);
+    window.addEventListener('keyup', up);
+    window.addEventListener('blur', blur);
+    return () => {
+      window.removeEventListener('keydown', down);
+      window.removeEventListener('keyup', up);
+      window.removeEventListener('blur', blur);
+    };
+  }, []);
+
+  // Keep the paint config current — ModelViewer reads this ref in its
+  // pointer handlers so brush changes never re-create the Three.js scene.
+  useEffect(() => {
+    maskPaintConfigRef.current = {
+      tool: maskTool,
+      sign: ctrlHeld ? (inpaintSign === 'add' ? 'subtract' : 'add') : inpaintSign,
+      size: brushSize,
+      setSize: setBrushSize,
+      hardness: brushHardness,
+      spread: brushSpread,
+      opacity: brushOpacity,
+      getSelectedLayerId: () => selectedLayerIdRef.current,
+      getOrCreateLayerMask,
+      markMaskModified,
+      onStrokeStart: cancelMaskSaveTimer,
+      onStrokeEnd: scheduleMaskSave,
+    };
+  }, [maskTool, inpaintSign, ctrlHeld, brushSize, brushHardness, brushSpread, brushOpacity, getOrCreateLayerMask, markMaskModified, cancelMaskSaveTimer, scheduleMaskSave]);
+
+  // Inpainting mode — activate the mesh-wide overlay when the tool is selected,
+  // tear it down whenever another tool takes over (Cancel, pointer, etc.)
+  useEffect(() => {
+    if (maskTool === 'inpaint') viewerRef.current?.beginInpaint?.();
+    else viewerRef.current?.endInpaint?.();
+  }, [maskTool]);
+
+  const cancelInpainting = useCallback(() => setMaskTool('pointer'), []);
+
+  // Load persisted paint-tool settings once per project
+  const paintToolsLoadedRef = useRef(null); // projectId whose settings were loaded
+  useEffect(() => {
+    if (!id || paintToolsLoadedRef.current === id) return;
+    paintToolsLoadedRef.current = id;
+    try {
+      const raw = localStorage.getItem(`paintTools:${id}`);
+      if (!raw) return;
+      const saved = JSON.parse(raw);
+      if (typeof saved.size === 'number') setBrushSize(Math.min(300, Math.max(1, saved.size)));
+      if (typeof saved.hardness === 'number') setBrushHardness(Math.min(100, Math.max(0, saved.hardness)));
+      if (typeof saved.spread === 'number') setBrushSpread(Math.min(100, Math.max(0, saved.spread)));
+      if (typeof saved.opacity === 'number') setBrushOpacity(Math.min(100, Math.max(1, saved.opacity)));
+      if (saved.inpaintSign === 'add' || saved.inpaintSign === 'subtract') setInpaintSign(saved.inpaintSign);
+    } catch {
+      /* corrupt entry — ignore */
+    }
+  }, [id]);
+
+  // Persist paint-tool settings whenever they change (skipped until the
+  // project's saved values have been loaded so defaults don't clobber them)
+  useEffect(() => {
+    if (!id || paintToolsLoadedRef.current !== id) return;
+    try {
+      localStorage.setItem(`paintTools:${id}`, JSON.stringify({
+        size: brushSize,
+        hardness: brushHardness,
+        spread: brushSpread,
+        opacity: brushOpacity,
+        inpaintSign,
+      }));
+    } catch {
+      /* storage full/blocked — non-fatal */
+    }
+  }, [id, brushSize, brushHardness, brushSpread, brushOpacity, inpaintSign]);
+
+  // Auto-select the first layer (or keep selection valid) when layers change
+  useEffect(() => {
+    if (meshLayers.length === 0) {
+      if (selectedLayerId !== null) setSelectedLayerId(null);
+      return;
+    }
+    if (!meshLayers.some((l) => l.id === selectedLayerId)) {
+      setSelectedLayerId(meshLayers[0].id);
+    }
+  }, [meshLayers, selectedLayerId]);
+
+  const refreshLayerTextures = useCallback(
+    async (layers = null, meshKey = null) => {
+      if (!viewerRef.current) return;
+      const key = meshKey || selectedMesh?.key;
+      if (!key) return;
+      const meshDbId = meshDbIds[key];
+      if (!meshDbId) return;
+      const layerList = layers || meshLayers;
+      const visibleLayers = layerList.filter((l) => l.visible !== false);
+      const entries = [];
+      const authHeaders = token ? { Authorization: `Bearer ${token}` } : {};
+      for (const layer of visibleLayers) {
+        let url = null;
+        try {
+          const res = await fetch(layerApi.uvmapUrl(id, meshDbId, layer.id), {
+            headers: authHeaders,
+          });
+          if (res.ok) {
+            const blob = await res.blob();
+            if (blob.size > 0) url = URL.createObjectURL(blob);
+          }
+        } catch {
+          /* ignore */
+        }
+
+        // Mask: reuse the local render targets if present (covers unsaved
+        // edits and already-loaded masks); otherwise fetch a saved mask.png
+        // and blit it into the layer's mask render target.
+        let maskTexture = null;
+        let maskEntry = layerMasksRef.current.get(layer.id);
+        if (!maskEntry) {
+          try {
+            const res = await fetch(layerApi.maskUrl(id, meshDbId, layer.id), {
+              headers: authHeaders,
+            });
+            if (res.ok) {
+              const blob = await res.blob();
+              if (blob.size > 0) {
+                // Flip at decode time — UNPACK_FLIP_Y_WEBGL (texture.flipY) is
+                // not reliably applied to ImageBitmap sources, which caused the
+                // saved mask to load back Y-flipped.
+                const bitmap = await createImageBitmap(blob, { imageOrientation: 'flipY' });
+                maskEntry = getOrCreateLayerMask(layer.id);
+                viewerRef.current?.uploadMaskImage?.(maskEntry, bitmap);
+                bitmap.close();
+                if (!maskEntry.initialized) {
+                  // Upload didn't land (renderer not ready / blit failed) —
+                  // drop the entry so the next refresh retries the fetch.
+                  maskEntry.a.dispose();
+                  maskEntry.b.dispose();
+                  layerMasksRef.current.delete(layer.id);
+                  maskEntry = null;
+                }
+              }
+            }
+          } catch (err) {
+            console.warn(`Failed to load mask for layer ${layer.id}:`, err);
+          }
+        }
+        // Never bind an unrendered target — it samples black and hides the layer
+        maskTexture = maskEntry && maskEntry.initialized ? maskEntry.front.texture : null;
+
+        entries.push({ url, maskTexture, layerId: layer.id });
+      }
+      const hasAny = entries.some((e) => e.url !== null);
+      viewerRef.current.updateLayerTextures(hasAny ? entries : []);
+    },
+    [id, layerApi, meshDbIds, meshLayers, selectedMesh, token, getOrCreateLayerMask]
+  );
 
   const loadMeshLayers = useCallback(
     async (meshDbId) => {
       if (!meshDbId) {
         setMeshLayers([]);
+        pendingLayersRef.current = [];
         return [];
       }
-      try {
-        const res = await layerApi.getByMesh(id, meshDbId);
-        if (res.data?.success) {
-          const layers = res.data.data || [];
-          setMeshLayers(layers);
-          setAllMeshLayers((prev) => ({ ...prev, [meshDbId]: layers }));
-          return layers;
-        }
-      } catch {
-        /* ignore */
-      }
-      return [];
+      // Layers are always populated by the load API and kept in sync via context.
+      // New layers added during the session update allMeshLayers directly.
+      // Textures are refreshed after the mesh loads in the viewer via onMeshLoaded.
+      const layers = allMeshLayersRef.current[meshDbId] || [];
+      setMeshLayers(layers);
+      pendingLayersRef.current = layers;
+      return layers;
     },
-    [id, layerApi]
+    []
   );
 
-  const refreshLayerTextures = useCallback(
-    async (layers = null) => {
-      if (!selectedMesh || !viewerRef.current) return;
-      const meshDbId = meshDbIds[selectedMesh.key];
-      if (!meshDbId) return;
-      const layerList = layers || meshLayers;
-      const visibleLayers = layerList.filter((l) => l.visible !== false);
-      const uvMapUrls = [];
-      for (const layer of visibleLayers) {
-        try {
-          const res = await fetch(layerApi.uvmapUrl(id, meshDbId, layer.id), {
-            headers: token ? { Authorization: `Bearer ${token}` } : {},
-          });
-          if (res.ok) {
-            const blob = await res.blob();
-            if (blob.size > 0) {
-              uvMapUrls.push(URL.createObjectURL(blob));
-            } else {
-              uvMapUrls.push(null);
-            }
-          } else {
-            uvMapUrls.push(null);
-          }
-        } catch {
-          uvMapUrls.push(null);
-        }
-      }
-      const validUrls = uvMapUrls.filter((u) => u !== null);
-      if (validUrls.length > 0) {
-        viewerRef.current.updateLayerTextures(validUrls);
-      } else {
-        viewerRef.current.updateLayerTextures([]);
-      }
-    },
-    [id, layerApi, meshDbIds, meshLayers, selectedMesh, token]
-  );
+  // Adds a layer to the cache synchronously (updates ref + state).
+  // Used by generation code so loadMeshLayers sees the new layer immediately.
+  const addMeshLayer = useCallback((meshDbId, layer) => {
+    const prev = allMeshLayersRef.current;
+    const updated = { ...prev, [meshDbId]: [...(prev[meshDbId] || []), layer] };
+    allMeshLayersRef.current = updated;
+    setAllMeshLayers(updated);
+    setMeshLayers(updated[meshDbId] || []);
+  }, []);
+
+  // Removes a layer from the cache synchronously (updates ref + state).
+  // Used by delete code so the UI updates before the API call.
+  const removeMeshLayer = useCallback((meshDbId, layerId) => {
+    const prev = allMeshLayersRef.current;
+    const updated = { ...prev, [meshDbId]: (prev[meshDbId] || []).filter((l) => l.id !== layerId) };
+    allMeshLayersRef.current = updated;
+    setAllMeshLayers(updated);
+    setMeshLayers(updated[meshDbId] || []);
+    // Dispose the layer's mask render targets if they exist
+    const maskEntry = layerMasksRef.current.get(layerId);
+    if (maskEntry) {
+      maskEntry.a.dispose();
+      maskEntry.b.dispose();
+      layerMasksRef.current.delete(layerId);
+    }
+    modifiedLayerIdsRef.current.delete(layerId);
+  }, []);
 
   const refreshMeshRefView = useCallback(() => {
     if (!selectedMesh) {
@@ -344,8 +703,9 @@ export function ProjectProvider({ children }) {
       setModels(data.models || []);
 
       const depthImageModels = (data.imageModels || []).filter((m) => m.type === 1);
+      const generationImageModels = (data.imageModels || []).filter((m) => m.type === 0);
       setImageModels(depthImageModels);
-      setRefImageModels((data.imageModels || []).filter((m) => m.type === 0));
+      setRefImageModels(generationImageModels);
 
       const imageModelList = depthImageModels;
       const savedImageModelId = data.project?.imageModelId;
@@ -366,6 +726,19 @@ export function ProjectProvider({ children }) {
         } else {
           setSelectedModelId('');
         }
+      }
+
+      // Inpaint model — type 0 (image generation) list, localStorage preferred
+      const preferredInpaintKey = localStorage.getItem('preferredInpaintModel');
+      const preferredInpaint = preferredInpaintKey
+        ? generationImageModels.find((m) => m.modelKey === preferredInpaintKey)
+        : null;
+      if (preferredInpaint) {
+        setInpaintModelId(String(preferredInpaint.id));
+      } else if (generationImageModels.length > 0) {
+        setInpaintModelId(String(generationImageModels[0].id));
+      } else {
+        setInpaintModelId('');
       }
 
       const savedMeshes = data.meshes || [];
@@ -426,6 +799,7 @@ export function ProjectProvider({ children }) {
           anglesByMesh[angle.meshId].push(angle);
         }
         setAllCameraAngles(anglesByMesh);
+        
       } else {
         for (const model of data.models || []) {
           if (!meshDataRef.current[model.id] && !parsingModelsRef.current[model.id]) {
@@ -435,40 +809,15 @@ export function ProjectProvider({ children }) {
       }
 
       try {
-        const refApi = ProjectReferences({ token });
-        const refRes = await refApi.getByProject(id);
-        if (refRes.data?.success) {
-          setProjectRefs(refRes.data.data || []);
-        }
+        setProjectRefs(data.references || []);
+        setMeshReferences(data.meshReferences || []);
+        // Update the ref synchronously so loadMeshLayers (triggered by the
+        // auto-select effect, which runs before this component's ref-mirror
+        // useEffect) sees the loaded layers instead of a stale empty object.
+        allMeshLayersRef.current = data.layers || {};
+        setAllMeshLayers(data.layers || {});
       } catch {
         /* references optional */
-      }
-
-      try {
-        const meshRefApi = ProjectMeshReferences({ token });
-        const allMeshRefs = {};
-        for (const mesh of data.meshes || []) {
-          const mrRes = await meshRefApi.getByMesh(id, mesh.id);
-          if (mrRes.data?.success) {
-            allMeshRefs[mesh.id] = mrRes.data.data || [];
-          }
-        }
-        setMeshReferences(allMeshRefs);
-      } catch {
-        /* mesh references optional */
-      }
-
-      try {
-        const allLayers = {};
-        for (const mesh of data.meshes || []) {
-          const lRes = await layerApi.getByMesh(id, mesh.id);
-          if (lRes.data?.success) {
-            allLayers[mesh.id] = lRes.data.data || [];
-          }
-        }
-        setAllMeshLayers(allLayers);
-      } catch {
-        /* layers optional */
       }
     } catch (err) {
       setError(err.response?.data?.message || err.message || 'Failed to load project');
@@ -563,9 +912,13 @@ export function ProjectProvider({ children }) {
     setRefImageModels,
     selectedModelId,
     setSelectedModelId,
+    inpaintModelId,
+    setInpaintModelId,
+    inpaintModelOptions,
     imageModelOptions,
     selectedImageModel,
     isComfyUI,
+    isGradio,
     // generation
     generating,
     setGenerating,
@@ -594,6 +947,36 @@ export function ProjectProvider({ children }) {
     setMeshLayers,
     allMeshLayers,
     setAllMeshLayers,
+    // mask brush
+    maskTool,
+    inpaintPrompt,
+    setInpaintPrompt,
+    inpaintSign,
+    setInpaintSign,
+    ctrlHeld,
+    setMaskTool,
+    cancelInpainting,
+    brushSize,
+    setBrushSize,
+    brushHardness,
+    setBrushHardness,
+    brushSpread,
+    setBrushSpread,
+    brushOpacity,
+    setBrushOpacity,
+    selectedLayerId,
+    setSelectedLayerId,
+    modifiedLayerIds,
+    setModifiedLayerIds,
+    maskThumbVersions,
+    setMaskThumbVersions,
+    layerMasksRef,
+    maskPaintConfigRef,
+    getOrCreateLayerMask,
+    markMaskModified,
+    saveModifiedMasks,
+    scheduleMaskSave,
+    cancelMaskSaveTimer,
     // refs
     viewerRef,
     pendingLayersRef,
@@ -609,6 +992,8 @@ export function ProjectProvider({ children }) {
     downloadAndParseModel,
     parseUploadedFile,
     loadMeshLayers,
+    addMeshLayer,
+    removeMeshLayer,
     refreshLayerTextures,
     refreshMeshRefView,
     // utils

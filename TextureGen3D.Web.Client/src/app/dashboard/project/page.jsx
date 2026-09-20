@@ -3,13 +3,15 @@ import { ProjectProvider, useProject } from '@/context/project';
 import LoadingScreen from './components/LoadingScreen';
 import ViewportSection from './components/ViewportSection';
 import MouseHints from './components/MouseHints';
+import MaskToolbar from './components/MaskToolbar';
 import ProjectHeader from './components/ProjectHeader';
 import RightSidebar from './components/RightSidebar';
 import GenerateImagesPanel from './components/GenerateImagesPanel';
+import InpaintPanel from './components/InpaintPanel';
 import ErrorOverlay from './components/ErrorOverlay';
 
 function ProjectContent() {
-  const { id, token, loading, loadedRef, loadProject, project, viewerRef, thumbGenAttemptedRef } = useProject();
+  const { id, token, loading, loadedRef, loadProject, project, viewerRef, thumbGenAttemptedRef, maskTool } = useProject();
   const [showPanel, setShowPanel] = useState(true);
 
   // One-time project load
@@ -44,18 +46,26 @@ function ProjectContent() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [project]);
 
-  if (loading) {
-    return <LoadingScreen />;
-  }
-
+  // The canvas mounts once and stays mounted — LoadingScreen overlays it
+  // instead of replacing it, so the WebGL context is never torn down.
   return (
     <div className="fixed inset-0 overflow-hidden bg-gray-900 text-gray-100">
       <ViewportSection />
+      <MaskToolbar />
       <MouseHints />
       <ProjectHeader showPanel={showPanel} setShowPanel={setShowPanel} />
       <RightSidebar />
-      <GenerateImagesPanel showPanel={showPanel} setShowPanel={setShowPanel} />
+      {maskTool === 'inpaint' ? (
+        <InpaintPanel showPanel={showPanel} setShowPanel={setShowPanel} />
+      ) : (
+        <GenerateImagesPanel showPanel={showPanel} setShowPanel={setShowPanel} />
+      )}
       <ErrorOverlay />
+      {loading && (
+        <div className="fixed inset-0 z-50 bg-gray-900">
+          <LoadingScreen />
+        </div>
+      )}
     </div>
   );
 }

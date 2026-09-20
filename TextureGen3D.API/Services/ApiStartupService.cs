@@ -22,6 +22,8 @@ namespace TextureGen3D.API.Services
             builder.Services.AddTransient<IImageGeneration, ImageGenerationForOpenAI>();
             builder.Services.AddTransient<IImageGeneration, ImageGenerationForComfyUI>();
             builder.Services.AddTransient<ImageGenerationForComfyUI>();
+            builder.Services.AddTransient<IImageGeneration, ImageGenerationForGradio>();
+            builder.Services.AddTransient<ImageGenerationForGradio>();
             builder.Services.AddTransient<IImageUpscaler, ImageUpscaler>();
             builder.Services.AddTransient<IImageTokens>(sp => new ImageTokensForOpenAI(0m, 0m, 0m));
             builder.Services.AddScoped<IImageService, ImageService>();

@@ -15,24 +15,19 @@ CREATE TABLE IF NOT EXISTS public."ImageGeneration" (
     "PromptPath" TEXT NULL DEFAULT NULL,
     "DepthMapPath" TEXT NULL DEFAULT NULL,
     "InputImagesPath" TEXT NULL DEFAULT NULL,
+    "SeedPath" TEXT NULL DEFAULT NULL,
+    "Prompt" TEXT NULL DEFAULT NULL,
+    "EndpointUrl" TEXT NULL DEFAULT NULL,
     "Active" BOOLEAN NOT NULL DEFAULT TRUE,
     "DateCreated" TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "DateUpdated" TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 -- Add columns if they don't exist (for existing databases)
-DO $$
-BEGIN
-    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'ImageGeneration' AND column_name = 'WorkflowJson') THEN
-        ALTER TABLE public."ImageGeneration" ADD COLUMN "WorkflowJson" TEXT NULL DEFAULT NULL;
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'ImageGeneration' AND column_name = 'PromptPath') THEN
-        ALTER TABLE public."ImageGeneration" ADD COLUMN "PromptPath" TEXT NULL DEFAULT NULL;
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'ImageGeneration' AND column_name = 'DepthMapPath') THEN
-        ALTER TABLE public."ImageGeneration" ADD COLUMN "DepthMapPath" TEXT NULL DEFAULT NULL;
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'ImageGeneration' AND column_name = 'InputImagesPath') THEN
-        ALTER TABLE public."ImageGeneration" ADD COLUMN "InputImagesPath" TEXT NULL DEFAULT NULL;
-    END IF;
-END $$;
+ALTER TABLE public."ImageGeneration" ADD COLUMN IF NOT EXISTS "WorkflowJson" TEXT NULL DEFAULT NULL;
+ALTER TABLE public."ImageGeneration" ADD COLUMN IF NOT EXISTS "PromptPath" TEXT NULL DEFAULT NULL;
+ALTER TABLE public."ImageGeneration" ADD COLUMN IF NOT EXISTS "DepthMapPath" TEXT NULL DEFAULT NULL;
+ALTER TABLE public."ImageGeneration" ADD COLUMN IF NOT EXISTS "InputImagesPath" TEXT NULL DEFAULT NULL;
+ALTER TABLE public."ImageGeneration" ADD COLUMN IF NOT EXISTS "SeedPath" TEXT NULL DEFAULT NULL;
+ALTER TABLE public."ImageGeneration" ADD COLUMN IF NOT EXISTS "Prompt" TEXT NULL DEFAULT NULL;
+ALTER TABLE public."ImageGeneration" ADD COLUMN IF NOT EXISTS "EndpointUrl" TEXT NULL DEFAULT NULL;

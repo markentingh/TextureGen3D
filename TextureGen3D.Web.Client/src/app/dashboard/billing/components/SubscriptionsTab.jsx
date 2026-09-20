@@ -1,15 +1,14 @@
 import React, { useState, useEffect, useCallback } from 'react';
+import { useModal } from '@/context/modal';
 import ButtonOutline from '@/components/ui/button-outline';
 import ButtonIcon from '@/components/ui/button-icon';
 import Icon from '@/components/ui/icon';
 import SubscriptionModal from './SubscriptionModal';
 
 export default function SubscriptionsTab({ api, showMessage }) {
+  const { showModal, hideModal } = useModal();
   const [subscriptions, setSubscriptions] = useState([]);
   const [products, setProducts] = useState([]);
-  const [editing, setEditing] = useState(null);
-  const [showModal, setShowModal] = useState(false);
-  const [modalKey, setModalKey] = useState(0);
   const [dragIndex, setDragIndex] = useState(null);
   const [dragOverIndex, setDragOverIndex] = useState(null);
 
@@ -25,8 +24,7 @@ export default function SubscriptionsTab({ api, showMessage }) {
     const res = await api.saveSubscription(subscription);
     if (res.data.success) {
       showMessage('info', 'Subscription saved successfully.');
-      setShowModal(false);
-      setEditing(null);
+      hideModal();
       load();
     } else {
       showMessage('error', res.data.message || 'Failed to save subscription.');
@@ -89,20 +87,12 @@ export default function SubscriptionsTab({ api, showMessage }) {
     <div>
       <div className="tool-bar mb-4">
         <div className="right-side">
-          <ButtonOutline onClick={() => { setEditing(null); setModalKey(k => k + 1); setShowModal(true); }}>
+          <ButtonOutline onClick={() => showModal({ title: 'Add Subscription', body: <SubscriptionModal subscription={null} products={products} onSave={handleSave} onClose={hideModal} /> })}>
             <Icon name="add" />
             <span className="ml-2">Add Subscription</span>
           </ButtonOutline>
         </div>
       </div>
-      <SubscriptionModal
-        key={modalKey}
-        show={showModal}
-        subscription={editing}
-        products={products}
-        onSave={handleSave}
-        onClose={() => { setShowModal(false); setEditing(null); }}
-      />
       <div className="bg-white dark:bg-gray-800 rounded-lg shadow overflow-hidden">
         <table className="w-full text-left border-collapse">
           <thead className="bg-gray-100 dark:bg-gray-700">
@@ -148,7 +138,7 @@ export default function SubscriptionsTab({ api, showMessage }) {
                 </td>
                 <td className="px-4 py-3">
                   <div className="flex items-center gap-2">
-                    <ButtonIcon name="edit" onClick={() => { setEditing(s); setModalKey(k => k + 1); setShowModal(true); }} title="Edit" />
+                    <ButtonIcon name="edit" onClick={() => showModal({ title: 'Edit Subscription', body: <SubscriptionModal subscription={s} products={products} onSave={handleSave} onClose={hideModal} /> })} title="Edit" />
                     <ButtonIcon name="delete" color="red" onClick={() => handleArchive(s.id)} title="Archive" />
                   </div>
                 </td>

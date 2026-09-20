@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { useSession } from '@/context/session';
+import { useModal } from '@/context/modal';
 import { Users } from '@/api/admin/users';
-import Modal from '@/components/ui/modal';
 import Button from '@/components/ui/button';
 import Icon from '@/components/ui/icon';
 import Input from '@/components/forms/input';
@@ -15,9 +15,84 @@ const formatDate = (value) => {
   return date.toLocaleString();
 };
 
+function UserDetailsContent({ user, onSaved, onClose }) {
+  const session = useSession();
+  const { updateFullName, sendPasswordReset } = Users(session);
+  const [fullName, setFullName] = useState(user.fullName || '');
+  const [message, setMessage] = useState(null);
+
+  const handleSaveFullName = () => {
+    updateFullName({ Id: user.id, FullName: fullName }).then((response) => {
+      if (response.data.success) {
+        setMessage({ type: 'info', text: 'Full name updated' });
+        onSaved(fullName);
+      } else {
+        setMessage({ type: 'error', text: response.data.message || 'Failed to update full name' });
+      }
+    }).catch((error) => {
+      setMessage({ type: 'error', text: error?.response?.data?.message || 'Failed to update full name' });
+    });
+  };
+
+  const handleSendPasswordReset = () => {
+    sendPasswordReset(user.id).then((response) => {
+      if (response.data.success) {
+        setMessage({ type: 'info', text: response.data.message || 'Password reset email sent' });
+      } else {
+        setMessage({ type: 'error', text: response.data.message || 'Failed to send password reset' });
+      }
+    }).catch((error) => {
+      setMessage({ type: 'error', text: error?.response?.data?.message || 'Failed to send password reset' });
+    });
+  };
+
+  return (
+    <>
+      {message && (
+        <Message type={message.type} onClose={() => setMessage(null)}>
+          {message.text}
+        </Message>
+      )}
+      <Input
+        name="fullName"
+        label="Full Name"
+        value={fullName}
+        onInput={(e) => setFullName(e.target.value)}
+      />
+      <div className="mb-4">
+        <p className="text-sm text-gray-500 dark:text-gray-400">Email</p>
+        <p className="font-medium">{user.email}</p>
+      </div>
+      <div className="mb-4">
+        <p className="text-sm text-gray-500 dark:text-gray-400">Created</p>
+        <p>{formatDate(user.created)}</p>
+      </div>
+      <div className="mb-4">
+        <p className="text-sm text-gray-500 dark:text-gray-400">Last Login</p>
+        <p>{formatDate(user.lastLogin)}</p>
+      </div>
+      <div className="buttons flex flex-wrap gap-2">
+        <Button
+          onClick={handleSaveFullName}
+          disabled={fullName === user.fullName}
+        >
+          Save Changes
+        </Button>
+        <ButtonOutline onClick={handleSendPasswordReset}>
+          Send Password Reset
+        </ButtonOutline>
+        <Button color="gray" className="cancel" onClick={onClose}>
+          Cancel
+        </Button>
+      </div>
+    </>
+  );
+}
+
 export default function DashboardUsers() {
   const session = useSession();
-  const { getAllFiltered, updateFullName, sendPasswordReset } = Users(session);
+  const { showModal, hideModal } = useModal();
+  const { getAllFiltered } = Users(session);
 
   const [users, setUsers] = useState([]);
   const [totalCount, setTotalCount] = useState(0);
@@ -28,10 +103,7 @@ export default function DashboardUsers() {
     start: 0,
     length: 50
   });
-  const [selectedUser, setSelectedUser] = useState(null);
-  const [fullName, setFullName] = useState('');
   const [searchInput, setSearchInput] = useState('');
-  const [message, setMessage] = useState(null);
   const [loading, setLoading] = useState(false);
 
   const fetchUsers = () => {
@@ -41,12 +113,9 @@ export default function DashboardUsers() {
       if (response.data.success) {
         setUsers(response.data.data.items || []);
         setTotalCount(response.data.data.totalCount || 0);
-      } else {
-        setMessage({ type: 'error', text: response.data.message || 'Failed to fetch users' });
       }
     }).catch((error) => {
       setLoading(false);
-      setMessage({ type: 'error', text: error?.response?.data?.message || 'Failed to fetch users' });
     });
   };
 
@@ -67,39 +136,19 @@ export default function DashboardUsers() {
   };
 
   const handleRowClick = (person) => {
-    setSelectedUser(person);
-    setFullName(person.fullName || '');
-    setMessage(null);
-  };
-
-  const handleCloseModal = () => {
-    setSelectedUser(null);
-    setMessage(null);
-  };
-
-  const handleSaveFullName = () => {
-    updateFullName({ Id: selectedUser.id, FullName: fullName }).then((response) => {
-      if (response.data.success) {
-        setMessage({ type: 'info', text: 'Full name updated' });
-        setSelectedUser((prev) => ({ ...prev, fullName }));
-        fetchUsers();
-      } else {
-        setMessage({ type: 'error', text: response.data.message || 'Failed to update full name' });
-      }
-    }).catch((error) => {
-      setMessage({ type: 'error', text: error?.response?.data?.message || 'Failed to update full name' });
-    });
-  };
-
-  const handleSendPasswordReset = () => {
-    sendPasswordReset(selectedUser.id).then((response) => {
-      if (response.data.success) {
-        setMessage({ type: 'info', text: response.data.message || 'Password reset email sent' });
-      } else {
-        setMessage({ type: 'error', text: response.data.message || 'Failed to send password reset' });
-      }
-    }).catch((error) => {
-      setMessage({ type: 'error', text: error?.response?.data?.message || 'Failed to send password reset' });
+    showModal({
+      title: 'User Details',
+      onClose: hideModal,
+      body: (
+        <UserDetailsContent
+          user={person}
+          onSaved={(fullName) => {
+            setUsers((prev) => prev.map((u) => u.id === person.id ? { ...u, fullName } : u));
+            fetchUsers();
+          }}
+          onClose={hideModal}
+        />
+      ),
     });
   };
 
@@ -203,47 +252,6 @@ export default function DashboardUsers() {
         totalItems={totalCount}
         onPageChange={(page) => setFilter((prev) => ({ ...prev, start: (page - 1) * prev.length }))}
       />
-      {selectedUser && (
-        <Modal title="User Details" onClose={handleCloseModal}>
-          {message && (
-            <Message type={message.type} onClose={() => setMessage(null)}>
-              {message.text}
-            </Message>
-          )}
-          <Input
-            name="fullName"
-            label="Full Name"
-            value={fullName}
-            onInput={(e) => setFullName(e.target.value)}
-          />
-          <div className="mb-4">
-            <p className="text-sm text-gray-500 dark:text-gray-400">Email</p>
-            <p className="font-medium">{selectedUser.email}</p>
-          </div>
-          <div className="mb-4">
-            <p className="text-sm text-gray-500 dark:text-gray-400">Created</p>
-            <p>{formatDate(selectedUser.created)}</p>
-          </div>
-          <div className="mb-4">
-            <p className="text-sm text-gray-500 dark:text-gray-400">Last Login</p>
-            <p>{formatDate(selectedUser.lastLogin)}</p>
-          </div>
-          <div className="buttons flex flex-wrap gap-2">
-            <Button
-              onClick={handleSaveFullName}
-              disabled={fullName === selectedUser.fullName}
-            >
-              Save Changes
-            </Button>
-            <ButtonOutline onClick={handleSendPasswordReset}>
-              Send Password Reset
-            </ButtonOutline>
-            <Button color="gray" className="cancel" onClick={handleCloseModal}>
-              Cancel
-            </Button>
-          </div>
-        </Modal>
-      )}
     </div>
   );
 }

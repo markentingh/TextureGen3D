@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useCallback } from 'react';
+import { useModal } from '@/context/modal';
 import ButtonIcon from '@/components/ui/button-icon';
 import ButtonOutline from '@/components/ui/button-outline';
 import Icon from '@/components/ui/icon';
@@ -6,12 +7,10 @@ import SubscribeModal from './SubscribeModal';
 import UserSubscriptionDetails from './UserSubscriptionDetails';
 
 export default function UserSubscriptionsTab({ api, showMessage }) {
+  const { showModal, hideModal } = useModal();
   const [subscriptions, setSubscriptions] = useState([]);
   const [products, setProducts] = useState([]);
   const [allSubscriptions, setAllSubscriptions] = useState([]);
-  const [showSubscribeModal, setShowSubscribeModal] = useState(false);
-  const [showDetailsModal, setShowDetailsModal] = useState(false);
-  const [selectedAppUserId, setSelectedAppUserId] = useState(null);
   const [loading, setLoading] = useState(false);
 
   const load = useCallback(async () => {
@@ -46,20 +45,12 @@ export default function UserSubscriptionsTab({ api, showMessage }) {
     <div>
       <div className="tool-bar mb-4">
         <div className="right-side">
-          <ButtonOutline onClick={() => setShowSubscribeModal(true)}>
+          <ButtonOutline onClick={() => showModal({ title: 'Subscribe User', body: <SubscribeModal subscriptions={allSubscriptions} products={products} api={api} onClose={hideModal} onStarted={handleStarted} /> })}>
             <Icon name="add" />
             <span className="ml-2">Subscribe</span>
           </ButtonOutline>
         </div>
       </div>
-      <SubscribeModal
-        show={showSubscribeModal}
-        subscriptions={allSubscriptions}
-        products={products}
-        api={api}
-        onClose={() => setShowSubscribeModal(false)}
-        onStarted={handleStarted}
-      />
       <div className="bg-white dark:bg-gray-800 rounded-lg shadow overflow-hidden">
         <table className="w-full text-left border-collapse">
           <thead className="bg-gray-100 dark:bg-gray-700">
@@ -86,7 +77,18 @@ export default function UserSubscriptionsTab({ api, showMessage }) {
                 </td>
                 <td className="px-4 py-3">
                   <div className="flex items-center gap-2">
-                    <ButtonIcon name="edit" onClick={() => { setSelectedAppUserId(s.appUserId); setShowDetailsModal(true); }} title="Details" />
+                    <ButtonIcon name="edit" onClick={() => showModal({
+                      title: 'User Subscription Details',
+                      className: 'max-w-3xl w-full',
+                      onClose: hideModal,
+                      body: (
+                        <UserSubscriptionDetails
+                          appUserId={s.appUserId}
+                          api={api}
+                          onClose={hideModal}
+                        />
+                      ),
+                    })} title="Details" />
                     {!s.cancelled && (
                       <ButtonIcon name="delete" color="red" onClick={() => handleCancel(s.id)} title="Cancel" />
                     )}
@@ -104,12 +106,6 @@ export default function UserSubscriptionsTab({ api, showMessage }) {
           </tbody>
         </table>
       </div>
-      <UserSubscriptionDetails
-        show={showDetailsModal}
-        appUserId={selectedAppUserId}
-        api={api}
-        onClose={() => setShowDetailsModal(false)}
-      />
     </div>
   );
 }

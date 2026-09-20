@@ -26,6 +26,35 @@ namespace TextureGen3D.API.Services
             _options = options.Value;
         }
 
+        /// <summary>
+        /// Cancel the currently running ComfyUI workflow by POSTing to /interrupt.
+        /// </summary>
+        public async Task InterruptAsync()
+        {
+            if (!_options.Models.TryGetValue("comfyui", out var config))
+                return;
+
+            var endpoint = config.Endpoint.TrimEnd('/');
+            var apiKey = config.ApiKey;
+
+            using var client = _httpClientFactory.CreateClient("ImageGeneration");
+            client.Timeout = TimeSpan.FromSeconds(10);
+
+            using var request = new HttpRequestMessage(HttpMethod.Post, $"{endpoint}/interrupt");
+            if (!string.IsNullOrWhiteSpace(apiKey))
+                request.Headers.Add("X-API-Key", apiKey);
+
+            try
+            {
+                using var response = await client.SendAsync(request);
+                Console.WriteLine($"[ComfyUI] Interrupt response: {response.StatusCode}");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[ComfyUI] Interrupt failed: {ex.Message}");
+            }
+        }
+
         public async Task<ImageGenerationResult> GenerateAsync(ImageGenerationRequest request)
         {
             throw new NotSupportedException("ComfyUI generation requires progress tracking. Use GenerateWithProgressAsync via the SignalR hub.");
@@ -41,8 +70,11 @@ namespace TextureGen3D.API.Services
             string promptPath,
             string depthMapPath,
             string inputImagesPath,
+            string seedPath,
+            int? seed,
             string subfolder,
             IProgress<(int value, string? message)>? progress = null,
+            Action<string>? workflowCallback = null,
             CancellationToken cancellationToken = default)
         {
             if (!_options.Models.TryGetValue("comfyui", out var config))
@@ -85,7 +117,16 @@ namespace TextureGen3D.API.Services
                 SetWorkflowArrayValue(workflow, inputImagesPath, uploadedPaths);
             }
 
-            // 4. Queue the prompt via /prompt API
+            // 4. Inject the seed into the workflow
+            if (!string.IsNullOrWhiteSpace(seedPath) && seed.HasValue)
+            {
+                SetWorkflowValue(workflow, seedPath, seed.Value.ToString());
+            }
+
+            // 5. Send the populated workflow to the client for debugging
+            workflowCallback?.Invoke(workflow.ToJsonString());
+
+            // 6. Queue the prompt via /prompt API
             progress?.Report((5, "Queuing workflow..."));
             var clientId = Guid.NewGuid().ToString("N");
             var promptId = await QueuePromptAsync(client, endpoint, apiKey, workflow, clientId, cancellationToken);
