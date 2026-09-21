@@ -104,6 +104,53 @@ namespace TextureGen3D.API.Controllers
             }
         }
 
+        [HttpPost("{projectId}/{modelId}/update-file")]
+        [RequestSizeLimit(1_000_000_000)]
+        public async Task<IActionResult> UpdateFile(Guid projectId, Guid modelId, IFormFile file)
+        {
+            try
+            {
+                var userId = GetUserId();
+                if (userId == Guid.Empty)
+                    return Json(new ApiResponse { success = false, message = "Could not find user" });
+
+                var project = await _projectRepo.GetByIdAsync(projectId, userId);
+                if (project == null)
+                    return Json(new ApiResponse { success = false, message = "Project not found" });
+
+                var model = await _modelRepo.GetByIdAsync(modelId, projectId);
+                if (model == null)
+                    return Json(new ApiResponse { success = false, message = "Model not found" });
+
+                if (file == null || file.Length == 0)
+                    return Json(new ApiResponse { success = false, message = "No file provided" });
+
+                var extension = Path.GetExtension(file.FileName).TrimStart('.').ToLowerInvariant();
+                if (!AllowedExtensions.Contains(extension))
+                    return Json(new ApiResponse { success = false, message = $"Unsupported file extension. Allowed: .fbx, .obj, .abc, .usd, .ply, .stl" });
+
+                using var ms = new MemoryStream();
+                await file.CopyToAsync(ms);
+                var fileBytes = ms.ToArray();
+
+                // Remove the old stored file (needed when the extension changes —
+                // otherwise the old path would linger), then write the new one.
+                await _imageService.DeleteProjectModelAsync(projectId, modelId, model.Extension);
+                await _imageService.SaveProjectModelAsync(projectId, modelId, extension, fileBytes);
+
+                model.Filename = file.FileName;
+                model.Extension = extension;
+                model.FileSize = (int)file.Length;
+                await _modelRepo.UpdateFileInfoAsync(modelId, projectId, model.Filename, model.Extension, model.FileSize);
+
+                return Json(new ApiResponse { success = true, data = model });
+            }
+            catch (Exception ex)
+            {
+                return Json(new ApiResponse { success = false, message = ex.Message });
+            }
+        }
+
         [HttpGet("{projectId}/{modelId}/download")]
         public async Task<IActionResult> Download(Guid projectId, Guid modelId)
         {

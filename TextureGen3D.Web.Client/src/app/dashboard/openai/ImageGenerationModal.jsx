@@ -15,7 +15,8 @@ const IG_TYPES = [
 
 const MODEL_TYPES = [
     { value: 0, label: 'Image Generation' },
-    { value: 1, label: 'Depth To Image' }
+    { value: 1, label: 'Depth To Image' },
+    { value: 2, label: 'Inpainting' }
 ];
 const RESOLUTIONS = [
     { value: '1024x1024', label: '1024 x 1024' },

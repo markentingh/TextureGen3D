@@ -1,27 +1,99 @@
-import React from 'react';
+import React, { useEffect } from 'react';
 import { useProject } from '@/context/project';
 import { Projects } from '@/api/user/projects';
+import { useHubGeneration } from './useHubGeneration';
 import ReferenceImagesSection from './ReferenceImagesSection';
 import TextArea from '@/components/forms/textarea';
 import Select from '@/components/forms/select';
+import Icon from '@/components/ui/icon';
+
+// Write the mask (white = painted) into the image's alpha channel.
+// Painted regions become transparent — what the OpenAI image-edit
+// API treats as the area to regenerate.
+function applyMaskToAlpha(imageDataUrl, maskDataUrl) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => {
+      const mask = new Image();
+      mask.onload = () => {
+        const w = img.width;
+        const h = img.height;
+        const canvas = document.createElement('canvas');
+        canvas.width = w;
+        canvas.height = h;
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(img, 0, 0);
+
+        const maskCanvas = document.createElement('canvas');
+        maskCanvas.width = w;
+        maskCanvas.height = h;
+        const maskCtx = maskCanvas.getContext('2d');
+        maskCtx.drawImage(mask, 0, 0, w, h);
+
+        const imgData = ctx.getImageData(0, 0, w, h);
+        const maskData = maskCtx.getImageData(0, 0, w, h);
+        for (let i = 0; i < imgData.data.length; i += 4) {
+          const luma = maskData.data[i] * 0.299 + maskData.data[i + 1] * 0.587 + maskData.data[i + 2] * 0.114;
+          imgData.data[i + 3] = 255 - luma;
+        }
+        ctx.putImageData(imgData, 0, 0);
+        resolve(canvas.toDataURL('image/png'));
+      };
+      mask.onerror = reject;
+      mask.src = maskDataUrl;
+    };
+    img.onerror = reject;
+    img.src = imageDataUrl;
+  });
+}
+
+
 
 export default function InpaintPanel({ showPanel, setShowPanel }) {
   const {
     id,
     token,
     models,
+    selectedMesh,
+    meshDbIds,
+    meshRefView,
+    meshLayers,
     inpaintPrompt,
     setInpaintPrompt,
+    inpaintMaskVisible,
+    setInpaintMaskVisible,
     imageModels,
-    refImageModels,
+    inpaintImageModels,
     selectedModelId,
     setSelectedModelId,
     inpaintModelId,
     setInpaintModelId,
     inpaintModelOptions,
+    textureResolution,
+    isComfyUI,
+    isGradio,
     setProject,
     imageModelOptions,
+    viewerRef,
+    layerApi,
+    prependMeshLayer,
+    loadMeshLayers,
+    refreshLayerTextures,
+    generating,
+    setGenerating,
+    comfyProgress,
+    setComfyProgress,
+    comfyMessage,
+    setComfyMessage,
+    setLayerThumbVersion,
+    setMaskThumbVersions,
   } = useProject();
+  const { generateViaHub } = useHubGeneration();
+
+  // Sync the eye toggle with the shader overlay
+  useEffect(() => {
+    viewerRef.current?.setInpaintMaskVisible?.(inpaintMaskVisible);
+  }, [inpaintMaskVisible, viewerRef]);
 
   if (!showPanel || models.length === 0) return null;
 
@@ -44,16 +116,173 @@ export default function InpaintPanel({ showPanel, setShowPanel }) {
   const handleInpaintModelChange = (e) => {
     const modelId = e.target.value;
     setInpaintModelId(modelId);
-    const selectedModel = refImageModels.find((m) => m.id?.toString() === modelId);
+    const selectedModel = inpaintImageModels.find((m) => m.id?.toString() === modelId);
     if (selectedModel?.modelKey) {
       localStorage.setItem('preferredInpaintModel', selectedModel.modelKey);
+    }
+  };
+
+  const handleInpaint = async () => {
+    if (generating) return;
+    const meshDbId = selectedMesh ? meshDbIds[selectedMesh.key] : null;
+    if (!meshDbId) return;
+
+    setGenerating(true);
+    setComfyProgress(0);
+    setComfyMessage('Capturing view...');
+
+    try {
+      const cameraAngle = viewerRef.current?.getCameraAngle?.();
+      const cameraAngleJson = cameraAngle ? JSON.stringify(cameraAngle) : '';
+
+      // 1+2 — unlit composite (white bg, no overlay) + raw inpaint mask
+      const composite = viewerRef.current?.captureCompositeImage?.(textureResolution);
+      const maskImage = viewerRef.current?.captureInpaintMaskImage?.(textureResolution);
+      if (!composite || !maskImage) throw new Error('Failed to capture inpaint inputs');
+
+      // 3 — inverted mask → alpha channel of the composite
+      const maskedImage = await applyMaskToAlpha(composite, maskImage);
+
+      // 4 — inpaint edit: composite is InputImages[0], masked RGBA is InputMask,
+      // active mesh references are appended to InputImages
+      setComfyProgress(15);
+      setComfyMessage('Inpainting...');
+      const referenceIds = meshRefView.filter((r) => r.active).map((r) => r.id);
+      const inpRes = await layerApi.inpaint(
+        id,
+        meshDbId,
+        composite,
+        maskedImage,
+        inpaintPrompt,
+        referenceIds,
+        parseInt(inpaintModelId),
+        textureResolution
+      );
+      if (!inpRes.data?.success) throw new Error(inpRes.data?.message || 'Inpaint failed');
+      const inpaintedImage = inpRes.data.data?.image;
+      if (!inpaintedImage) throw new Error('No image returned from inpaint');
+
+      // 5 — same projection pipeline as the Generate Images panel: new layer,
+      // depth map, projection model (type 1) → texture, project to UV map
+      setComfyProgress(60);
+      setComfyMessage('Projecting onto new layer...');
+      const layerNum = meshLayers.length + 1;
+      const layerRes = await layerApi.create(id, meshDbId, `Layer ${layerNum}`, cameraAngleJson, true);
+      if (!layerRes.data?.success) throw new Error('Failed to create layer');
+      const layer = layerRes.data.data;
+      prependMeshLayer(meshDbId, layer);
+      // New inpaint layers go to the top of the stack — index 0 draws last
+      // in the composite shader and renders first in the sidebar list.
+      await layerApi.reorder(id, meshDbId, [layer.id, ...meshLayers.map((l) => l.id)]);
+
+      // Camera-angle thumbnail for the layer row — arbitrary inpaint angles
+      // don't match a stored camera angle, so persist our own angle_thumb.png
+      const angleThumb = viewerRef.current?.captureThumbnail?.(75, cameraAngle);
+      if (angleThumb) {
+        try {
+          await layerApi.saveAngleThumb(id, layer.id, meshDbId, angleThumb);
+        } catch (err) {
+          console.warn('Failed to save layer angle thumbnail:', err);
+        }
+      }
+
+      // Depth map must match the captured camera angle, not the live
+      // camera — the user may have rotated the mesh mid-inpaint.
+      const depthMap = viewerRef.current?.captureDepthMap(textureResolution, cameraAngle);
+      if (!depthMap) throw new Error('Failed to generate depth map');
+
+      setComfyProgress(75);
+      setComfyMessage('Generating projection...');
+      let generatedImage;
+      if (isComfyUI || isGradio) {
+        // Same path as the Generate Images panel — the hub reads the depth map
+        // from storage and reports progress over SignalR
+        const hubUrl = isComfyUI ? '/hubs/comfyui' : '/hubs/gradio';
+        const hubName = isComfyUI ? 'ComfyUI' : 'Gradio';
+        await layerApi.saveDepthMap(id, layer.id, meshDbId, depthMap);
+        generatedImage = await generateViaHub({
+          hubUrl,
+          hubName,
+          layer,
+          meshDbId,
+          fullPrompt: inpaintPrompt,
+          inputImage: inpaintedImage,
+        });
+      } else {
+        const genRes = await layerApi.generate(
+          id,
+          layer.id,
+          meshDbId,
+          parseInt(selectedModelId),
+          inpaintPrompt,
+          depthMap,
+          cameraAngleJson,
+          null,
+          inpaintedImage,
+          textureResolution
+        );
+        if (!genRes.data?.success) throw new Error(genRes.data?.message || 'Projection generation failed');
+        generatedImage = genRes.data.data?.image;
+      }
+
+      if (generatedImage) {
+        // Project the full generated image — the layer's mask.png (below)
+        // constrains visibility to the painted region, not the UV map alpha.
+        // Project using the captured camera angle — the live camera may have
+        // moved since the composite/mask were captured.
+        const uvMapDataUrl = await viewerRef.current?.projectImageToUvMap(generatedImage, cameraAngle, textureResolution);
+        if (uvMapDataUrl) {
+          await layerApi.saveUvMap(id, layer.id, meshDbId, uvMapDataUrl);
+        }
+
+        // The inpaint mask render target is already UV-space (white =
+        // painted), so it saves directly as the layer's mask.png — the layer
+        // shader samples mask.r where white = visible.
+        const inpaintMaskDataUrl = viewerRef.current?.inpaintMaskToDataURL?.();
+        if (inpaintMaskDataUrl) {
+          await layerApi.saveMasks(id, meshDbId, [{ layerId: layer.id, base64Mask: inpaintMaskDataUrl }]);
+        }
+
+        const updatedLayers = await loadMeshLayers(meshDbId);
+        await refreshLayerTextures(updatedLayers);
+
+        // Bump thumb versions so the layer row's <img> tags refetch — they
+        // fired on mount (before the files were saved), got 404s, and hid
+        // themselves until the src changes.
+        setLayerThumbVersion((v) => v + 1);
+        setMaskThumbVersions((prev) => ({ ...prev, [layer.id]: (prev[layer.id] || 0) + 1 }));
+      }
+
+      setComfyProgress(100);
+      setComfyMessage('Done');
+      // Hide the inpaint overlay so the new layer's changes are visible
+      setInpaintMaskVisible(false);
+    } catch (err) {
+      console.error('Inpaint failed:', err);
+      setComfyMessage(`Error: ${err.message}`);
+    } finally {
+      setGenerating(false);
     }
   };
 
   return (
     <div className="fixed bottom-0 left-0 z-20 w-80 max-w-[calc(100vw-20rem)] bg-white/95 dark:bg-gray-800/95 backdrop-blur border-t border-r border-gray-200 dark:border-gray-700 rounded-tr-lg shadow-lg max-h-[calc(100vh-5em)] flex flex-col">
       <div className="flex items-center justify-between p-3 border-b border-gray-200 dark:border-gray-700">
-        <h3 className="text-sm font-semibold text-gray-800 dark:text-gray-200">Inpaint Tool</h3>
+        <div className="flex items-center gap-1">
+          <button
+            onClick={() => setInpaintMaskVisible((v) => !v)}
+            className={`flex-shrink-0 translate-y-[4px] pr-2 transition ${
+              inpaintMaskVisible
+                ? 'text-gray-500 hover:text-gray-700 dark:hover:text-gray-300'
+                : 'text-gray-300 dark:text-gray-600 hover:text-gray-500'
+            }`}
+            aria-label={inpaintMaskVisible ? 'Hide inpaint mask' : 'Show inpaint mask'}
+            title={inpaintMaskVisible ? 'Hide inpaint mask' : 'Show inpaint mask'}
+          >
+            <Icon name={inpaintMaskVisible ? 'visibility' : 'visibility_off'} className="text-2xl" />
+          </button>
+          <h3 className="text-sm font-semibold text-gray-800 dark:text-gray-200">Inpaint Tool</h3>
+        </div>
         <button
           onClick={() => setShowPanel(false)}
           className="p-1 rounded hover:bg-gray-100 dark:hover:bg-gray-700 text-gray-500 dark:text-gray-400"
@@ -76,7 +305,7 @@ export default function InpaintPanel({ showPanel, setShowPanel }) {
           />
         </div>
 
-        <ReferenceImagesSection />
+        <ReferenceImagesSection maxRefs={1} />
 
         <div>
           <label className="block text-xs font-medium text-gray-700 dark:text-gray-300 mb-1">Inpaint Image Model</label>
@@ -98,10 +327,26 @@ export default function InpaintPanel({ showPanel, setShowPanel }) {
       </div>
 
       <div className="p-3 border-t border-gray-200 dark:border-gray-700">
+        {generating && (
+          <div className="mb-2">
+            <div className="flex items-center justify-between text-xs text-gray-600 dark:text-gray-400 mb-1">
+              <span>{comfyMessage || 'Inpainting...'}</span>
+              <span>{comfyProgress}%</span>
+            </div>
+            <div className="w-full h-2 bg-gray-200 dark:bg-gray-700 rounded-full overflow-hidden">
+              <div
+                className="h-full bg-green-500 transition-all duration-300 rounded-full"
+                style={{ width: `${comfyProgress}%` }}
+              />
+            </div>
+          </div>
+        )}
         <button
-          className="w-full px-4 py-2 border-2 border-green-600 text-green-600 dark:text-green-400 dark:border-green-500 rounded-lg hover:bg-green-600 hover:text-white dark:hover:bg-green-600 dark:hover:text-white transition font-medium text-sm"
+          onClick={handleInpaint}
+          disabled={generating || !selectedMesh || !inpaintModelId}
+          className="w-full px-4 py-2 border-2 border-green-600 text-green-600 dark:text-green-400 dark:border-green-500 rounded-lg hover:bg-green-600 hover:text-white dark:hover:bg-green-600 dark:hover:text-white transition font-medium text-sm disabled:opacity-50 disabled:cursor-not-allowed"
         >
-          Inpaint To New Layer
+          {generating ? 'Inpainting...' : 'Inpaint To New Layer'}
         </button>
       </div>
     </div>

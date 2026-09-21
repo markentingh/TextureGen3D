@@ -2,10 +2,10 @@ import React, { useEffect, useState } from 'react';
 import { useProject } from '@/context/project';
 
 /**
- * MaskThumb — renders a layer's mask as a white thumbnail on transparency.
- * Fetches the raw mask image, then produces a white RGBA image whose alpha
- * channel is the inverted mask (painted-black areas become opaque white
- * strokes; unpainted areas become fully transparent).
+ * MaskThumb — renders a layer's mask thumbnail as white strokes on
+ * transparency: the mask's luminance becomes the alpha channel of a white
+ * image, so painted/visible areas show white and hidden areas let the
+ * checkerboard background show through.
  */
 export default function MaskThumb({ url, version = 0, size = 47 }) {
   const { token } = useProject();
@@ -33,7 +33,7 @@ export default function MaskThumb({ url, version = 0, size = 47 }) {
         ctx.drawImage(bitmap, 0, 0);
         bitmap.close();
 
-        // White image; alpha = inverted mask luminance
+        // White image; alpha = mask luminance (white = visible → opaque)
         const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
         const d = imgData.data;
         for (let i = 0; i < d.length; i += 4) {
@@ -41,7 +41,7 @@ export default function MaskThumb({ url, version = 0, size = 47 }) {
           d[i] = 255;
           d[i + 1] = 255;
           d[i + 2] = 255;
-          d[i + 3] = 255 - maskValue;
+          d[i + 3] = maskValue;
         }
         ctx.putImageData(imgData, 0, 0);
 

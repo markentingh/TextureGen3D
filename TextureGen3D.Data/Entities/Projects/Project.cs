@@ -12,5 +12,6 @@ namespace TextureGen3D.Data.Entities.Projects
         public DateTime Created { get; set; }
         public int? ImageModelId { get; set; }
         public int? Seed { get; set; }
+        public int TextureResolution { get; set; } = 1024;
     }
 }

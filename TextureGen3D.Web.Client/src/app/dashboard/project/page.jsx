@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { ProjectProvider, useProject } from '@/context/project';
+import { useModal } from '@/context/modal';
 import LoadingScreen from './components/LoadingScreen';
 import ViewportSection from './components/ViewportSection';
 import MouseHints from './components/MouseHints';
@@ -11,7 +12,8 @@ import InpaintPanel from './components/InpaintPanel';
 import ErrorOverlay from './components/ErrorOverlay';
 
 function ProjectContent() {
-  const { id, token, loading, loadedRef, loadProject, project, viewerRef, thumbGenAttemptedRef, maskTool } = useProject();
+  const { id, token, loading, loadedRef, loadProject, project, viewerRef, thumbGenAttemptedRef, maskTool, textureResolution } = useProject();
+  const { showModal, hideModal } = useModal();
   const [showPanel, setShowPanel] = useState(true);
 
   // One-time project load
@@ -45,6 +47,48 @@ function ProjectContent() {
     return () => clearTimeout(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [project]);
+
+  // Dev-tools debug helpers — capture the inpaint pipeline's input images
+  // (same hidden-canvas captures as Inpaint To Layer) and preview them:
+  //   getInpaintMeshImage() — unlit mesh + all layers, no inpaint overlay
+  //   getInpaintMaskImage() — the inpaint mask only, on a black background
+  useEffect(() => {
+    const showPreview = (title, dataUrl) => {
+      if (!dataUrl) {
+        console.warn(`[${title}] no image captured — is a mesh loaded?`);
+        return;
+      }
+      showModal({
+        title,
+        className: 'max-w-[90vw] max-h-[90vh]',
+        onClose: hideModal,
+        body: (
+          <div className="flex items-center justify-center" onClick={hideModal}>
+            <img
+              src={dataUrl}
+              alt={title}
+              className="max-w-[85vw] max-h-[80vh] object-contain rounded-lg"
+              onClick={(e) => e.stopPropagation()}
+            />
+          </div>
+        ),
+      });
+    };
+    window.getInpaintMeshImage = () => {
+      const dataUrl = viewerRef.current?.captureCompositeImage?.(textureResolution);
+      showPreview('Inpaint Mesh Image', dataUrl);
+      return dataUrl;
+    };
+    window.getInpaintMaskImage = () => {
+      const dataUrl = viewerRef.current?.captureInpaintMaskImage?.(textureResolution);
+      showPreview('Inpaint Mask Image', dataUrl);
+      return dataUrl;
+    };
+    return () => {
+      delete window.getInpaintMeshImage;
+      delete window.getInpaintMaskImage;
+    };
+  }, [viewerRef, textureResolution, showModal, hideModal]);
 
   // The canvas mounts once and stays mounted — LoadingScreen overlays it
   // instead of replacing it, so the WebGL context is never torn down.

@@ -58,6 +58,12 @@ namespace TextureGen3D.Data.Repositories.Projects
             await _dbConnection.ExecuteAsync(query, new { modelId, projectId });
         }
 
+        public async Task UpdateDataAsync(Guid id, Guid projectId, string meshData, string uvMapData, int triangles, int vertices)
+        {
+            const string query = @"UPDATE public.""ProjectMeshes"" SET ""MeshData"" = @meshData, ""UVMapData"" = @uvMapData, ""Triangles"" = @triangles, ""Vertices"" = @vertices WHERE ""Id"" = @id AND ""ProjectId"" = @projectId";
+            await _dbConnection.ExecuteAsync(query, new { id, projectId, meshData, uvMapData, triangles, vertices });
+        }
+
         public async Task UpdatePromptAsync(Guid id, Guid projectId, string prompt)
         {
             const string query = @"UPDATE public.""ProjectMeshes"" SET ""Prompt"" = @prompt WHERE ""Id"" = @id AND ""ProjectId"" = @projectId";

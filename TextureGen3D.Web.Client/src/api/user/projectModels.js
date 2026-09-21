@@ -11,6 +11,13 @@ const ProjectModels = (args) => Api({ ...args }).endpoints(({ api }) => {
         headers: { 'Content-Type': 'multipart/form-data' }
       });
     },
+    updateFile: (projectId, modelId, file) => {
+      const formData = new FormData();
+      formData.append('file', file);
+      return api.post(`${apiPath}/${projectId}/${modelId}/update-file`, formData, {
+        headers: { 'Content-Type': 'multipart/form-data' }
+      });
+    },
     downloadUrl: (projectId, modelId) => `${apiPath}/${projectId}/${modelId}/download`,
     delete: (projectId, modelId) => api.post(`${apiPath}/${projectId}/${modelId}/delete`),
   };

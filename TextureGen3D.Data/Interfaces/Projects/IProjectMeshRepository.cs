@@ -11,5 +11,6 @@ namespace TextureGen3D.Data.Interfaces.Projects
         Task DeleteAsync(Guid id, Guid projectId);
         Task DeleteByModelIdAsync(Guid modelId, Guid projectId);
         Task UpdatePromptAsync(Guid id, Guid projectId, string prompt);
+        Task UpdateDataAsync(Guid id, Guid projectId, string meshData, string uvMapData, int triangles, int vertices);
     }
 }

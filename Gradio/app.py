@@ -24,6 +24,12 @@ def refcontrol_tab():
                 precision=0,
                 info="-1 for random",
             )
+            resolution_input = gr.Number(
+                label="Texture Resolution",
+                value=1024,
+                precision=0,
+                info="Target output size in px (1024/2048/4096)",
+            )
             generate_btn = gr.Button("Generate", variant="primary")
 
         with gr.Column():
@@ -31,7 +37,7 @@ def refcontrol_tab():
 
     generate_btn.click(
         fn=depth_to_image,
-        inputs=[depth_map_input, reference_input, prompt_input, seed_input],
+        inputs=[depth_map_input, reference_input, prompt_input, seed_input, resolution_input],
         outputs=output_image,
     )
 

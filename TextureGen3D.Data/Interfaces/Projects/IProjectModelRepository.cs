@@ -8,5 +8,6 @@ namespace TextureGen3D.Data.Interfaces.Projects
         Task<ProjectModel?> GetByIdAsync(Guid id, Guid projectId);
         Task<IEnumerable<ProjectModel>> GetByProjectIdAsync(Guid projectId);
         Task DeleteAsync(Guid id, Guid projectId);
+        Task UpdateFileInfoAsync(Guid id, Guid projectId, string filename, string extension, int fileSize);
     }
 }

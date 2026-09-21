@@ -13,6 +13,7 @@ const Projects = (args) => Api({ ...args }).endpoints(({ api }) => {
     updateKey: (request) => api.post(`${apiPath}/update-key`, request),
     updateImageModel: (request) => api.post(`${apiPath}/update-image-model`, request),
     updateSeed: (request) => api.post(`${apiPath}/update-seed`, request),
+    updateTextureResolution: (request) => api.post(`${apiPath}/update-texture-resolution`, request),
     saveThumb: (id, base64Image) => api.post(`${apiPath}/${id}/save-thumb`, { base64Image }),
     archive: (request) => api.post(`${apiPath}/archive`, request),
     unarchive: (request) => api.post(`${apiPath}/unarchive`, request),

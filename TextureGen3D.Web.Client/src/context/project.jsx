@@ -54,6 +54,7 @@ export function ProjectProvider({ children }) {
   // ── Image models ──
   const [imageModels, setImageModels] = useState([]);
   const [refImageModels, setRefImageModels] = useState([]);
+  const [inpaintImageModels, setInpaintImageModels] = useState([]);
   const [selectedModelId, setSelectedModelId] = useState('');
   const [inpaintModelId, setInpaintModelId] = useState('');
 
@@ -89,6 +90,7 @@ export function ProjectProvider({ children }) {
   // ── Mask brush ──
   const [maskTool, setMaskTool] = useState('pointer'); // 'pointer' | 'brush' | 'eraser' | 'inpaint'
   const [inpaintPrompt, setInpaintPrompt] = useState('');
+  const [inpaintMaskVisible, setInpaintMaskVisible] = useState(true);
   const [inpaintSign, setInpaintSign] = useState('add'); // 'add' (white) | 'subtract' (black)
   const [ctrlHeld, setCtrlHeld] = useState(false); // Ctrl inverts the inpaint sign while held
   const [brushSize, setBrushSize] = useState(50);      // 1-300 (mask pixels, diameter)
@@ -101,6 +103,8 @@ export function ProjectProvider({ children }) {
 
   const selectedLayerIdRef = useRef(null);
   useEffect(() => { selectedLayerIdRef.current = selectedLayerId; }, [selectedLayerId]);
+  const maskToolRef = useRef(maskTool);
+  useEffect(() => { maskToolRef.current = maskTool; }, [maskTool]);
   const selectedMeshRef = useRef(null);
   useEffect(() => { selectedMeshRef.current = selectedMesh; }, [selectedMesh]);
   const meshDbIdsRef = useRef({});
@@ -162,11 +166,11 @@ export function ProjectProvider({ children }) {
 
   const inpaintModelOptions = useMemo(
     () =>
-      refImageModels.map((m) => ({
+      inpaintImageModels.map((m) => ({
         value: m.id?.toString() || m.modelKey || m.name,
         label: m.name || m.model || m.modelKey,
       })),
-    [refImageModels]
+    [inpaintImageModels]
   );
 
   const selectedImageModel = useMemo(
@@ -391,6 +395,22 @@ export function ProjectProvider({ children }) {
     else viewerRef.current?.endInpaint?.();
   }, [maskTool]);
 
+  // Brush/eraser splits the shader into baked below / live selected / baked
+  // above textures — rebuild on any tool switch (entering or leaving paint
+  // mode changes the layout), and on target-layer changes while painting.
+  // Also creates/destroys the viewer's brush cursor ring.
+  useEffect(() => {
+    refreshLayerTextures();
+    viewerRef.current?.setBrushRingActive?.(
+      maskTool === 'brush' || maskTool === 'eraser' || maskTool === 'inpaint'
+    );
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [maskTool]);
+  useEffect(() => {
+    if (maskTool === 'brush' || maskTool === 'eraser') refreshLayerTextures();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedLayerId]);
+
   const cancelInpainting = useCallback(() => setMaskTool('pointer'), []);
 
   // Load persisted paint-tool settings once per project
@@ -406,14 +426,14 @@ export function ProjectProvider({ children }) {
       if (typeof saved.hardness === 'number') setBrushHardness(Math.min(100, Math.max(0, saved.hardness)));
       if (typeof saved.spread === 'number') setBrushSpread(Math.min(100, Math.max(0, saved.spread)));
       if (typeof saved.opacity === 'number') setBrushOpacity(Math.min(100, Math.max(1, saved.opacity)));
-      if (saved.inpaintSign === 'add' || saved.inpaintSign === 'subtract') setInpaintSign(saved.inpaintSign);
     } catch {
       /* corrupt entry — ignore */
     }
   }, [id]);
 
   // Persist paint-tool settings whenever they change (skipped until the
-  // project's saved values have been loaded so defaults don't clobber them)
+  // project's saved values have been loaded so defaults don't clobber them).
+  // inpaintSign is intentionally not persisted — it always starts on 'add'.
   useEffect(() => {
     if (!id || paintToolsLoadedRef.current !== id) return;
     try {
@@ -422,12 +442,20 @@ export function ProjectProvider({ children }) {
         hardness: brushHardness,
         spread: brushSpread,
         opacity: brushOpacity,
-        inpaintSign,
       }));
     } catch {
       /* storage full/blocked — non-fatal */
     }
-  }, [id, brushSize, brushHardness, brushSpread, brushOpacity, inpaintSign]);
+  }, [id, brushSize, brushHardness, brushSpread, brushOpacity]);
+
+  // Selecting the inpaint tool always starts in add (+) mode with the
+  // inpaint mask overlay visible
+  useEffect(() => {
+    if (maskTool === 'inpaint') {
+      setInpaintSign('add');
+      setInpaintMaskVisible(true);
+    }
+  }, [maskTool]);
 
   // Auto-select the first layer (or keep selection valid) when layers change
   useEffect(() => {
@@ -502,10 +530,27 @@ export function ProjectProvider({ children }) {
         // Never bind an unrendered target — it samples black and hides the layer
         maskTexture = maskEntry && maskEntry.initialized ? maskEntry.front.texture : null;
 
-        entries.push({ url, maskTexture, layerId: layer.id });
+        // The layer stack is baked into combined images on the CPU — supply
+        // the mask pixels (read back from the live RT so unsaved strokes are
+        // included). The paint target's RT binds directly instead, but its
+        // data URL is still provided for the fallback combined path.
+        let maskDataUrl = null;
+        if (maskEntry && maskEntry.initialized) {
+          try {
+            maskDataUrl = viewerRef.current?.maskToDataURL?.(maskEntry) || null;
+          } catch {
+            /* readback failed — layer bakes unmasked */
+          }
+        }
+
+        entries.push({ url, maskTexture, maskDataUrl, layerId: layer.id });
       }
       const hasAny = entries.some((e) => e.url !== null);
-      viewerRef.current.updateLayerTextures(hasAny ? entries : []);
+      const paintLayerId =
+        (maskToolRef.current === 'brush' || maskToolRef.current === 'eraser')
+          ? selectedLayerIdRef.current
+          : null;
+      viewerRef.current.updateLayerTextures(hasAny ? entries : [], { paintLayerId });
     },
     [id, layerApi, meshDbIds, meshLayers, selectedMesh, token, getOrCreateLayerMask]
   );
@@ -533,6 +578,15 @@ export function ProjectProvider({ children }) {
   const addMeshLayer = useCallback((meshDbId, layer) => {
     const prev = allMeshLayersRef.current;
     const updated = { ...prev, [meshDbId]: [...(prev[meshDbId] || []), layer] };
+    allMeshLayersRef.current = updated;
+    setAllMeshLayers(updated);
+    setMeshLayers(updated[meshDbId] || []);
+  }, []);
+
+  // Same as addMeshLayer but inserts at index 0 (top of the layers list).
+  const prependMeshLayer = useCallback((meshDbId, layer) => {
+    const prev = allMeshLayersRef.current;
+    const updated = { ...prev, [meshDbId]: [layer, ...(prev[meshDbId] || [])] };
     allMeshLayersRef.current = updated;
     setAllMeshLayers(updated);
     setMeshLayers(updated[meshDbId] || []);
@@ -687,6 +741,146 @@ export function ProjectProvider({ children }) {
     [id, token]
   );
 
+  // Re-upload a newer version of an existing model file. Mesh records are
+  // matched by name server-side — existing records (and their layers, camera
+  // angles, references) update in place; only brand-new mesh names create
+  // new records.
+  const reuploadModelFile = useCallback(
+    async (modelId, file) => {
+      if (!modelId || !file) return { success: false, message: 'No file provided' };
+      const model = models.find((m) => m.id === modelId);
+      if (!model) return { success: false, message: 'Model not found' };
+      setParsingModels((prev) => ({ ...prev, [modelId]: true }));
+      try {
+        const buffer = await file.arrayBuffer();
+        const result = await parseModel(file.name, buffer);
+
+        // Replace the stored model file + record
+        const modelsApi = ProjectModels({ token });
+        const fileRes = await modelsApi.updateFile(id, modelId, file);
+        if (!fileRes.data.success) throw new Error(fileRes.data.message || 'File update failed');
+        const updatedModel = fileRes.data.data;
+        setModels((prev) => prev.map((m) => (m.id === modelId ? updatedModel : m)));
+
+        // Sync mesh records by name — update existing, create new
+        const meshesToSave = result.meshes.map((mesh) => ({
+          modelId,
+          name: mesh.name,
+          meshData: serializeMeshData(mesh.object),
+          uvMapData: serializeUVMapData(mesh.object),
+          triangles: mesh.triangles,
+          vertices: mesh.vertices,
+        }));
+        const meshesApi = ProjectMeshes({ token });
+        if (meshesToSave.length > 0) {
+          const syncRes = await meshesApi.syncBatch(id, modelId, meshesToSave);
+          if (!syncRes.data.success) throw new Error(syncRes.data.message || 'Mesh sync failed');
+        }
+
+        // Re-download every mesh record for the model and rebuild the objects
+        // from stored MeshData/UVMapData — the same path loadProject uses.
+        // (Sync only returns the incoming set; this also picks up orphaned
+        // records the new file no longer contains.)
+        const meshesRes = await meshesApi.getByModel(id, modelId);
+        if (!meshesRes.data.success) throw new Error(meshesRes.data.message || 'Failed to reload meshes');
+        const records = meshesRes.data.data || [];
+
+        const newMeshes = [];
+        const newMeshDbIds = {};
+        let totalTriangles = 0;
+        let totalVertices = 0;
+        records.forEach((mesh, i) => {
+          const geometry = deserializeMeshData(mesh.meshData);
+          if (mesh.uvMapData) {
+            const uvMaps = deserializeUVMapData(mesh.uvMapData);
+            for (const uvMap of uvMaps) {
+              const attrName = uvMap.name === 'uv' ? 'uv' : uvMap.name;
+              geometry.setAttribute(
+                attrName,
+                new THREE.Float32BufferAttribute(uvMap.data, 2)
+              );
+            }
+          }
+          const threeMesh = new THREE.Mesh(geometry, new THREE.MeshStandardMaterial());
+          threeMesh.name = mesh.name;
+          newMeshes.push({
+            name: mesh.name,
+            triangles: mesh.triangles,
+            vertices: mesh.vertices,
+            uvMaps: [],
+            boundingBox: null,
+            materials: [],
+            object: threeMesh,
+          });
+          totalTriangles += mesh.triangles;
+          totalVertices += mesh.vertices;
+          newMeshDbIds[`${modelId}-${i}`] = mesh.id;
+        });
+
+        setMeshData((prev) => ({
+          ...prev,
+          [modelId]: {
+            meshes: newMeshes,
+            totalTriangles,
+            totalVertices,
+            format: result.format,
+            warnings: result.warnings,
+            root: null,
+          },
+        }));
+        setMeshDbIds((prev) => {
+          const next = {};
+          for (const key of Object.keys(prev)) {
+            if (!key.startsWith(`${modelId}-`)) next[key] = prev[key];
+          }
+          Object.entries(newMeshDbIds).forEach(([key, meshId]) => {
+            next[key] = meshId;
+          });
+          return next;
+        });
+
+        // If the selected mesh belongs to this model its object is stale —
+        // re-select the same-named mesh so the viewer reloads the rebuilt
+        // geometry. Its record id (and layers/angles) is unchanged by sync.
+        const sel = selectedMeshRef.current;
+        if (sel && sel.modelId === modelId) {
+          const idx = newMeshes.findIndex((m) => m.name === sel.name);
+          if (idx >= 0) {
+            setSelectedMesh({
+              ...newMeshes[idx],
+              modelId,
+              modelFilename: updatedModel.filename,
+              meshIndex: idx,
+              key: `${modelId}-${idx}`,
+            });
+          } else {
+            // Mesh name gone in the new version — clear selection and let the
+            // auto-select effect pick the first mesh with a full reload.
+            setSelectedMesh(null);
+          }
+        }
+
+        setParseErrors((prev) => {
+          const next = { ...prev };
+          delete next[modelId];
+          return next;
+        });
+        return { success: true };
+      } catch (err) {
+        const message = err.response?.data?.message || err.message || 'Re-upload failed';
+        setParseErrors((prev) => ({ ...prev, [modelId]: message }));
+        return { success: false, message };
+      } finally {
+        setParsingModels((prev) => {
+          const next = { ...prev };
+          delete next[modelId];
+          return next;
+        });
+      }
+    },
+    [id, token, models]
+  );
+
   const loadProject = useCallback(async () => {
     setLoading(true);
     setError(null);
@@ -704,8 +898,10 @@ export function ProjectProvider({ children }) {
 
       const depthImageModels = (data.imageModels || []).filter((m) => m.type === 1);
       const generationImageModels = (data.imageModels || []).filter((m) => m.type === 0);
+      const inpaintModelsList = (data.imageModels || []).filter((m) => m.type === 2);
       setImageModels(depthImageModels);
       setRefImageModels(generationImageModels);
+      setInpaintImageModels(inpaintModelsList);
 
       const imageModelList = depthImageModels;
       const savedImageModelId = data.project?.imageModelId;
@@ -728,15 +924,15 @@ export function ProjectProvider({ children }) {
         }
       }
 
-      // Inpaint model — type 0 (image generation) list, localStorage preferred
+      // Inpaint model — type 2 (inpainting) list, localStorage preferred
       const preferredInpaintKey = localStorage.getItem('preferredInpaintModel');
       const preferredInpaint = preferredInpaintKey
-        ? generationImageModels.find((m) => m.modelKey === preferredInpaintKey)
+        ? inpaintModelsList.find((m) => m.modelKey === preferredInpaintKey)
         : null;
       if (preferredInpaint) {
         setInpaintModelId(String(preferredInpaint.id));
-      } else if (generationImageModels.length > 0) {
-        setInpaintModelId(String(generationImageModels[0].id));
+      } else if (inpaintModelsList.length > 0) {
+        setInpaintModelId(String(inpaintModelsList[0].id));
       } else {
         setInpaintModelId('');
       }
@@ -871,6 +1067,7 @@ export function ProjectProvider({ children }) {
     // core state
     project,
     setProject,
+    textureResolution: project?.textureResolution ?? 1024,
     models,
     setModels,
     loading,
@@ -910,6 +1107,7 @@ export function ProjectProvider({ children }) {
     setImageModels,
     refImageModels,
     setRefImageModels,
+    inpaintImageModels,
     selectedModelId,
     setSelectedModelId,
     inpaintModelId,
@@ -951,6 +1149,8 @@ export function ProjectProvider({ children }) {
     maskTool,
     inpaintPrompt,
     setInpaintPrompt,
+    inpaintMaskVisible,
+    setInpaintMaskVisible,
     inpaintSign,
     setInpaintSign,
     ctrlHeld,
@@ -991,8 +1191,10 @@ export function ProjectProvider({ children }) {
     loadProject,
     downloadAndParseModel,
     parseUploadedFile,
+    reuploadModelFile,
     loadMeshLayers,
     addMeshLayer,
+    prependMeshLayer,
     removeMeshLayer,
     refreshLayerTextures,
     refreshMeshRefView,

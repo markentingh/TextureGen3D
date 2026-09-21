@@ -2,7 +2,7 @@ import React, { useState, useRef, useEffect, memo } from 'react';
 import { createPortal } from 'react-dom';
 import { ProjectReferences } from '@/api/user/projectReferences';
 
-const ReferenceCell = memo(function ReferenceCell({ ref_, projectId, token, onToggleActive, onDelete, onNewImage, onEditImage, onPreview, showCheckbox = true }) {
+const ReferenceCell = memo(function ReferenceCell({ ref_, projectId, token, onToggleActive, onDelete, onNewImage, onEditImage, onChangeImage, onPreview, showCheckbox = true }) {
   const [menuOpen, setMenuOpen] = useState(false);
   const [menuPos, setMenuPos] = useState({ top: 0, left: 0 });
   const menuRef = useRef(null);
@@ -90,6 +90,14 @@ const ReferenceCell = memo(function ReferenceCell({ ref_, projectId, token, onTo
           >
             New Image
           </button>
+          {onChangeImage && (
+            <button
+              onClick={(e) => { e.stopPropagation(); setMenuOpen(false); onChangeImage(); }}
+              className="w-full px-3 py-1.5 text-left text-xs text-gray-700 dark:text-gray-200 hover:bg-gray-100 dark:hover:bg-gray-700 transition"
+            >
+              Change Image
+            </button>
+          )}
           <button
             onClick={(e) => { e.stopPropagation(); setMenuOpen(false); onEditImage(); }}
             className="w-full px-3 py-1.5 text-left text-xs text-gray-700 dark:text-gray-200 hover:bg-gray-100 dark:hover:bg-gray-700 transition"

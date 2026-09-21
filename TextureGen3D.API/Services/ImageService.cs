@@ -47,11 +47,18 @@ namespace TextureGen3D.API.Services
         Task<byte[]> GetProjectMeshLayerMaskAsync(Guid projectId, Guid meshId, Guid layerId);
         Task SaveProjectMeshLayerMaskThumbAsync(Guid projectId, Guid meshId, Guid layerId, byte[] fileData);
         Task<byte[]> GetProjectMeshLayerMaskThumbAsync(Guid projectId, Guid meshId, Guid layerId);
+        Task SaveProjectMeshLayerAngleThumbAsync(Guid projectId, Guid meshId, Guid layerId, byte[] fileData);
+        Task<byte[]> GetProjectMeshLayerAngleThumbAsync(Guid projectId, Guid meshId, Guid layerId);
         Task SaveProjectMeshLayerDepthMapAsync(Guid projectId, Guid meshId, Guid layerId, byte[] fileData);
         Task<byte[]> GetProjectMeshLayerDepthMapAsync(Guid projectId, Guid meshId, Guid layerId);
         Task DeleteProjectMeshLayerDepthMapAsync(Guid projectId, Guid meshId, Guid layerId);
         Task DeleteProjectMeshLayerFolderAsync(Guid projectId, Guid meshId, Guid layerId);
         Task DeleteProjectMeshFolderAsync(Guid projectId, Guid meshId);
+        // Projection images — caller-supplied generation inputs too large for
+        // SignalR messages; uploaded via API then referenced by GUID in the hubs
+        Task SaveProjectProjectionImageAsync(Guid projectId, Guid imageId, byte[] fileData);
+        Task<byte[]> GetProjectProjectionImageAsync(Guid projectId, Guid imageId);
+        Task DeleteProjectProjectionImageAsync(Guid projectId, Guid imageId);
     }
 
     public class ImageService : IImageService
@@ -433,6 +440,20 @@ namespace TextureGen3D.API.Services
             return await GetFromFileSystemAsync(relativePath);
         }
 
+        public async Task SaveProjectMeshLayerAngleThumbAsync(Guid projectId, Guid meshId, Guid layerId, byte[] fileData)
+        {
+            var relativePath = Path.Combine("projects", projectId.ToString(), "meshes", meshId.ToString(), layerId.ToString(), "angle_thumb.png");
+            if (_activeStorage == "azure") { await SaveToAzureBlobAsync(relativePath, fileData); return; }
+            await SaveToFileSystemAsync(relativePath, fileData);
+        }
+
+        public async Task<byte[]> GetProjectMeshLayerAngleThumbAsync(Guid projectId, Guid meshId, Guid layerId)
+        {
+            var relativePath = Path.Combine("projects", projectId.ToString(), "meshes", meshId.ToString(), layerId.ToString(), "angle_thumb.png");
+            if (_activeStorage == "azure") return await GetFromAzureBlobAsync(relativePath);
+            return await GetFromFileSystemAsync(relativePath);
+        }
+
         public async Task SaveProjectMeshLayerDepthMapAsync(Guid projectId, Guid meshId, Guid layerId, byte[] fileData)
         {
             var relativePath = Path.Combine("projects", projectId.ToString(), "meshes", meshId.ToString(), layerId.ToString(), "depthmap.jpg");
@@ -450,6 +471,28 @@ namespace TextureGen3D.API.Services
         public async Task DeleteProjectMeshLayerDepthMapAsync(Guid projectId, Guid meshId, Guid layerId)
         {
             var relativePath = Path.Combine("projects", projectId.ToString(), "meshes", meshId.ToString(), layerId.ToString(), "depthmap.jpg");
+            if (_activeStorage == "azure") { await DeleteFromAzureBlobAsync(relativePath); return; }
+            await DeleteFromFileSystemAsync(relativePath);
+        }
+
+        // Projection images: projects/{id}/projection/{imageId}.png
+        public async Task SaveProjectProjectionImageAsync(Guid projectId, Guid imageId, byte[] fileData)
+        {
+            var relativePath = Path.Combine("projects", projectId.ToString(), "projection", imageId.ToString() + ".png");
+            if (_activeStorage == "azure") { await SaveToAzureBlobAsync(relativePath, fileData); return; }
+            await SaveToFileSystemAsync(relativePath, fileData);
+        }
+
+        public async Task<byte[]> GetProjectProjectionImageAsync(Guid projectId, Guid imageId)
+        {
+            var relativePath = Path.Combine("projects", projectId.ToString(), "projection", imageId.ToString() + ".png");
+            if (_activeStorage == "azure") return await GetFromAzureBlobAsync(relativePath);
+            return await GetFromFileSystemAsync(relativePath);
+        }
+
+        public async Task DeleteProjectProjectionImageAsync(Guid projectId, Guid imageId)
+        {
+            var relativePath = Path.Combine("projects", projectId.ToString(), "projection", imageId.ToString() + ".png");
             if (_activeStorage == "azure") { await DeleteFromAzureBlobAsync(relativePath); return; }
             await DeleteFromFileSystemAsync(relativePath);
         }

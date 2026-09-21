@@ -14,7 +14,7 @@ import { useModal } from '@/context/modal';
  * camera angle's single reference; otherwise it shows the mesh's reference
  * list with active checkboxes.
  */
-export default function ReferenceImagesSection({ angleMode = false }) {
+export default function ReferenceImagesSection({ angleMode = false, maxRefs = 0 }) {
   const {
     id,
     token,
@@ -99,6 +99,73 @@ export default function ReferenceImagesSection({ angleMode = false }) {
     }
   };
 
+  // Opens the project-references picker. In angle mode the selection is stored
+  // on the camera angle; in mesh mode the selected project reference replaces
+  // `replaceRef` (Change Image) or — when maxRefs caps the list at 1 — whatever
+  // reference the mesh currently has.
+  const openProjectRefsModal = ({ replaceRef = null } = {}) => {
+    const meshDbId = selectedMesh ? meshDbIds[selectedMesh.key] : null;
+    const angleRefMode = angleMode && !!selectedAngleId;
+    const singleSelect = angleRefMode || !!replaceRef || maxRefs === 1;
+    showModal({
+      title: 'Project References',
+      className: 'max-w-[1200px]',
+      onClose: hideModal,
+      body: (
+        <ProjectReferencesModal
+          projectId={id}
+          token={token}
+          meshId={meshDbId}
+          cameraAngleMode={angleRefMode}
+          singleSelect={singleSelect}
+          selectedRefId={
+            angleRefMode
+              ? (cameraAngles.find((a) => a.id === selectedAngleId)?.projectReferenceId || null)
+              : (replaceRef?.id ?? (maxRefs === 1 ? meshRefView[0]?.id ?? null : null))
+          }
+          onSelectReference={async (refId) => {
+            try {
+              if (angleRefMode) {
+                const anglesApi = ProjectCameraAngles({ token });
+                await anglesApi.updateReference(id, selectedAngleId, refId);
+                setCameraAngles((prev) => prev.map((a) => a.id === selectedAngleId ? { ...a, projectReferenceId: refId } : a));
+                const ref = projectRefs.find((r) => r.id === refId);
+                setAngleRefView(ref ? [{ ...ref, active: true }] : []);
+              } else {
+                if (!meshDbId) return;
+                const meshRefApi = ProjectMeshReferences({ token });
+                const toRemove = replaceRef ? [replaceRef] : (maxRefs === 1 ? meshRefView : []);
+                const keepActive = replaceRef ? replaceRef.active : true;
+                for (const r of toRemove) {
+                  if (r.meshRefId && r.id !== refId) {
+                    await meshRefApi.delete(id, r.meshRefId);
+                  }
+                }
+                const addRes = await meshRefApi.add(id, meshDbId, refId);
+                const createdId = addRes.data?.data?.id;
+                if (createdId && !keepActive) {
+                  await meshRefApi.updateActive(id, createdId, false);
+                }
+                await handleModalMeshRefChanged();
+                refreshMeshRefView();
+              }
+              hideModal();
+            } catch (err) {
+              console.error('Failed to select reference:', err);
+            }
+          }}
+          onClose={hideModal}
+          onAdded={handleModalMeshRefChanged}
+          onDeleted={handleModalMeshRefChanged}
+          onProjectReferencesChanged={async () => {
+            await handleModalProjectRefsChanged();
+            handleModalMeshRefChanged();
+          }}
+        />
+      ),
+    });
+  };
+
   const openRefModal = ({ reference, mode, isAngleRef, angleId }) => {
     showModal({
       title: mode === 'edit' ? 'Edit Reference' : 'New Reference',
@@ -176,43 +243,12 @@ export default function ReferenceImagesSection({ angleMode = false }) {
             }}
             onNewImage={() => openRefModal({ reference: ref, mode: 'new', isAngleRef: angleMode, angleId: selectedAngleId })}
             onEditImage={() => openRefModal({ reference: ref, mode: 'edit' })}
+            onChangeImage={() => openProjectRefsModal({ replaceRef: ref })}
           />
         ))}
-        {(!angleMode || angleRefView.length === 0) && (
+        {(!angleMode || angleRefView.length === 0) && (!maxRefs || (angleMode ? angleRefView : meshRefView).length < maxRefs) && (
           <div
-            onClick={() => showModal({
-              title: 'Project References',
-              className: 'max-w-[1200px]',
-              body: (
-                <ProjectReferencesModal
-                  projectId={id}
-                  token={token}
-                  meshId={selectedMesh ? meshDbIds[selectedMesh.key] : null}
-                  cameraAngleMode={angleMode && !!selectedAngleId}
-                  selectedRefId={angleMode ? (cameraAngles.find((a) => a.id === selectedAngleId)?.projectReferenceId || null) : null}
-                  onSelectReference={async (refId) => {
-                    if (!selectedAngleId) return;
-                    try {
-                      const anglesApi = ProjectCameraAngles({ token });
-                      await anglesApi.updateReference(id, selectedAngleId, refId);
-                      setCameraAngles((prev) => prev.map((a) => a.id === selectedAngleId ? { ...a, projectReferenceId: refId } : a));
-                      const ref = projectRefs.find((r) => r.id === refId);
-                      setAngleRefView(ref ? [{ ...ref, active: true }] : []);
-                      hideModal();
-                    } catch (err) {
-                      console.error('Failed to set camera angle reference:', err);
-                    }
-                  }}
-                  onClose={hideModal}
-                  onAdded={handleModalMeshRefChanged}
-                  onDeleted={handleModalMeshRefChanged}
-                  onProjectReferencesChanged={async () => {
-                    await handleModalProjectRefsChanged();
-                    handleModalMeshRefChanged();
-                  }}
-                />
-              ),
-            })}
+            onClick={() => openProjectRefsModal()}
             className={`relative border-2 border-dashed rounded-lg flex flex-col items-center justify-center cursor-pointer transition border-gray-300 dark:border-gray-600 hover:border-purple-400 dark:hover:border-purple-500`}
             style={{ width: 100, height: 80 }}
           >

@@ -2,6 +2,7 @@ import React, { useRef, useEffect, useState, useCallback, forwardRef, useImperat
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { createThumbScene, disposeThumbScene, generateAngleThumbnail } from '@/helpers/camera-angle';
+import Icon from '@/components/ui/icon';
 
 /**
  * ModelViewer — full-screen Three.js canvas that renders the selected mesh.
@@ -29,6 +30,10 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
   const controlsRef = useRef(null);
   const currentMeshRef = useRef(null);
   const animationFrameRef = useRef(null);
+  const ringElRef = useRef(null);
+  // Brush ring state — shared between the imperative setBrushRingActive()
+  // (tool changes via project context), pointer handlers, and animate().
+  const ringStateRef = useRef({ visible: false, x: 0, y: 0, d: 0, appliedD: -1, dirty: false });
   const gridRef = useRef(null);
   const orthoCameraRef = useRef(null);
   const onMeshLoadedRef = useRef(onMeshLoaded);
@@ -42,6 +47,7 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
   const paintRttRef = useRef(null);        // lazily-built offscreen paint scene (RTT)
   const shaderLayerIdsRef = useRef([]);    // shader slot index -> layerId
   const whiteMaskTexRef = useRef(null);    // 1x1 white dummy for layers without a mask
+  const layerBuildIdRef = useRef(0);       // stale-build guard for async compositing
   const perspCameraRef = useRef(null);
 
   // ── Mask painting helpers (GPU render-to-texture, ping-pong) ──
@@ -208,6 +214,21 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
     entry.initialized = true;
   };
 
+  // Eye toggle on the light gizmo — u_unlit bypasses the layer shader's
+  // shadow term; the scene's directional lights are also zeroed so the grey
+  // MeshStandardMaterial fallback renders flat too.
+  const toggleUnlit = () => {
+    const next = !unlitRef.current;
+    unlitRef.current = next;
+    setUnlit(next);
+    currentMeshRef.current?.traverse((child) => {
+      const u = child.isMesh && child.material && child.material.uniforms;
+      if (u && u.u_unlit) u.u_unlit.value = next ? 1 : 0;
+    });
+    if (dirLight1Ref.current) dirLight1Ref.current.intensity = next ? 0 : 1.0;
+    if (dirLight2Ref.current) dirLight2Ref.current.intensity = next ? 0 : 0.5;
+  };
+
   // Push a mask's current front texture into the live layer shader
   const syncMaskUniform = (layerId, texture) => {
     const slot = shaderLayerIdsRef.current.indexOf(layerId);
@@ -219,6 +240,76 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
         uniforms[`hasMask${slot}`].value = 1;
       }
     });
+  };
+
+  // ── CPU layer compositing ──
+  // Bakes a set of layers into a single image so the shader only needs a
+  // couple of sampler2D slots regardless of the layer count.
+
+  const loadImgEl = (src) =>
+    new Promise((res, rej) => {
+      const i = new Image();
+      i.onload = () => res(i);
+      i.onerror = rej;
+      i.src = src;
+    });
+
+  // Composite items (ordered top→bottom) onto a canvas, matching the layer
+  // shader's semantics: mask.r lerps the uvmap alpha (white = visible) and
+  // near-black rgb is treated as empty (contentMask = step(0.01, length(rgb))).
+  const compositeLayerImages = async (items) => {
+    if (!items.length) return null;
+    const imgs = await Promise.all(items.map((e) => loadImgEl(e.url)));
+    const w = imgs[0].naturalWidth || imgs[0].width;
+    const h = imgs[0].naturalHeight || imgs[0].height;
+    const canvas = document.createElement('canvas');
+    canvas.width = w;
+    canvas.height = h;
+    const ctx = canvas.getContext('2d');
+    const tmp = document.createElement('canvas');
+    tmp.width = w;
+    tmp.height = h;
+    const tctx = tmp.getContext('2d', { willReadFrequently: true });
+    const mc = document.createElement('canvas');
+    mc.width = w;
+    mc.height = h;
+    const mctx = mc.getContext('2d', { willReadFrequently: true });
+
+    for (let i = items.length - 1; i >= 0; i--) { // bottom → top
+      tctx.clearRect(0, 0, w, h);
+      tctx.drawImage(imgs[i], 0, 0, w, h);
+      const imgData = tctx.getImageData(0, 0, w, h);
+      let md = null;
+      if (items[i].maskDataUrl) {
+        const maskImg = await loadImgEl(items[i].maskDataUrl);
+        mctx.clearRect(0, 0, w, h);
+        mctx.drawImage(maskImg, 0, 0, w, h);
+        md = mctx.getImageData(0, 0, w, h).data;
+      }
+      const d = imgData.data;
+      for (let p = 0; p < d.length; p += 4) {
+        const r = d[p], g = d[p + 1], b = d[p + 2];
+        if (r * r + g * g + b * b < 7) {
+          d[p + 3] = 0;
+        } else if (md) {
+          d[p + 3] = Math.round((d[p + 3] * md[p]) / 255);
+        }
+      }
+      tctx.putImageData(imgData, 0, 0);
+      ctx.drawImage(tmp, 0, 0);
+    }
+    return canvas;
+  };
+
+  // Upload a composited canvas as a THREE texture (tracked for disposal).
+  // flipY=true matches the uvmap textures — canvas row 0 is v=1.
+  const canvasToLayerTexture = async (canvas) => {
+    const blob = await new Promise((r) => canvas.toBlob(r, 'image/png'));
+    if (!blob) return null;
+    const url = URL.createObjectURL(blob);
+    const tex = await new THREE.TextureLoader().loadAsync(url);
+    tex.flipY = true;
+    return { tex, url };
   };
 
   // Mesh-wide inpaint mask — same ping-pong pair as layer masks, but cleared
@@ -238,6 +329,16 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
     return entry;
   };
 
+  // Free the inpaint ping-pong buffers (mesh swap / unmount). Tool switches
+  // keep them alive so re-selecting the inpaint tool restores the mask.
+  const disposeInpaintEntry = () => {
+    if (inpaintMaskRef.current) {
+      inpaintMaskRef.current.a.dispose();
+      inpaintMaskRef.current.b.dispose();
+      inpaintMaskRef.current = null;
+    }
+  };
+
   // Bind the inpaint mask + tile texture into the live layer shader materials
   const bindInpaintOverlay = (entry) => {
     currentMeshRef.current?.traverse((child) => {
@@ -245,7 +346,7 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
       if (u && u.u_inpaintMask) {
         u.u_inpaintMask.value = entry.front.texture;
         u.u_inpaintTile.value = inpaintTileTexRef.current;
-        u.u_hasInpaint.value = 1;
+        u.u_hasInpaint.value = inpaintVisibleRef.current ? 1 : 0;
       }
     });
   };
@@ -264,7 +365,6 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
   const gizmoInteractionRef = useRef(null);
   const raycasterRef = useRef(new THREE.Raycaster());
   const hoveredRingRef = useRef(null);
-  const brushRingRef = useRef(null);
 
   // Lighting gizmo refs
   const lightGizmoSceneRef = useRef(null);
@@ -275,12 +375,16 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
   const lightGizmoFillRef = useRef(null);
   const lightGizmoInteractionRef = useRef(null);
   const dirLight1Ref = useRef(null);
+  const dirLight2Ref = useRef(null);
   const lightGizmoSizeRef = useRef(70);
+  const [unlit, setUnlit] = useState(false); // eye toggle on the light gizmo — flat shading
+  const unlitRef = useRef(false);
 
   // Inpainting overlay — mesh-wide mask + repeating tile texture
   const inpaintMaskRef = useRef(null);    // { a, b, front, initialized }
   const inpaintTileTexRef = useRef(null);
   const inpaintActiveRef = useRef(false);
+  const inpaintVisibleRef = useRef(true); // eye toggle — hides the overlay without clearing the mask
 
   // GPU resources owned by the current layer-texture batch — disposed on the
   // next updateLayerTextures call so rebuilds don't leak textures/blob URLs
@@ -385,6 +489,7 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
     const dirLight2 = new THREE.DirectionalLight(0xffffff, 0.5);
     dirLight2.position.set(-10, 5, -10);
     scene.add(dirLight2);
+    dirLight2Ref.current = dirLight2;
 
     // Orbit controls
     const controls = new OrbitControls(camera, renderer.domElement);
@@ -630,6 +735,14 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
     // Pre-allocated temp objects for the animation loop (avoid per-frame allocation)
     const animTmpDir = new THREE.Vector3();
     const animTmpCamDir = new THREE.Vector3();
+    // Change-detection snapshots — gizmo/light sync only runs when something
+    // actually moved instead of every frame
+    const lastGizmoQuat = new THREE.Quaternion();
+    const lastGizmoUp = new THREE.Vector3();
+    const lastBulbPos = new THREE.Vector3();
+    // Forces a gizmo-shade recompute (e.g. when a hover ends — baseOpacity
+    // isn't the computed shade for back-facing sprites)
+    let gizmoSyncDirty = true;
 
     // Helper: apply zoom-aware frustum offset to the ortho camera.
     // Three.js ortho zoom keeps (left+right)/2 fixed but shrinks half-width
@@ -649,9 +762,51 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
       lastOrthoZoomRef.current = z;
     };
 
+    // Canvas metrics cache — refreshed once here and again only on window
+    // resize, so neither pointer handlers nor the animation loop do per-frame
+    // layout reads (the sidebar never changes size without a resize/zoom).
+    let canvasRect = null;
+    let containerW = 0;
+    let containerH = 0;
+    const syncCanvasMetrics = () => {
+      canvasRect = renderer.domElement.getBoundingClientRect();
+      containerW = container.clientWidth;
+      containerH = container.clientHeight;
+    };
+    syncCanvasMetrics();
+    const getCanvasRect = () => {
+      if (!canvasRect) syncCanvasMetrics();
+      return canvasRect;
+    };
+
+    // Brush ring — element created/destroyed via the imperative
+    // setBrushRingActive() (the project context calls it when maskTool
+    // changes). DOM writes deferred to the animation loop: one style update
+    // per frame max, positioned via `transform` (compositor-only).
+    const ringState = ringStateRef.current;
+
     // ── Animation loop ──
     const animate = () => {
       animationFrameRef.current = requestAnimationFrame(animate);
+
+      // Apply pending brush-ring DOM writes — one write per frame max.
+      if (ringState.dirty) {
+        ringState.dirty = false;
+        const ring = ringElRef.current;
+        if (ring) {
+          if (!ringState.visible) {
+            if (ring.style.display !== 'none') ring.style.display = 'none';
+          } else {
+            if (ring.style.display !== 'block') ring.style.display = 'block';
+            if (ringState.d !== ringState.appliedD) {
+              ringState.appliedD = ringState.d;
+              ring.style.width = `${ringState.d}px`;
+              ring.style.height = `${ringState.d}px`;
+            }
+            ring.style.transform = `translate(${ringState.x}px, ${ringState.y}px) translate(-50%, -50%)`;
+          }
+        }
+      }
 
       // Apply zoom-aware ortho frustum offset before controls.update() so
       // the projection matrix is correct when OrbitControls uses it.
@@ -664,8 +819,13 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
 
       // Sync gizmo axis orientation with main camera so the axis arrows reflect
       // the current view direction (like Blender's navigation gizmo).
+      // Skipped unless the camera orientation or up vector changed.
       const mainCam = cameraRef.current;
-      if (mainCam && gizmoCameraRef.current) {
+      if (mainCam && gizmoCameraRef.current &&
+          (gizmoSyncDirty || !mainCam.quaternion.equals(lastGizmoQuat) || !mainCam.up.equals(lastGizmoUp))) {
+        gizmoSyncDirty = false;
+        lastGizmoQuat.copy(mainCam.quaternion);
+        lastGizmoUp.copy(mainCam.up);
         mainCam.getWorldDirection(animTmpDir);
         gizmoCameraRef.current.position.copy(animTmpDir).multiplyScalar(-10);
         gizmoCameraRef.current.up.copy(mainCam.up);
@@ -695,9 +855,11 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
 
       // Update lightbulb icon position on the ring based on current light direction.
       // The light orbits in the XZ plane; map (x, z) to the ring's (x, y).
+      // Skipped unless the light actually moved.
       const light = dirLight1Ref.current;
       const bulbIcon = lightGizmoIconRef.current;
-      if (light && bulbIcon) {
+      if (light && bulbIcon && !light.position.equals(lastBulbPos)) {
+        lastBulbPos.copy(light.position);
         const lx = light.position.x;
         const lz = light.position.z;
         const len = Math.sqrt(lx * lx + lz * lz) || 1;
@@ -714,8 +876,8 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
         });
       }
 
-      const w = container.clientWidth;
-      const h = container.clientHeight;
+      const w = containerW;
+      const h = containerH;
       const gs = gizmoSizeRef.current;
 
       // Clear and render main scene full screen
@@ -793,6 +955,8 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
       orthoCameraRef.current.updateProjectionMatrix();
       lastOrthoZoomRef.current = z;
       renderer.setSize(w, h);
+      // Refresh the cached rect/dims read by pointer handlers and animate()
+      syncCanvasMetrics();
     };
     window.addEventListener('resize', handleResize);
 
@@ -803,7 +967,7 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
     const freeSpherePickArray = [null];
 
     const getGizmoNDC = (e) => {
-      const rect = renderer.domElement.getBoundingClientRect();
+      const rect = getCanvasRect();
       const gs = gizmoSizeRef.current;
       const pad = 12;
       // Gizmo region: shifted down-left by pad from top-right corner
@@ -817,7 +981,7 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
     };
 
     const isPointInGizmoRegion = (e) => {
-      const rect = renderer.domElement.getBoundingClientRect();
+      const rect = getCanvasRect();
       const gs = gizmoSizeRef.current;
       const pad = 12;
       return e.clientX >= rect.right - gs - pad && e.clientX <= rect.right - pad &&
@@ -826,7 +990,7 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
 
     // Lighting gizmo region (left of the navigation gizmo, half size, centered)
     const getLightGizmoNDC = (e) => {
-      const rect = renderer.domElement.getBoundingClientRect();
+      const rect = getCanvasRect();
       const gs = gizmoSizeRef.current;
       const lgs = lightGizmoSizeRef.current;
       const pad = 12;
@@ -842,7 +1006,7 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
     };
 
     const isPointInLightGizmoRegion = (e) => {
-      const rect = renderer.domElement.getBoundingClientRect();
+      const rect = getCanvasRect();
       const gs = gizmoSizeRef.current;
       const lgs = lightGizmoSizeRef.current;
       const pad = 12;
@@ -887,6 +1051,10 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
     };
 
     const applyHover = (obj) => {
+      // Shades need recompute next frame — hover changes which sprite the
+      // sync loop must skip, and un-hover restores baseOpacity (not the
+      // camera-relative shade)
+      gizmoSyncDirty = true;
       // Reset previous hover
       if (hoveredRingRef.current) {
         const prev = hoveredRingRef.current;
@@ -934,6 +1102,7 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
 
     // ── Mask painting (GPU render-to-texture, ping-pong) ──
     const maskRayNdc = new THREE.Vector2();
+    const maskFaceNormal = new THREE.Vector3();
 
     // Brush radius in world units — the Size slider is screen px, converted to
     // world units at the hit's depth so the painted circle matches the cursor
@@ -944,7 +1113,7 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
       const el = rendererRef.current?.domElement;
       if (!cfg || !cam || !el) return 0;
       const rPx = Math.max(0.5, (cfg.size || 50) / 2);
-      const rectH = el.getBoundingClientRect().height || 1;
+      const rectH = getCanvasRect().height || 1;
       if (cam.isOrthographicCamera) {
         const worldH = (cam.top - cam.bottom) / (cam.zoom || 1);
         return rPx * (worldH / rectH);
@@ -961,30 +1130,34 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
     // the Size slider value in px (the brush's world-space footprint varies
     // with UV density, so projecting it made the ring misleading).
     const hideBrushRing = () => {
-      if (brushRingRef.current) brushRingRef.current.style.display = 'none';
+      if (ringState.visible) {
+        ringState.visible = false;
+        ringState.dirty = true;
+      }
     };
     const updateBrushRing = (e) => {
-      const ring = brushRingRef.current;
       const el = renderer.domElement;
       const cfg = maskPaintCfgRef.current?.current;
-      if (!ring || !cfg) return;
+      if (!cfg) {
+        hideBrushRing();
+        return;
+      }
       // pointermove is bound on window — when the pointer is over an overlay
       // (toolbar, panels, hints) e.target is that element, not the canvas.
       if (e.target !== el) {
         hideBrushRing();
         return;
       }
-      const rect = el.getBoundingClientRect();
+      const rect = getCanvasRect();
       if (e.clientX < rect.left || e.clientX > rect.right || e.clientY < rect.top || e.clientY > rect.bottom) {
         hideBrushRing();
         return;
       }
-      const d = Math.max(2, cfg.size || 50);
-      ring.style.display = 'block';
-      ring.style.width = `${d}px`;
-      ring.style.height = `${d}px`;
-      ring.style.left = `${e.clientX - rect.left}px`;
-      ring.style.top = `${e.clientY - rect.top}px`;
+      ringState.x = e.clientX - rect.left;
+      ringState.y = e.clientY - rect.top;
+      ringState.d = Math.max(2, cfg.size || 50);
+      ringState.visible = true;
+      ringState.dirty = true;
       el.style.cursor = 'none';
     };
 
@@ -992,7 +1165,7 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
       const mesh = currentMeshRef.current;
       const cam = cameraRef.current;
       if (!mesh || !cam) return null;
-      const rect = renderer.domElement.getBoundingClientRect();
+      const rect = getCanvasRect();
       maskRayNdc.set(
         ((clientX - rect.left) / rect.width) * 2 - 1,
         -((clientY - rect.top) / rect.height) * 2 + 1
@@ -1000,7 +1173,12 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
       raycasterRef.current.setFromCamera(maskRayNdc, cam);
       const intersects = raycasterRef.current.intersectObject(mesh, true);
       const hit = intersects.length > 0 ? intersects[0] : null;
-      return hit && hit.uv && hit.face ? hit : null;
+      if (!hit || !hit.uv || !hit.face) return null;
+      // Reject backfaces — materials are DoubleSide so the raycaster can
+      // return triangles facing away from the camera; those can't be painted
+      maskFaceNormal.copy(hit.face.normal).transformDirection(hit.object.matrixWorld);
+      if (maskFaceNormal.dot(raycasterRef.current.ray.direction) > 0) return null;
+      return hit;
     };
 
     const stampMaskAtHit = (layerId, hit) => {
@@ -1135,7 +1313,7 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
 
       // Start a drag for all types. For axis, a quick click (no significant move)
       // will snap the view on pointerup.
-      const rect = renderer.domElement.getBoundingClientRect();
+      const rect = getCanvasRect();
       const gs = gizmoSizeRef.current;
       const pad = 12;
       const cx = rect.right - gs / 2 - pad;
@@ -1367,11 +1545,9 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
       const next = Math.min(300, Math.max(1, size + (e.deltaY < 0 ? step : -step)));
       cfg.setSize?.(next);
       // React state lands async — resize the ring now so it tracks the wheel
-      const ring = brushRingRef.current;
-      if (ring && ring.style.display === 'block') {
-        const d = Math.max(2, next);
-        ring.style.width = `${d}px`;
-        ring.style.height = `${d}px`;
+      if (ringState.visible) {
+        ringState.d = Math.max(2, next);
+        ringState.dirty = true;
       }
     };
 
@@ -1396,6 +1572,7 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
       if (renderer.domElement && container.contains(renderer.domElement)) {
         container.removeChild(renderer.domElement);
       }
+      ringElRef.current?.remove();
       // Dispose main scene
       scene.traverse((obj) => {
         if (obj.geometry) obj.geometry.dispose();
@@ -1429,18 +1606,124 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
       for (const t of layerGpuRef.current.textures) t.dispose();
       for (const u of layerGpuRef.current.blobUrls) URL.revokeObjectURL(u);
       layerGpuRef.current = { textures: [], blobUrls: [] };
+      disposeInpaintEntry();
+      inpaintTileTexRef.current?.dispose();
+      inpaintTileTexRef.current = null;
     };
   }, []);
+
+  // Hidden-canvas orthographic render of the mesh from the current camera
+  // view (or an explicit rotation). materialFor(child) may return a material
+  // to swap in for the capture; null keeps the live (composite) material.
+  // The clone shares geometry/materials with the live mesh — only materials
+  // created by materialFor are disposed.
+  // Renders on the MAIN renderer into a render target — the composite layer
+  // shader samples mask render-target textures (inpaint RT, per-layer mask
+  // RTs) that are bound to its WebGL context. A separate hidden renderer
+  // would sample them as black, discarding every fragment.
+  const captureMeshViewImage = (size, { rotation = null, clearColor = 0x000000, materialFor = null } = {}) => {
+    const renderer = rendererRef.current;
+    const mainCamera = cameraRef.current;
+    const mesh = currentMeshRef.current;
+    if (!renderer || !mainCamera || !mesh) return null;
+
+    const rt = new THREE.WebGLRenderTarget(size, size, {
+      format: THREE.RGBAFormat,
+      type: THREE.UnsignedByteType,
+    });
+
+    const captureScene = new THREE.Scene();
+
+    const viewMesh = mesh.clone(true);
+    const tempMaterials = [];
+    if (materialFor) {
+      viewMesh.traverse((child) => {
+        if (child.isMesh) {
+          const m = materialFor(child);
+          if (m) {
+            child.material = m;
+            tempMaterials.push(m);
+          }
+        }
+      });
+    }
+    captureScene.add(viewMesh);
+
+    const box = new THREE.Box3().setFromObject(viewMesh);
+    const center = box.getCenter(new THREE.Vector3());
+    const size3 = box.getSize(new THREE.Vector3());
+    const maxDim = Math.max(size3.x, size3.y, size3.z) || 1;
+    viewMesh.position.sub(center);
+
+    const frustumHalf = maxDim / 2 * 1.1;
+    const viewCamera = new THREE.OrthographicCamera(
+      -frustumHalf, frustumHalf,
+      frustumHalf, -frustumHalf,
+      0.1, maxDim * 4
+    );
+    const camDistance = maxDim * 2;
+    if (rotation) {
+      viewCamera.rotation.set(
+        THREE.MathUtils.degToRad(rotation.x || 0),
+        THREE.MathUtils.degToRad(rotation.y || 0),
+        THREE.MathUtils.degToRad(rotation.z || 0),
+      );
+      viewCamera.updateMatrixWorld();
+      const viewDir = new THREE.Vector3(0, 0, -1).applyQuaternion(viewCamera.quaternion);
+      viewCamera.position.copy(viewDir.clone().multiplyScalar(-camDistance));
+      viewCamera.up.set(0, 1, 0);
+      viewCamera.lookAt(0, 0, 0);
+    } else {
+      const viewDir = new THREE.Vector3();
+      mainCamera.getWorldDirection(viewDir);
+      viewCamera.position.copy(viewDir.clone().multiplyScalar(-camDistance));
+      viewCamera.up.copy(mainCamera.up);
+      viewCamera.lookAt(0, 0, 0);
+    }
+
+    // Save clear state, render into the RT, read back — always restore the
+    // renderer's target/clear state and free the RT + temp materials
+    const prevClearColor = renderer.getClearColor(new THREE.Color());
+    const prevClearAlpha = renderer.getClearAlpha();
+    const buf = new Uint8Array(size * size * 4);
+    try {
+      renderer.setRenderTarget(rt);
+      renderer.setClearColor(clearColor, 1);
+      renderer.clear();
+      renderer.render(captureScene, viewCamera);
+      renderer.readRenderTargetPixels(rt, 0, 0, size, size, buf);
+    } finally {
+      renderer.setClearColor(prevClearColor, prevClearAlpha);
+      renderer.setRenderTarget(null);
+      rt.dispose();
+      tempMaterials.forEach((m) => m.dispose());
+    }
+
+    // Flip rows (GL bottom-up → PNG top-down)
+    const canvas = document.createElement('canvas');
+    canvas.width = size;
+    canvas.height = size;
+    const ctx = canvas.getContext('2d');
+    const img = ctx.createImageData(size, size);
+    for (let y = 0; y < size; y++) {
+      const src = (size - 1 - y) * size * 4;
+      img.data.set(buf.subarray(src, src + size * 4), y * size * 4);
+    }
+    ctx.putImageData(img, 0, 0);
+    return canvas.toDataURL('image/png');
+  };
 
   // Expose methods to parent via ref
   useImperativeHandle(ref, () => ({
     getCameraAngle() {
       const cam = cameraRef.current;
       if (!cam) return null;
+      // 2 decimals — the CameraAngle column is VARCHAR(64), full-precision
+      // radToDeg output overflows it
       return {
-        x: THREE.MathUtils.radToDeg(cam.rotation.x),
-        y: THREE.MathUtils.radToDeg(cam.rotation.y),
-        z: THREE.MathUtils.radToDeg(cam.rotation.z),
+        x: Math.round(THREE.MathUtils.radToDeg(cam.rotation.x) * 100) / 100,
+        y: Math.round(THREE.MathUtils.radToDeg(cam.rotation.y) * 100) / 100,
+        z: Math.round(THREE.MathUtils.radToDeg(cam.rotation.z) * 100) / 100,
       };
     },
     captureThumbnail(size = 75, rotation = null) {
@@ -1603,83 +1886,137 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
       const depthScene = new THREE.Scene();
       depthScene.background = new THREE.Color(0x000000);
 
-      // Clone the mesh with depth material
-      const depthMesh = mesh.clone(true);
-      depthMesh.traverse((child) => {
-        if (child.isMesh) {
-          if (child.material) {
-            if (Array.isArray(child.material)) child.material.forEach((m) => m.dispose());
-            else child.material.dispose();
+      try {
+        // Clone the mesh with depth material
+        const depthMesh = mesh.clone(true);
+        depthMesh.traverse((child) => {
+          if (child.isMesh) {
+            if (child.material) {
+              if (Array.isArray(child.material)) child.material.forEach((m) => m.dispose());
+              else child.material.dispose();
+            }
+            child.material = new THREE.MeshDepthMaterial({
+              depthPacking: THREE.BasicDepthPacking,
+              side: THREE.FrontSide,
+            });
           }
-          child.material = new THREE.MeshDepthMaterial({
-            depthPacking: THREE.BasicDepthPacking,
-            side: THREE.FrontSide,
-          });
-        }
-      });
-      depthScene.add(depthMesh);
+        });
+        depthScene.add(depthMesh);
 
-      // Compute bounding box
-      const box = new THREE.Box3().setFromObject(depthMesh);
-      const center = box.getCenter(new THREE.Vector3());
-      const size3 = box.getSize(new THREE.Vector3());
-      const maxDim = Math.max(size3.x, size3.y, size3.z) || 1;
-      depthMesh.position.sub(center);
+        // Compute bounding box
+        const box = new THREE.Box3().setFromObject(depthMesh);
+        const center = box.getCenter(new THREE.Vector3());
+        const size3 = box.getSize(new THREE.Vector3());
+        const maxDim = Math.max(size3.x, size3.y, size3.z) || 1;
+        depthMesh.position.sub(center);
 
-      // Use an orthographic camera for the depth map — no perspective distortion,
-      // and depth values map linearly across the near/far range.
-      const frustumHalf = maxDim / 2 * 1.1; // small padding so the mesh isn't clipped
-      const depthCamera = new THREE.OrthographicCamera(
-        -frustumHalf, frustumHalf,
-        frustumHalf, -frustumHalf,
-        0.1, maxDim * 4
-      );
-
-      // Position the camera along the view direction
-      const camDistance = maxDim * 2; // well outside the mesh
-      if (rotation) {
-        depthCamera.rotation.set(
-          THREE.MathUtils.degToRad(rotation.x || 0),
-          THREE.MathUtils.degToRad(rotation.y || 0),
-          THREE.MathUtils.degToRad(rotation.z || 0),
+        // Use an orthographic camera for the depth map — no perspective distortion,
+        // and depth values map linearly across the near/far range.
+        const frustumHalf = maxDim / 2 * 1.1; // small padding so the mesh isn't clipped
+        const depthCamera = new THREE.OrthographicCamera(
+          -frustumHalf, frustumHalf,
+          frustumHalf, -frustumHalf,
+          0.1, maxDim * 4
         );
-        depthCamera.updateMatrixWorld();
-        const viewDir = new THREE.Vector3(0, 0, -1);
-        viewDir.applyQuaternion(depthCamera.quaternion);
-        depthCamera.position.copy(viewDir.clone().multiplyScalar(-camDistance));
-        depthCamera.up.set(0, 1, 0);
-        depthCamera.lookAt(0, 0, 0);
-      } else {
-        const viewDir = new THREE.Vector3();
-        mainCamera.getWorldDirection(viewDir);
-        depthCamera.position.copy(viewDir.clone().multiplyScalar(-camDistance));
-        depthCamera.up.copy(mainCamera.up);
-        depthCamera.lookAt(0, 0, 0);
-      }
 
-      // Tighten near/far planes tightly around the mesh so depth values
-      // span the full 0–1 range — brighter whites for near surfaces,
-      // darker greys for far surfaces.
-      depthCamera.near = camDistance - maxDim / 2 * 1.05;
-      depthCamera.far = camDistance + maxDim / 2 * 1.05;
-      depthCamera.updateProjectionMatrix();
-
-      depthRenderer.render(depthScene, depthCamera);
-      const dataUrl = hiddenCanvas.toDataURL('image/png');
-
-      // Cleanup: dispose renderer, lose WebGL context, remove hidden canvas
-      depthScene.traverse((obj) => {
-        if (obj.geometry) obj.geometry.dispose();
-        if (obj.material) {
-          if (Array.isArray(obj.material)) obj.material.forEach((m) => m.dispose());
-          else obj.material.dispose();
+        // Position the camera along the view direction
+        const camDistance = maxDim * 2; // well outside the mesh
+        if (rotation) {
+          depthCamera.rotation.set(
+            THREE.MathUtils.degToRad(rotation.x || 0),
+            THREE.MathUtils.degToRad(rotation.y || 0),
+            THREE.MathUtils.degToRad(rotation.z || 0),
+          );
+          depthCamera.updateMatrixWorld();
+          const viewDir = new THREE.Vector3(0, 0, -1);
+          viewDir.applyQuaternion(depthCamera.quaternion);
+          depthCamera.position.copy(viewDir.clone().multiplyScalar(-camDistance));
+          depthCamera.up.set(0, 1, 0);
+          depthCamera.lookAt(0, 0, 0);
+        } else {
+          const viewDir = new THREE.Vector3();
+          mainCamera.getWorldDirection(viewDir);
+          depthCamera.position.copy(viewDir.clone().multiplyScalar(-camDistance));
+          depthCamera.up.copy(mainCamera.up);
+          depthCamera.lookAt(0, 0, 0);
         }
-      });
-      depthRenderer.dispose();
-      depthRenderer.forceContextLoss();
-      hiddenCanvas.remove();
 
+        // Tighten near/far planes tightly around the mesh so depth values
+        // span the full 0–1 range — brighter whites for near surfaces,
+        // darker greys for far surfaces.
+        depthCamera.near = camDistance - maxDim / 2 * 1.05;
+        depthCamera.far = camDistance + maxDim / 2 * 1.05;
+        depthCamera.updateProjectionMatrix();
+
+        depthRenderer.render(depthScene, depthCamera);
+        return hiddenCanvas.toDataURL('image/png');
+      } finally {
+        // Always clean up: dispose renderer, lose WebGL context, remove hidden canvas
+        depthScene.traverse((obj) => {
+          if (obj.geometry) obj.geometry.dispose();
+          if (obj.material) {
+            if (Array.isArray(obj.material)) obj.material.forEach((m) => m.dispose());
+            else obj.material.dispose();
+          }
+        });
+        depthRenderer.dispose();
+        depthRenderer.forceContextLoss();
+        hiddenCanvas.remove();
+      }
+    },
+
+    /**
+     * Render the mesh with its composite layer materials — unlit, white
+     * background, no inpaint overlay — from the current camera view.
+     * Uniforms are shared with the live materials: toggle, render
+     * synchronously, restore — no frame ever shows the change.
+     */
+    captureCompositeImage(size = 1024) {
+      const mats = [];
+      currentMeshRef.current?.traverse((c) => {
+        if (c.isMesh && c.material?.uniforms) mats.push(c.material);
+      });
+      mats.forEach((m) => {
+        if (m.uniforms.u_unlit) m.uniforms.u_unlit.value = 1;
+        if (m.uniforms.u_hasInpaint) m.uniforms.u_hasInpaint.value = 0;
+      });
+      const dataUrl = captureMeshViewImage(size, { clearColor: 0xffffff });
+      mats.forEach((m) => {
+        if (m.uniforms.u_unlit) m.uniforms.u_unlit.value = unlitRef.current ? 1 : 0;
+        if (m.uniforms.u_hasInpaint) m.uniforms.u_hasInpaint.value = inpaintActiveRef.current && inpaintVisibleRef.current ? 1 : 0;
+      });
       return dataUrl;
+    },
+
+    /**
+     * Render the raw inpaint mask on the mesh — white where painted, black
+     * elsewhere, black background — from the current camera view.
+     */
+    captureInpaintMaskImage(size = 1024) {
+      const maskTex = inpaintMaskRef.current?.front?.texture;
+      if (!maskTex) return null;
+      return captureMeshViewImage(size, {
+        clearColor: 0x000000,
+        materialFor: () => new THREE.ShaderMaterial({
+          uniforms: { u_mask: { value: maskTex } },
+          vertexShader: `
+            varying vec2 vUv;
+            void main() {
+              vUv = uv;
+              gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+            }
+          `,
+          fragmentShader: `
+            uniform sampler2D u_mask;
+            varying vec2 vUv;
+            void main() {
+              float m = texture2D(u_mask, vUv).r;
+              gl_FragColor = vec4(vec3(m), 1.0);
+            }
+          `,
+          side: THREE.DoubleSide,
+        }),
+      });
     },
 
     /**
@@ -1707,21 +2044,42 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
 
       return new Promise((resolve) => {
         genImg.onload = () => {
+          // Hoisted so the catch path can dispose whatever was created before
+          // the failure — a thrown error must not leak the hidden canvas or
+          // its WebGL context.
+          let hiddenCanvas = null, hiddenRenderer = null, renderTarget = null, genTexture = null, uvScene = null;
+          const cleanup = () => {
+            try {
+              if (hiddenRenderer) hiddenRenderer.setRenderTarget(null);
+              uvScene?.traverse((obj) => {
+                if (obj.geometry) obj.geometry.dispose();
+                if (obj.material) {
+                  if (Array.isArray(obj.material)) obj.material.forEach((m) => m.dispose());
+                  else obj.material.dispose();
+                }
+              });
+              genTexture?.dispose();
+              renderTarget?.dispose();
+              hiddenRenderer?.dispose();
+              hiddenRenderer?.forceContextLoss();
+            } catch { /* best-effort dispose */ }
+            hiddenCanvas?.remove();
+          };
           try {
             console.log('[UVProject] Generated image loaded:', genImg.width, 'x', genImg.height);
 
             // Create the generated image texture — no color space conversion, pass RGB through directly
-            const genTexture = new THREE.Texture(genImg);
+            genTexture = new THREE.Texture(genImg);
             genTexture.needsUpdate = true;
 
             // Create a hidden canvas + dedicated renderer so the main canvas is untouched
-            const hiddenCanvas = document.createElement('canvas');
+            hiddenCanvas = document.createElement('canvas');
             hiddenCanvas.width = uvMapSize;
             hiddenCanvas.height = uvMapSize;
             hiddenCanvas.style.display = 'none';
             document.body.appendChild(hiddenCanvas);
 
-            const hiddenRenderer = new THREE.WebGLRenderer({
+            hiddenRenderer = new THREE.WebGLRenderer({
               canvas: hiddenCanvas,
               antialias: false,
               alpha: true,
@@ -1733,7 +2091,7 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
             hiddenRenderer.autoClear = true;
             console.log('[UVProject] Hidden renderer created');
 
-            const renderTarget = new THREE.WebGLRenderTarget(uvMapSize, uvMapSize, {
+            renderTarget = new THREE.WebGLRenderTarget(uvMapSize, uvMapSize, {
               format: THREE.RGBAFormat,
               type: THREE.UnsignedByteType,
               minFilter: THREE.NearestFilter,
@@ -1786,7 +2144,7 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
             // The fragment shader transforms the world position by the projector camera
             // matrices to find where this fragment appears in the generated image, then
             // samples the generated image at that position.
-            const uvScene = new THREE.Scene();
+            uvScene = new THREE.Scene();
             const uvMesh = mesh.clone(true);
             let meshChildCount = 0;
             uvMesh.traverse((child) => {
@@ -1841,7 +2199,8 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
                           min(uv.y, 1.0 - uv.y)
                         ) / fadeUv;
                         float alpha = clamp(edgeFade, 0.0, 1.0);
-                        gl_FragColor = vec4(texture2D(projTexture, uv).rgb, alpha);
+                        vec4 src = texture2D(projTexture, uv);
+                        gl_FragColor = vec4(src.rgb, alpha * src.a);
                       } else {
                         discard; // transparent — outside projector frustum
                       }
@@ -1872,20 +2231,8 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
             }
             console.log('[UVProject] Non-transparent pixels:', nonTransparentCount, '/', uvMapSize * uvMapSize);
 
-            // Cleanup render target + UV scene + hidden renderer
-            hiddenRenderer.setRenderTarget(null);
-            uvScene.traverse((obj) => {
-              if (obj.geometry) obj.geometry.dispose();
-              if (obj.material) {
-                if (Array.isArray(obj.material)) obj.material.forEach((m) => m.dispose());
-                else obj.material.dispose();
-              }
-            });
-            genTexture.dispose();
-            renderTarget.dispose();
-            hiddenRenderer.dispose();
-            hiddenRenderer.forceContextLoss();
-            hiddenCanvas.remove();
+            // Cleanup render target + UV scene + hidden renderer/canvas
+            cleanup();
 
             // Write pixels to a 2D canvas, flipping Y (WebGL origin is bottom-left, canvas is top-left)
             const uvCanvas = document.createElement('canvas');
@@ -1959,6 +2306,7 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
             resolve(result);
           } catch (err) {
             console.error('[UVProject] Error:', err);
+            cleanup();
             resolve(null);
           }
         };
@@ -1983,40 +2331,75 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
     },
 
     /**
-     * Update the mesh material to use combined UV map textures from layers.
-     * @param {Array} uvMapUrls - Array of UV map data URLs ordered by layer index
+     * Create/destroy the brush cursor ring — the project context calls this
+     * when maskTool changes so the element only exists while a paint tool
+     * (brush/eraser/inpaint) is active.
      */
-    updateLayerTextures(entries) {
+    setBrushRingActive(active) {
+      const container = containerRef.current;
+      const ringState = ringStateRef.current;
+      if (active && container && !ringElRef.current) {
+        const el = document.createElement('div');
+        el.className = 'absolute rounded-full border border-white pointer-events-none';
+        el.style.cssText = 'display:none;left:0;top:0;transform:translate(-50%,-50%);z-index:10;';
+        container.appendChild(el);
+        ringElRef.current = el;
+        ringState.appliedD = -1;
+        ringState.dirty = true;
+      } else if (!active && ringElRef.current) {
+        ringElRef.current.remove();
+        ringElRef.current = null;
+        ringState.visible = false;
+      }
+    },
+
+    /**
+     * Composite layer images into a single canvas using the same math as the
+     * on-mesh shader composite. items: [{ url, maskDataUrl }], ordered
+     * top → bottom. Returns a canvas (or null when empty).
+     */
+    compositeLayersToCanvas(items) {
+      return compositeLayerImages(items || []);
+    },
+
+    /**
+     * Update the mesh material from the layer stack. Layers are baked into
+     * combined images on the CPU (mask applied to each uvmap's alpha) so the
+     * shader samples a constant number of textures regardless of layer count.
+     * @param {Array} entries - [{ url, maskDataUrl, maskTexture, layerId }]
+     *   ordered top→bottom (legacy callers may pass plain url strings)
+     * @param {Object} opts - { paintLayerId } — with the brush/eraser active,
+     *   the selected layer keeps its own uvmap + live mask sampler (strokes
+     *   draw in real-time) while the layers above and below it are each baked
+     *   into a single combined texture.
+     */
+    updateLayerTextures(entries, opts = {}) {
       const mesh = currentMeshRef.current;
       if (!mesh) return;
+      const buildId = ++layerBuildIdRef.current;
+      const paintLayerId = opts.paintLayerId ?? null;
 
-      // Free the previous batch's GPU resources — layer textures and their
-      // blob object URLs would otherwise leak on every rebuild.
-      for (const t of layerGpuRef.current.textures) t.dispose();
-      for (const u of layerGpuRef.current.blobUrls) URL.revokeObjectURL(u);
-      layerGpuRef.current = { textures: [], blobUrls: [] };
+      const items = (entries || [])
+        .map((e) => (typeof e === 'string' ? { url: e } : e))
+        .filter((e) => e.url);
 
-      // entries: [{ url, maskTexture, layerId }] — legacy callers may pass
-      // a plain array of urls
-      const items = (entries || []).map((e) => (typeof e === 'string' ? { url: e } : e));
-
-      // Load all UV map textures
-      const loader = new THREE.TextureLoader();
-      const withTex = [];
-      for (const item of items) {
-        if (!item.url) continue;
-        const tex = loader.load(item.url);
-        tex.flipY = true; // canvas paints v=0 at bottom; flipY=true maps UV v=0 to canvas bottom
-        layerGpuRef.current.textures.push(tex);
-        if (item.url.startsWith('blob:')) layerGpuRef.current.blobUrls.push(item.url);
-        withTex.push({ ...item, tex });
+      // Shared white dummy texture for unbound samplers
+      if (!whiteMaskTexRef.current) {
+        const data = new Uint8Array([255, 255, 255, 255]);
+        whiteMaskTexRef.current = new THREE.DataTexture(data, 1, 1, THREE.RGBAFormat);
+        whiteMaskTexRef.current.needsUpdate = true;
       }
+      const white = whiteMaskTexRef.current;
 
-      // Remember which layerId occupies each shader slot (for bindLayerMask)
-      shaderLayerIdsRef.current = withTex.map((e) => e.layerId || null);
+      const freeGpu = () => {
+        for (const t of layerGpuRef.current.textures) t.dispose();
+        for (const u of layerGpuRef.current.blobUrls) URL.revokeObjectURL(u);
+        layerGpuRef.current = { textures: [], blobUrls: [] };
+      };
 
-      // No layers — restore the original grey MeshStandardMaterial
-      if (withTex.length === 0) {
+      const setGreyMaterial = () => {
+        freeGpu();
+        shaderLayerIdsRef.current = [];
         mesh.traverse((child) => {
           if (child.isMesh) {
             if (child.material) {
@@ -2031,65 +2414,39 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
             });
           }
         });
+      };
+
+      // No layers — restore the original grey MeshStandardMaterial
+      if (items.length === 0) {
+        setGreyMaterial();
         return;
       }
 
-      const layerCount = Math.min(withTex.length, 16);
-
-      // Collect the directional light position for the shader
       const dirLight1 = dirLight1Ref.current;
       const dir1Pos = dirLight1 ? dirLight1.position : new THREE.Vector3(10, 10, 10);
 
-      // Shared white dummy texture for layers that have no mask
-      if (!whiteMaskTexRef.current) {
-        const data = new Uint8Array([255, 255, 255, 255]);
-        whiteMaskTexRef.current = new THREE.DataTexture(data, 1, 1, THREE.RGBAFormat);
-        whiteMaskTexRef.current.needsUpdate = true;
-      }
-
-      // Build uniforms: one sampler2D per layer (up to 16) + mask sampler/flag + light position
-      const uniforms = {
-        layerCount: { value: layerCount },
-        dir1Pos: { value: dir1Pos },
-        // Inpainting overlay (mesh-wide mask + repeating tile)
-        u_inpaintMask: { value: inpaintActiveRef.current ? (inpaintMaskRef.current?.front.texture || whiteMaskTexRef.current) : whiteMaskTexRef.current },
-        u_inpaintTile: { value: inpaintTileTexRef.current || whiteMaskTexRef.current },
+      const inpaintUniforms = () => ({
+        u_inpaintMask: { value: inpaintActiveRef.current ? (inpaintMaskRef.current?.front.texture || white) : white },
+        u_inpaintTile: { value: inpaintTileTexRef.current || white },
         u_inpaintOffset: { value: 0 },
-        u_hasInpaint: { value: inpaintActiveRef.current ? 1 : 0 },
-      };
-      for (let i = 0; i < layerCount; i++) {
-        uniforms[`layer${i}`] = { value: withTex[i].tex };
-        uniforms[`mask${i}`] = { value: withTex[i].maskTexture || whiteMaskTexRef.current };
-        uniforms[`hasMask${i}`] = { value: withTex[i].maskTexture ? 1 : 0 };
-      }
+        u_unlit: { value: unlitRef.current ? 1 : 0 },
+        u_hasInpaint: { value: inpaintActiveRef.current && inpaintVisibleRef.current ? 1 : 0 },
+      });
 
-      // Dynamically generate the fragment shader with exactly layerCount samplers + shadow lighting
-      // Layers are applied in reverse order (highest index first, lowest index last)
-      // so that lower-index layers appear on top of higher-index layers
-      const layerIndices = Array.from({ length: layerCount }, (_, i) => layerCount - 1 - i);
-      const fragmentShader = `
-        uniform int layerCount;
-        ${Array.from({ length: layerCount }, (_, i) => `uniform sampler2D layer${i};\n        uniform sampler2D mask${i};\n        uniform float hasMask${i};`).join('\n        ')}
-        uniform vec3 dir1Pos;
-        uniform sampler2D u_inpaintMask;
-        uniform sampler2D u_inpaintTile;
-        uniform float u_inpaintOffset;
-        uniform float u_hasInpaint;
+      const vertexShader = `
         varying vec2 vUv;
         varying vec3 vNormal;
         varying vec3 vWorldPos;
         void main() {
-          vec4 color = vec4(0.0);
-          ${layerIndices.map((i) => `
-          {
-            vec4 layerColor${i} = texture2D(layer${i}, vUv);
-            float contentMask${i} = step(0.01, length(layerColor${i}.rgb));
-            // LERP alpha: start=0, end=uvmap alpha, weight=mask (white=visible, black=hidden)
-            float paintMask${i} = mix(1.0, texture2D(mask${i}, vUv).r, hasMask${i});
-            float alpha${i} = mix(0.0, layerColor${i}.a, paintMask${i});
-            color.rgb = mix(color.rgb, layerColor${i}.rgb, contentMask${i} * alpha${i});
-            color.a = max(color.a, alpha${i} * contentMask${i});
-          }`).join('')}
+          vUv = uv;
+          vNormal = normalize(mat3(modelMatrix) * normal);
+          vWorldPos = (modelMatrix * vec4(position, 1.0)).xyz;
+          gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+        }
+      `;
+
+      // Shadow-only lighting + inpaint overlay — identical for both variants
+      const shaderTail = `
           if (color.a < 0.01) discard;
 
           // Shadow-only lighting: don't brighten the texture, only darken areas facing away from the light
@@ -2099,13 +2456,13 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
           // Shadow factor: 1.0 (no shadow) when facing the light, 0.35 (dark) when facing away
           float shadow = mix(0.35, 1.0, clamp(NdotL * 0.5 + 0.5, 0.0, 1.0));
 
-          vec3 shaded = color.rgb * shadow;
+          vec3 shaded = mix(color.rgb * shadow, color.rgb, u_unlit);
           // Inpainting overlay: lerp to the repeating tile where the mask is
           // painted — tile alpha is respected so transparent parts of the
           // pattern let the layers underneath show through
           if (u_hasInpaint > 0.5) {
             float ip = texture2D(u_inpaintMask, vUv).r;
-            vec4 tile = texture2D(u_inpaintTile, vUv * 16.0 + vec2(u_inpaintOffset, 0.0));
+            vec4 tile = texture2D(u_inpaintTile, vUv * 32.0 + vec2(u_inpaintOffset, 0.0));
             shaded = mix(shaded, tile.rgb, ip * tile.a);
           }
 
@@ -2113,30 +2470,160 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
         }
       `;
 
-      mesh.traverse((child) => {
-        if (child.isMesh) {
-          if (child.material) {
-            if (Array.isArray(child.material)) child.material.forEach((m) => m.dispose());
-            else child.material.dispose();
+      const combinedFragment = `
+        uniform sampler2D u_combined;
+        uniform float u_hasCombined;
+        uniform vec3 dir1Pos;
+        uniform sampler2D u_inpaintMask;
+        uniform sampler2D u_inpaintTile;
+        uniform float u_inpaintOffset;
+        uniform float u_hasInpaint;
+        uniform float u_unlit;
+        varying vec2 vUv;
+        varying vec3 vNormal;
+        varying vec3 vWorldPos;
+        void main() {
+          vec4 color = vec4(0.0);
+          if (u_hasCombined > 0.5) color = texture2D(u_combined, vUv);
+${shaderTail}`;
+
+      // Brush/eraser: baked below stack → selected layer with live mask →
+      // baked above stack. mask0/hasMask0 keep the per-layer naming so
+      // syncMaskUniform + bindLayerMask work via shaderLayerIdsRef slot 0.
+      const paintFragment = `
+        uniform sampler2D u_below;
+        uniform float u_hasBelow;
+        uniform sampler2D u_above;
+        uniform float u_hasAbove;
+        uniform sampler2D layer0;
+        uniform sampler2D mask0;
+        uniform float hasMask0;
+        uniform vec3 dir1Pos;
+        uniform sampler2D u_inpaintMask;
+        uniform sampler2D u_inpaintTile;
+        uniform float u_inpaintOffset;
+        uniform float u_hasInpaint;
+        uniform float u_unlit;
+        varying vec2 vUv;
+        varying vec3 vNormal;
+        varying vec3 vWorldPos;
+        void main() {
+          vec4 color = vec4(0.0);
+          if (u_hasBelow > 0.5) {
+            vec4 c = texture2D(u_below, vUv);
+            color.rgb = mix(color.rgb, c.rgb, c.a);
+            color.a = max(color.a, c.a);
           }
-          child.material = new THREE.ShaderMaterial({
-            uniforms,
-            vertexShader: `
-              varying vec2 vUv;
-              varying vec3 vNormal;
-              varying vec3 vWorldPos;
-              void main() {
-                vUv = uv;
-                vNormal = normalize(mat3(modelMatrix) * normal);
-                vWorldPos = (modelMatrix * vec4(position, 1.0)).xyz;
-                gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
-              }
-            `,
-            fragmentShader,
-            side: THREE.DoubleSide,
-          });
+          {
+            vec4 layerColor0 = texture2D(layer0, vUv);
+            float contentMask0 = step(0.01, length(layerColor0.rgb));
+            // LERP alpha: start=0, end=uvmap alpha, weight=mask (white=visible, black=hidden)
+            float paintMask0 = mix(1.0, texture2D(mask0, vUv).r, hasMask0);
+            float alpha0 = mix(0.0, layerColor0.a, paintMask0);
+            color.rgb = mix(color.rgb, layerColor0.rgb, contentMask0 * alpha0);
+            color.a = max(color.a, alpha0 * contentMask0);
+          }
+          if (u_hasAbove > 0.5) {
+            vec4 c = texture2D(u_above, vUv);
+            color.rgb = mix(color.rgb, c.rgb, c.a);
+            color.a = max(color.a, c.a);
+          }
+${shaderTail}`;
+
+      (async () => {
+        const gpu = { textures: [], blobUrls: [] };
+        let uniforms = null;
+        let fragmentShader = null;
+        let layerIds = [];
+        const bail = () => {
+          for (const t of gpu.textures) t.dispose();
+          for (const u of gpu.blobUrls) URL.revokeObjectURL(u);
+        };
+
+        const selIdx = paintLayerId ? items.findIndex((e) => e.layerId === paintLayerId) : -1;
+
+        try {
+          if (selIdx >= 0) {
+            // Bake the stacks above and below the paint-target layer
+            const [belowCanvas, aboveCanvas] = await Promise.all([
+              compositeLayerImages(items.slice(selIdx + 1)),
+              compositeLayerImages(items.slice(0, selIdx)),
+            ]);
+            if (buildId !== layerBuildIdRef.current) { bail(); return; }
+
+            const selTex = await new THREE.TextureLoader().loadAsync(items[selIdx].url);
+            selTex.flipY = true;
+            gpu.textures.push(selTex);
+            if (items[selIdx].url.startsWith('blob:')) gpu.blobUrls.push(items[selIdx].url);
+
+            const below = belowCanvas ? await canvasToLayerTexture(belowCanvas) : null;
+            const above = aboveCanvas ? await canvasToLayerTexture(aboveCanvas) : null;
+            for (const c of [below, above]) {
+              if (!c) continue;
+              gpu.textures.push(c.tex);
+              gpu.blobUrls.push(c.url);
+            }
+            if (buildId !== layerBuildIdRef.current) { bail(); return; }
+
+            layerIds = [paintLayerId]; // slot 0 → mask0/hasMask0
+            uniforms = {
+              layer0: { value: selTex },
+              mask0: { value: items[selIdx].maskTexture || white },
+              hasMask0: { value: items[selIdx].maskTexture ? 1 : 0 },
+              u_below: { value: below ? below.tex : white },
+              u_hasBelow: { value: below ? 1 : 0 },
+              u_above: { value: above ? above.tex : white },
+              u_hasAbove: { value: above ? 1 : 0 },
+              dir1Pos: { value: dir1Pos },
+              ...inpaintUniforms(),
+            };
+            fragmentShader = paintFragment;
+          } else {
+            const canvas = await compositeLayerImages(items);
+            if (buildId !== layerBuildIdRef.current) { bail(); return; }
+            const combined = canvas ? await canvasToLayerTexture(canvas) : null;
+            if (!combined) { setGreyMaterial(); return; }
+            gpu.textures.push(combined.tex);
+            gpu.blobUrls.push(combined.url);
+
+            uniforms = {
+              u_combined: { value: combined.tex },
+              u_hasCombined: { value: 1 },
+              dir1Pos: { value: dir1Pos },
+              ...inpaintUniforms(),
+            };
+            fragmentShader = combinedFragment;
+          }
+        } catch (err) {
+          console.error('Layer texture build failed:', err);
+          bail();
+          return;
         }
-      });
+
+        // A newer build superseded this one — free what we made and bail
+        if (buildId !== layerBuildIdRef.current) {
+          bail();
+          return;
+        }
+
+        freeGpu();
+        layerGpuRef.current = gpu;
+        shaderLayerIdsRef.current = layerIds;
+        mesh.traverse((child) => {
+          if (child.isMesh) {
+            if (child.material) {
+              if (Array.isArray(child.material)) child.material.forEach((m) => m.dispose());
+              else child.material.dispose();
+            }
+            child.material = new THREE.ShaderMaterial({
+              uniforms,
+              vertexShader,
+              fragmentShader,
+              side: THREE.DoubleSide,
+            });
+          }
+        });
+      })();
     },
 
     /**
@@ -2164,8 +2651,10 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
      * regions show the tile pattern across all layers.
      */
     beginInpaint() {
+      // Preserve an existing mask — switching tools doesn't discard strokes
+      const hadMask = !!inpaintMaskRef.current;
       const entry = getInpaintEntry();
-      clearMaskTarget(entry, 0x000000);
+      if (!hadMask) clearMaskTarget(entry, 0x000000);
       if (!inpaintTileTexRef.current) {
         const tex = new THREE.TextureLoader().load('/inpaint-tile.png');
         tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
@@ -2175,7 +2664,9 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
       bindInpaintOverlay(entry);
     },
 
-    // Remove the inpaint mask + tile from the shader and free the GPU buffers
+    // Remove the inpaint mask + tile from the shader. The GPU buffers stay
+    // alive so the mask is restored when the tool is re-selected — they are
+    // only freed on mesh swap / unmount.
     endInpaint() {
       inpaintActiveRef.current = false;
       currentMeshRef.current?.traverse((child) => {
@@ -2186,13 +2677,15 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
           u.u_inpaintTile.value = null;
         }
       });
-      if (inpaintMaskRef.current) {
-        inpaintMaskRef.current.a.dispose();
-        inpaintMaskRef.current.b.dispose();
-        inpaintMaskRef.current = null;
-      }
-      inpaintTileTexRef.current?.dispose();
-      inpaintTileTexRef.current = null;
+    },
+
+    // Show/hide the inpaint overlay without clearing the painted mask
+    setInpaintMaskVisible(visible) {
+      inpaintVisibleRef.current = visible;
+      currentMeshRef.current?.traverse((child) => {
+        const u = child.isMesh && child.material && child.material.uniforms;
+        if (u && u.u_hasInpaint) u.u_hasInpaint.value = inpaintActiveRef.current && visible ? 1 : 0;
+      });
     },
 
     /**
@@ -2260,6 +2753,14 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
       c2.putImageData(img, 0, 0);
       return canvas.toDataURL('image/png');
     },
+
+    // Read back the inpaint tool's mask render target (UV space, white =
+    // painted) as a PNG data URL — the same format as layer mask saves.
+    inpaintMaskToDataURL() {
+      const entry = inpaintMaskRef.current;
+      if (!entry) return null;
+      return this.maskToDataURL(entry);
+    },
   }), []);
 
   // Load / swap mesh when selection changes
@@ -2280,6 +2781,13 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
         }
       });
       currentMeshRef.current = null;
+    }
+
+    // The inpaint mask is UV data tied to the previous mesh — drop it, then
+    // recreate a cleared entry if the tool is still active on the new mesh
+    disposeInpaintEntry();
+    if (inpaintActiveRef.current) {
+      clearMaskTarget(getInpaintEntry(), 0x000000);
     }
 
     if (!meshMeta || !meshMeta.object) {
@@ -2390,6 +2898,7 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
         for (const t of layerGpuRef.current.textures) t.dispose();
         for (const u of layerGpuRef.current.blobUrls) URL.revokeObjectURL(u);
         layerGpuRef.current = { textures: [], blobUrls: [] };
+        disposeInpaintEntry();
       }
       const grid = sceneRef.current.getObjectByName('__grid');
       if (grid) grid.visible = true;
@@ -2402,12 +2911,23 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
       className="absolute inset-0 w-full h-full"
       style={{ background: 'radial-gradient(circle at center, #2a2a5e, #1a1a2e)' }}
     >
-      {/* Brush-size cursor ring — positioned/sized directly on pointermove */}
-      <div
-        ref={brushRingRef}
-        className="absolute rounded-full border border-white pointer-events-none"
-        style={{ display: 'none', transform: 'translate(-50%, -50%)', zIndex: 10 }}
-      />
+
+      {/* Light toggle — centered on the sunlight gizmo (left of the nav gizmo).
+          Off = unlit shading on the main canvas */}
+      <button
+        type="button"
+        onClick={toggleUnlit}
+        className={`absolute z-20 transition ${
+          unlit
+            ? 'text-gray-300 dark:text-gray-600 hover:text-gray-500'
+            : 'text-gray-500 hover:text-gray-700 dark:hover:text-gray-300'
+        }`}
+        style={{ top: 82, right: 219, transform: 'translate(50%, -50%)' }}
+        aria-label={unlit ? 'Enable lighting' : 'Disable lighting'}
+        title={unlit ? 'Lighting off — click for lit' : 'Lighting on — click for unlit'}
+      >
+        <Icon name={unlit ? 'visibility_off' : 'visibility'} className="text-2xl" />
+      </button>
     </div>
   );
 });

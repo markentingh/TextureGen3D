@@ -75,6 +75,7 @@ namespace TextureGen3D.API.Controllers
             public Guid MeshId { get; set; }
             public string Name { get; set; } = "";
             public string? CameraAngle { get; set; }
+            public bool Inpaint { get; set; }
         }
 
         [HttpPost("{projectId}")]
@@ -98,6 +99,7 @@ namespace TextureGen3D.API.Controllers
                     Name = request.Name,
                     Index = nextIndex,
                     CameraAngle = request.CameraAngle ?? "",
+                    Inpaint = request.Inpaint,
                 };
                 var created = await _layerRepo.CreateAsync(layer);
                 return Json(new ApiResponse { success = true, data = created });
@@ -282,6 +284,59 @@ namespace TextureGen3D.API.Controllers
             }
         }
 
+        [HttpGet("{projectId}/mesh/{meshId}/{layerId}/angle-thumb")]
+        public async Task<IActionResult> GetLayerAngleThumb(Guid projectId, Guid meshId, Guid layerId)
+        {
+            try
+            {
+                var data = await _imageService.GetProjectMeshLayerAngleThumbAsync(projectId, meshId, layerId);
+                if (data == null) return NotFound();
+                return File(data, "image/png");
+            }
+            catch
+            {
+                return NotFound();
+            }
+        }
+
+        public class SaveAngleThumbRequest
+        {
+            public Guid MeshId { get; set; }
+            public string Base64Image { get; set; } = "";
+        }
+
+        /// <summary>
+        /// Save a thumbnail of the camera angle used to project this layer —
+        /// shown in the layer row for layers whose angle has no camera-angle record.
+        /// </summary>
+        [HttpPost("{projectId}/{layerId}/save-angle-thumb")]
+        public async Task<IActionResult> SaveAngleThumb(Guid projectId, Guid layerId, [FromBody] SaveAngleThumbRequest request)
+        {
+            try
+            {
+                var userId = GetUserId();
+                if (userId == Guid.Empty)
+                    return Json(new ApiResponse { success = false, message = "Could not find user" });
+
+                var project = await _projectRepo.GetByIdAsync(projectId, userId);
+                if (project == null)
+                    return Json(new ApiResponse { success = false, message = "Project not found" });
+
+                var base64 = request.Base64Image;
+                if (string.IsNullOrWhiteSpace(base64))
+                    return Json(new ApiResponse { success = false, message = "No image provided" });
+                if (base64.StartsWith("data:")) base64 = base64.Substring(base64.IndexOf(',') + 1);
+                var imageBytes = Convert.FromBase64String(base64);
+
+                await _imageService.SaveProjectMeshLayerAngleThumbAsync(projectId, request.MeshId, layerId, imageBytes);
+                return Json(new ApiResponse { success = true });
+            }
+            catch (Exception ex)
+            {
+                return Json(new ApiResponse { success = false, message = ex.Message });
+            }
+        }
+
         public class SaveImageRequest
         {
             public Guid MeshId { get; set; }
@@ -453,6 +508,8 @@ namespace TextureGen3D.API.Controllers
             public string DepthMap { get; set; } = ""; // base64 data URL of the depth map
             public string CameraAngle { get; set; } = ""; // JSON {x,y,z}
             public Guid? CameraAngleId { get; set; } // if set, use this camera angle's reference image instead of mesh references
+            public string? InputImage { get; set; } // base64 data URL — caller-supplied input image (e.g. an inpainted render); replaces mesh/angle references
+            public int Resolution { get; set; } // texture resolution in px (1024/2048/4096); falls back to the project's TextureResolution
         }
 
         public class SaveDepthMapRequest
@@ -497,6 +554,44 @@ namespace TextureGen3D.API.Controllers
             }
         }
 
+        public class SaveProjectionImageRequest
+        {
+            public string Image { get; set; } = ""; // base64 data URL
+        }
+
+        /// <summary>
+        /// Upload a caller-supplied projection input image (e.g. an inpainted
+        /// render). SignalR messages are limited to 32KB, so images are sent via
+        /// this API and the hubs resolve them by id from storage.
+        /// </summary>
+        [HttpPost("{projectId}/projection-image")]
+        public async Task<IActionResult> SaveProjectionImage(Guid projectId, [FromBody] SaveProjectionImageRequest request)
+        {
+            try
+            {
+                var userId = GetUserId();
+                if (userId == Guid.Empty)
+                    return Json(new ApiResponse { success = false, message = "Could not find user" });
+
+                var project = await _projectRepo.GetByIdAsync(projectId, userId);
+                if (project == null)
+                    return Json(new ApiResponse { success = false, message = "Project not found" });
+
+                if (string.IsNullOrWhiteSpace(request.Image))
+                    return Json(new ApiResponse { success = false, message = "No image provided" });
+
+                var base64 = request.Image.StartsWith("data:") ? request.Image[(request.Image.IndexOf(',') + 1)..] : request.Image;
+                var imageId = Guid.NewGuid();
+                await _imageService.SaveProjectProjectionImageAsync(projectId, imageId, Convert.FromBase64String(base64));
+
+                return Json(new ApiResponse { success = true, data = new { imageId } });
+            }
+            catch (Exception ex)
+            {
+                return Json(new ApiResponse { success = false, message = ex.Message });
+            }
+        }
+
         [HttpPost("{projectId}/{layerId}/generate")]
         public async Task<IActionResult> GenerateImage(Guid projectId, Guid layerId, [FromBody] GenerateLayerImageRequest request)
         {
@@ -526,8 +621,15 @@ namespace TextureGen3D.API.Controllers
                     inputImages.Add(depthMapBytes);
                 }
 
+                // A caller-supplied input image (e.g. an inpainted render) acts as
+                // the sole reference — skip mesh/angle reference lookup entirely
+                if (!string.IsNullOrWhiteSpace(request.InputImage))
+                {
+                    var imgBase64 = request.InputImage.StartsWith("data:") ? request.InputImage.Substring(request.InputImage.IndexOf(',') + 1) : request.InputImage;
+                    inputImages.Add(Convert.FromBase64String(imgBase64));
+                }
                 // Fetch image references: use camera angle's reference if CameraAngleId is set, otherwise mesh references
-                if (request.CameraAngleId.HasValue)
+                else if (request.CameraAngleId.HasValue)
                 {
                     var angle = await _angleRepo.GetByIdAsync(request.CameraAngleId.Value, projectId);
                     if (angle != null && angle.ProjectReferenceId.HasValue)
@@ -558,18 +660,20 @@ namespace TextureGen3D.API.Controllers
                 if (inputImages.Count == 0)
                     return Json(new ApiResponse { success = false, message = "At least one input image (depth map) is required" });
 
+                var resolution = request.Resolution > 0 ? request.Resolution
+                    : (project.TextureResolution > 0 ? project.TextureResolution : 1024);
                 var hasReferences = inputImages.Count > 1;
                 var albedoInstruction = " The output must be a pure albedo (diffuse color) map — flat, evenly lit surface colors with no shadows, no highlights, no ambient occlusion, no specular reflections, and no directional lighting. Treat the result as if illuminated by uniform, shadowless light from all directions so that only the intrinsic material color of each surface point is captured.";
                 var systemPrompt = hasReferences
-                    ? "You are generating a texture map for a 3D model. The first input image is a depth map rendered from a specific camera angle of the 3D model's surface — brighter pixels are closer to the camera, darker pixels are farther away. The remaining input images are reference textures that should be projected onto the 3D model's surface as seen from that camera angle. Generate a 1024x1024 texture that maps the reference imagery onto the geometry indicated by the depth map, preserving the spatial layout and surface contours. The output should look like a coherent texture applied to the 3D model's UV map from this viewpoint, not a flat composite. Respect the depth map's silhouette and surface relief when placing and distorting the reference textures." + albedoInstruction + "\n\n" + (request.Prompt ?? "")
-                    : "You are generating a texture map for a 3D model. The first input image is a depth map rendered from a specific camera angle of the 3D model's surface — brighter pixels are closer to the camera, darker pixels are farther away. Generate a 1024x1024 texture that follows the surface contours and silhouette indicated by the depth map, producing a coherent texture suitable for the model's UV map from this viewpoint." + albedoInstruction + "\n\n" + (request.Prompt ?? "");
+                    ? $"You are generating a texture map for a 3D model. The first input image is a depth map rendered from a specific camera angle of the 3D model's surface — brighter pixels are closer to the camera, darker pixels are farther away. The remaining input images are reference textures that should be projected onto the 3D model's surface as seen from that camera angle. Generate a {resolution}x{resolution} texture that maps the reference imagery onto the geometry indicated by the depth map, preserving the spatial layout and surface contours. The output should look like a coherent texture applied to the 3D model's UV map from this viewpoint, not a flat composite. Respect the depth map's silhouette and surface relief when placing and distorting the reference textures." + albedoInstruction + "\n\n" + (request.Prompt ?? "")
+                    : $"You are generating a texture map for a 3D model. The first input image is a depth map rendered from a specific camera angle of the 3D model's surface — brighter pixels are closer to the camera, darker pixels are farther away. Generate a {resolution}x{resolution} texture that follows the surface contours and silhouette indicated by the depth map, producing a coherent texture suitable for the model's UV map from this viewpoint." + albedoInstruction + "\n\n" + (request.Prompt ?? "");
 
                 var genRequest = new ImageGenerationRequest
                 {
                     Prompt = systemPrompt,
                     Model = imageModel.Model,
-                    Width = 1024,
-                    Height = 1024,
+                    Width = resolution,
+                    Height = resolution,
                     InputImages = inputImages,
                 };
 
@@ -601,6 +705,93 @@ namespace TextureGen3D.API.Controllers
                 }
 
                 // Return the generated image as base64 so the client can project it onto the UV map
+                return Json(new ApiResponse { success = true, data = new
+                {
+                    image = $"data:image/png;base64,{Convert.ToBase64String(result.ImageBytes)}"
+                }});
+            }
+            catch (Exception ex)
+            {
+                return Json(new ApiResponse { success = false, message = ex.Message });
+            }
+        }
+
+        public class InpaintRequest
+        {
+            public Guid MeshId { get; set; }
+            public string Image { get; set; } = ""; // base64 data URL — the unlit composite render (InputImages[0])
+            public string Mask { get; set; } = "";  // base64 data URL — composite with the masked region made transparent (InputMask)
+            public string? Prompt { get; set; }
+            public List<Guid>? ReferenceIds { get; set; } // active project reference ids
+            public int ImageModelId { get; set; }
+            public int Resolution { get; set; } // texture resolution in px; falls back to the project's TextureResolution
+        }
+
+        /// <summary>
+        /// Inpaint a camera-space render of the mesh: the base composite goes to
+        /// InputImages[0], the RGBA image with the masked region transparent goes
+        /// to InputMask, and active reference images are appended to InputImages.
+        /// Returns the edited image as a base64 data URL.
+        /// </summary>
+        [HttpPost("{projectId}/inpaint")]
+        public async Task<IActionResult> Inpaint(Guid projectId, [FromBody] InpaintRequest request)
+        {
+            try
+            {
+                var userId = GetUserId();
+                if (userId == Guid.Empty)
+                    return Json(new ApiResponse { success = false, message = "Could not find user" });
+
+                var project = await _projectRepo.GetByIdAsync(projectId, userId);
+                if (project == null)
+                    return Json(new ApiResponse { success = false, message = "Project not found" });
+
+                var imageModel = await _imageGenModelRepo.GetByIdAsync(request.ImageModelId);
+                if (imageModel == null)
+                    return Json(new ApiResponse { success = false, message = "Image model not found" });
+
+                static byte[] DecodeDataUrl(string dataUrl) => Convert.FromBase64String(
+                    dataUrl.StartsWith("data:") ? dataUrl[(dataUrl.IndexOf(',') + 1)..] : dataUrl);
+
+                if (string.IsNullOrWhiteSpace(request.Image))
+                    return Json(new ApiResponse { success = false, message = "No input image provided" });
+                if (string.IsNullOrWhiteSpace(request.Mask))
+                    return Json(new ApiResponse { success = false, message = "No input mask provided" });
+
+                var inputImages = new List<byte[]> { DecodeDataUrl(request.Image) };
+
+                if (request.ReferenceIds != null)
+                {
+                    foreach (var refId in request.ReferenceIds)
+                    {
+                        var reference = await _refRepo.GetByIdAsync(refId, projectId);
+                        if (reference == null) continue;
+                        var refBytes = await _imageService.GetProjectReferenceAsync(projectId, reference.Id, reference.Extension);
+                        if (refBytes != null && refBytes.Length > 0)
+                            inputImages.Add(refBytes);
+                    }
+                }
+
+                var resolution = request.Resolution > 0 ? request.Resolution
+                    : (project.TextureResolution > 0 ? project.TextureResolution : 1024);
+                var genRequest = new ImageGenerationRequest
+                {
+                    // Frame the request so the model edits the composite (input
+                    // image 0) instead of treating inputs as generation sources
+                    Prompt = $"Update the first input image based on the provided mask, reference images, and the following prompt: {request.Prompt}",
+                    Model = imageModel.Model,
+                    Width = resolution,
+                    Height = resolution,
+                    InputImages = inputImages,
+                    InputMask = DecodeDataUrl(request.Mask),
+                };
+
+                var genService = _allImageGenerations.FirstOrDefault(g => g.ModelKey == imageModel.ModelKey)
+                    ?? _imageGeneration;
+                var result = await genService.GenerateAsync(genRequest);
+                if (result.ImageBytes == null || result.ImageBytes.Length == 0)
+                    return Json(new ApiResponse { success = false, message = "Image generation returned no image" });
+
                 return Json(new ApiResponse { success = true, data = new
                 {
                     image = $"data:image/png;base64,{Convert.ToBase64String(result.ImageBytes)}"
@@ -751,12 +942,13 @@ namespace TextureGen3D.API.Controllers
                 var genService = _allImageGenerations.FirstOrDefault(g => g.ModelKey == imageModel.ModelKey)
                     ?? _imageGeneration;
 
+                var stitchResolution = project.TextureResolution > 0 ? project.TextureResolution : 1024;
                 var genRequest = new ImageGenerationRequest
                 {
                     Prompt = stitchPrompt,
                     Model = imageModel.Model,
-                    Width = 1024,
-                    Height = 1024,
+                    Width = stitchResolution,
+                    Height = stitchResolution,
                     InputImages = inputImages,
                 };
 

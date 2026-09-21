@@ -1,4 +1,5 @@
 using Microsoft.AspNetCore.SignalR;
+using Microsoft.Extensions.Hosting;
 using TextureGen3D.API.Services;
 using TextureGen3D.Data.Entities;
 using TextureGen3D.Data.Interfaces;
@@ -20,6 +21,7 @@ namespace TextureGen3D.API.Hubs
         readonly IProjectCameraAngleRepository _angleRepo;
         readonly IProjectRepository _projectRepo;
         readonly IImageService _imageService;
+        readonly IHostEnvironment _env;
 
         public ComfyUiHub(
             ImageGenerationForComfyUI comfyUiService,
@@ -28,7 +30,8 @@ namespace TextureGen3D.API.Hubs
             IProjectReferenceRepository refRepo,
             IProjectCameraAngleRepository angleRepo,
             IProjectRepository projectRepo,
-            IImageService imageService)
+            IImageService imageService,
+            IHostEnvironment env)
         {
             _comfyUiService = comfyUiService;
             _imageGenModelRepo = imageGenModelRepo;
@@ -37,6 +40,7 @@ namespace TextureGen3D.API.Hubs
             _angleRepo = angleRepo;
             _projectRepo = projectRepo;
             _imageService = imageService;
+            _env = env;
         }
 
         /// <summary>
@@ -51,7 +55,9 @@ namespace TextureGen3D.API.Hubs
             Guid projectId,
             Guid meshId,
             Guid layerId,
-            Guid? cameraAngleId = null)
+            Guid? cameraAngleId = null,
+            int resolution = 1024,
+            Guid? inputImageId = null)
         {
             try
             {
@@ -76,8 +82,20 @@ namespace TextureGen3D.API.Hubs
                 if (depthMapBytes != null && depthMapBytes.Length > 0)
                     inputImages.Add(depthMapBytes);
 
+                // A caller-supplied projection image (e.g. an inpainted render,
+                // uploaded via API since SignalR caps messages at 32KB) acts as
+                // the sole reference — skip angle/mesh reference lookup entirely
+                if (inputImageId.HasValue)
+                {
+                    var projBytes = await _imageService.GetProjectProjectionImageAsync(projectId, inputImageId.Value);
+                    if (projBytes != null && projBytes.Length > 0)
+                        inputImages.Add(projBytes);
+                    // Keep uploads in Development for debugging; clean up elsewhere
+                    if (!_env.IsDevelopment())
+                        await _imageService.DeleteProjectProjectionImageAsync(projectId, inputImageId.Value);
+                }
                 // Fetch image references: use camera angle's reference if cameraAngleId is set, otherwise mesh references
-                if (cameraAngleId.HasValue)
+                else if (cameraAngleId.HasValue)
                 {
                     var angle = await _angleRepo.GetByIdAsync(cameraAngleId.Value, projectId);
                     if (angle != null && angle.ProjectReferenceId.HasValue)
@@ -114,8 +132,8 @@ namespace TextureGen3D.API.Hubs
                 {
                     Prompt = fullPrompt,
                     Model = imageModel.Model,
-                    Width = 1024,
-                    Height = 1024,
+                    Width = resolution,
+                    Height = resolution,
                     InputImages = inputImages,
                 };
 

@@ -17,8 +17,15 @@ LORA_MODEL = "thedeoxen/refcontrol-FLUX.2-klein-4B-reference-depth-lora"
 # Match the ComfyUI workflow settings:
 #   Flux2Scheduler steps=20, CFGGuider cfg=5, empty negative prompt,
 #   positive prompt is literally "refcontrol" (the LoRA trigger word).
-NUM_STEPS = 4
+# NOTE: 4 steps is only correct for the *distilled* klein model — the base
+# model is not step-distilled, so 4 steps leaves it under-denoised and the
+# output comes out dark/muted.
+NUM_STEPS = 20
 GUIDANCE_SCALE = 5.0
+# RefControl LoRA weight — at full strength (1.0) the depth LoRA can
+# over-saturate dark boundaries; 0.8 keeps natural lighting. Passed through
+# attention_kwargs -> joint_attention_kwargs on the transformer.
+LORA_SCALE = 0.8
 TRIGGER_WORD = "refcontrol"
 
 _pipe = None
@@ -83,14 +90,15 @@ def get_pipeline():
     return _pipe
 
 
-def scale_to_1mp(img):
-    """Scale an image to ~1 megapixel while preserving aspect ratio.
+def scale_to_resolution(img, resolution=1024):
+    """Scale an image to ~resolution² total pixels while preserving aspect ratio.
 
-    Matches ComfyUI's ImageScaleToTotalPixels (megapixels=1, nearest-exact).
+    Matches ComfyUI's ImageScaleToTotalPixels (nearest-exact), where the
+    target pixel count is resolution × resolution (1024 → ~1MP, 2048 → ~4MP).
     Dimensions are rounded to multiples of 8 for VAE compatibility.
     """
     w, h = img.size
-    target = 1024 * 1024
+    target = int(resolution) * int(resolution)
     scale = (target / (w * h)) ** 0.5
     new_w = max(8, int(round(w * scale / 8)) * 8)
     new_h = max(8, int(round(h * scale / 8)) * 8)
@@ -99,25 +107,27 @@ def scale_to_1mp(img):
     return img.resize((new_w, new_h), Image.NEAREST)
 
 
-def depth_to_image(depth_map_image, reference_image, prompt="", seed=-1):
+def depth_to_image(depth_map_image, reference_image, prompt="", seed=-1, resolution=1024):
     """Generate an output image by fusing a reference image with a depth map using the RefControl LoRA.
 
     The depth map provides pose/structure, the reference image provides identity/style.
-    Mirrors the ComfyUI workflow: both images are scaled to 1MP (aspect preserved),
-    VAE-encoded, and attached as reference latents to the conditioning.
+    Mirrors the ComfyUI workflow: both images are scaled to resolution² total
+    pixels (aspect preserved), VAE-encoded, and attached as reference latents
+    to the conditioning.
 
     Args:
         depth_map_image: PIL Image — depth map (controls pose/structure)
         reference_image: PIL Image — reference image (controls identity/style)
         prompt: str — optional extra prompt text ("refcontrol" trigger word is always included)
         seed: int — random seed for reproducibility (-1 = random)
+        resolution: int — target texture resolution in px (1024/2048/4096)
 
     Returns:
         PIL Image — generated output image
     """
     print(f"[depth_to_image] depth_map_image: {depth_map_image.size if depth_map_image else None} mode={depth_map_image.mode if depth_map_image else None}, "
           f"reference_image: {reference_image.size if reference_image else None} mode={reference_image.mode if reference_image else None}, "
-          f"prompt: {prompt!r}, seed: {seed}")
+          f"prompt: {prompt!r}, seed: {seed}, resolution: {resolution}")
 
     if depth_map_image is None or reference_image is None:
         print("[depth_to_image] Returning None — missing depth map or reference image")
@@ -140,10 +150,10 @@ def depth_to_image(depth_map_image, reference_image, prompt="", seed=-1):
     depth_rgb = depth_map_image.convert("RGB")
     ref_rgb = reference_image.convert("RGB")
 
-    # Scale to ~1MP preserving aspect ratio (ComfyUI ImageScaleToTotalPixels).
-    # Do NOT stretch to a fixed 1024x1024 — that distorts non-square images.
-    depth_scaled = scale_to_1mp(depth_rgb)
-    ref_scaled = scale_to_1mp(ref_rgb)
+    # Scale to ~resolution² preserving aspect ratio (ComfyUI ImageScaleToTotalPixels).
+    # Do NOT stretch to a fixed square — that distorts non-square images.
+    depth_scaled = scale_to_resolution(depth_rgb, resolution)
+    ref_scaled = scale_to_resolution(ref_rgb, resolution)
 
     out_w, out_h = depth_scaled.size
     print(f"[depth_to_image] depth_scaled: {depth_scaled.size}, ref_scaled: {ref_scaled.size}")
@@ -166,6 +176,7 @@ def depth_to_image(depth_map_image, reference_image, prompt="", seed=-1):
             width=out_w,
             num_inference_steps=NUM_STEPS,
             guidance_scale=GUIDANCE_SCALE,
+            attention_kwargs={"scale": LORA_SCALE},
             generator=generator,
         )
     print(f"[depth_to_image] Generated image: {result.images[0].size}")

@@ -1,6 +1,6 @@
-import React, { useState, useRef, useCallback, useEffect } from 'react';
-import * as signalR from '@microsoft/signalr';
+import React, { useState, useRef, useEffect } from 'react';
 import { useProject } from '@/context/project';
+import { useHubGeneration } from './useHubGeneration';
 import { Projects } from '@/api/user/projects';
 import { ProjectMeshes } from '@/api/user/projectMeshes';
 import { ProjectCameraAngles } from '@/api/user/projectCameraAngles';
@@ -43,6 +43,7 @@ export default function GenerateImagesPanel({ showPanel, setShowPanel }) {
     setSelectedModelId,
     setProject,
     project,
+    textureResolution,
     imageModelOptions,
     isComfyUI,
     isGradio,
@@ -70,7 +71,7 @@ export default function GenerateImagesPanel({ showPanel, setShowPanel }) {
 
   const [currentGeneratingAngleId, setCurrentGeneratingAngleId] = useState(null);
   const seedDebounceRef = useRef(null);
-  const activeHubConnectionRef = useRef(null);
+  const { generateViaHub, activeHubConnectionRef } = useHubGeneration();
   const cancelRequestedRef = useRef(false);
 
   // ── Camera angle checkboxes (persisted to localStorage) ──
@@ -119,81 +120,6 @@ export default function GenerateImagesPanel({ showPanel, setShowPanel }) {
 
   // ── Gradio server reachability — checked on Generate click only ──
   const [gradioOffline, setGradioOffline] = useState(false);
-
-  // ── Shared SignalR generation helper (ComfyUI + Gradio) ──
-  // Both hubs expose the same GenerateImage method and events.
-  const generateViaHub = useCallback(
-    async ({ hubUrl, hubName, layer, meshDbId, fullPrompt, angleId, angleNum, totalAngles }) => {
-      return new Promise((resolve, reject) => {
-        const connection = new signalR.HubConnectionBuilder()
-          .withUrl(hubUrl, { accessTokenFactory: () => token })
-          .withAutomaticReconnect()
-          .configureLogging(signalR.LogLevel.Information)
-          .withServerTimeout(1000 * 60 * 60)
-          .withKeepAliveInterval(15000)
-          .build();
-        activeHubConnectionRef.current = connection;
-
-        connection.on('ProgressUpdate', (value, message) => {
-          setComfyProgress(value);
-          if (angleNum && totalAngles) {
-            setComfyMessage(`Image ${angleNum}/${totalAngles}: ${message || 'Generating...'}`);
-          } else if (message) {
-            setComfyMessage(message);
-          }
-        });
-        connection.on('SeedUsed', (seed) => {
-          console.log(`[${hubName}] Seed used${angleNum ? ` (angle ${angleNum})` : ''}: ${seed ?? 'none'}`);
-        });
-        connection.on('GenerationComplete', async (base64Image) => {
-          try {
-            const saveRes = await layerApi.saveComfyUiResult(
-              id,
-              layer.id,
-              meshDbId,
-              base64Image
-            );
-            if (!saveRes.data?.success) throw new Error(`Failed to save ${hubName} result`);
-            activeHubConnectionRef.current = null;
-            await connection.stop();
-            resolve(base64Image);
-          } catch (err) {
-            activeHubConnectionRef.current = null;
-            await connection.stop();
-            reject(err);
-          }
-        });
-        connection.on('GenerationError', async (errorMsg, stackTrace) => {
-          console.error(`${hubName} Generation Error${angleNum ? ` (angle ${angleNum})` : ''}:`, errorMsg);
-          if (stackTrace) console.error('Stack trace:', stackTrace);
-          activeHubConnectionRef.current = null;
-          await connection.stop();
-          reject(new Error(errorMsg));
-        });
-        connection
-          .start()
-          .then(() => {
-            console.log(`[${hubName}] Connection started, invoking GenerateImage...`);
-            connection.invoke(
-              'GenerateImage',
-              parseInt(selectedModelId),
-              fullPrompt,
-              id,
-              meshDbId,
-              layer.id,
-              angleId || null
-            );
-          })
-          .catch((err) => {
-            console.error(`[${hubName}] Connection error:`, err);
-            activeHubConnectionRef.current = null;
-            connection.stop();
-            reject(err);
-          });
-      });
-    },
-    [token, id, selectedModelId, layerApi, setComfyProgress, setComfyMessage]
-  );
 
   // ── Cancel generation ──
   const handleCancelGeneration = async () => {
@@ -558,7 +484,9 @@ export default function GenerateImagesPanel({ showPanel, setShowPanel }) {
         const layer = layerRes.data.data;
         addMeshLayer(meshDbId, layer);
 
-        const depthMap = viewerRef.current?.captureDepthMap(1024);
+        // Use the captured camera angle — the user may rotate the mesh
+        // while generation is in flight.
+        const depthMap = viewerRef.current?.captureDepthMap(textureResolution, cameraAngle);
         if (!depthMap) throw new Error('Failed to generate depth map');
 
         const fullPrompt = meshPrompts[meshDbId] || '';
@@ -584,7 +512,10 @@ export default function GenerateImagesPanel({ showPanel, setShowPanel }) {
             parseInt(selectedModelId),
             fullPrompt,
             depthMap,
-            cameraAngleJson
+            cameraAngleJson,
+            null,
+            null,
+            textureResolution
           );
           if (!genRes.data?.success)
             throw new Error(genRes.data?.message || 'Image generation failed');
@@ -594,8 +525,8 @@ export default function GenerateImagesPanel({ showPanel, setShowPanel }) {
         if (generatedImage) {
           const uvMapPromise = viewerRef.current?.projectImageToUvMap(
             generatedImage,
-            null,
-            1024
+            cameraAngle,
+            textureResolution
           );
           if (uvMapPromise) {
             const uvMapDataUrl = await uvMapPromise;
@@ -650,7 +581,7 @@ export default function GenerateImagesPanel({ showPanel, setShowPanel }) {
           viewerRef.current?.setCameraRotation(angle.rotation);
           await new Promise((r) => setTimeout(r, 50));
 
-          const depthMap = viewerRef.current?.captureDepthMap(1024, angle.rotation);
+          const depthMap = viewerRef.current?.captureDepthMap(textureResolution, angle.rotation);
           if (!depthMap)
             throw new Error(`Failed to generate depth map for angle ${angleNum}`);
 
@@ -682,7 +613,9 @@ export default function GenerateImagesPanel({ showPanel, setShowPanel }) {
               fullPrompt,
               depthMap,
               cameraAngleJson,
-              angle.id
+              angle.id,
+              null,
+              textureResolution
             );
             if (!genRes.data?.success)
               throw new Error(
@@ -698,7 +631,7 @@ export default function GenerateImagesPanel({ showPanel, setShowPanel }) {
               const uvMapPromise = viewerRef.current?.projectImageToUvMap(
                 generatedImage,
                 angle.rotation,
-                1024
+                textureResolution
               );
               if (uvMapPromise) {
                 const uvMapDataUrl = await uvMapPromise;
@@ -856,7 +789,7 @@ export default function GenerateImagesPanel({ showPanel, setShowPanel }) {
           />
         </div>
 
-        <ReferenceImagesSection angleMode={generationMode === 'angles'} />
+        <ReferenceImagesSection angleMode={generationMode === 'angles'} maxRefs={generationMode === 'single' ? 1 : 0} />
 
         <div>
           <label className="block text-xs font-medium text-gray-700 dark:text-gray-300 mb-1">Projection Image Model</label>

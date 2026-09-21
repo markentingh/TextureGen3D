@@ -48,5 +48,11 @@ namespace TextureGen3D.Data.Repositories.Projects
             const string query = @"DELETE FROM public.""ProjectModels"" WHERE ""Id"" = @id AND ""ProjectId"" = @projectId";
             await _dbConnection.ExecuteAsync(query, new { id, projectId });
         }
+
+        public async Task UpdateFileInfoAsync(Guid id, Guid projectId, string filename, string extension, int fileSize)
+        {
+            const string query = @"UPDATE public.""ProjectModels"" SET ""Filename"" = @filename, ""Extension"" = @extension, ""FileSize"" = @fileSize WHERE ""Id"" = @id AND ""ProjectId"" = @projectId";
+            await _dbConnection.ExecuteAsync(query, new { id, projectId, filename, extension, fileSize });
+        }
     }
 }

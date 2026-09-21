@@ -9,9 +9,11 @@ CREATE TABLE IF NOT EXISTS public."Projects" (
     "Created" TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "ImageModelId" INTEGER NULL,
     "Seed" INTEGER NULL,
+    "TextureResolution" INTEGER NOT NULL DEFAULT 1024,
     CONSTRAINT "FK_Projects_AppUsers" FOREIGN KEY ("AppUserId") REFERENCES public."AppUsers"("Id") ON DELETE CASCADE
 );
 
 -- Add column for existing databases (no-op if already present)
 ALTER TABLE public."Projects" ADD COLUMN IF NOT EXISTS "ImageModelId" INTEGER NULL;
 ALTER TABLE public."Projects" ADD COLUMN IF NOT EXISTS "Seed" INTEGER NULL;
+ALTER TABLE public."Projects" ADD COLUMN IF NOT EXISTS "TextureResolution" INTEGER NOT NULL DEFAULT 1024;

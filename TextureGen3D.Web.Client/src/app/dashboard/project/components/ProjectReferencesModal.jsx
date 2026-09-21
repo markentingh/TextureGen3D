@@ -5,7 +5,7 @@ import { ProjectReferences } from '@/api/user/projectReferences';
 import { ProjectMeshReferences } from '@/api/user/projectMeshReferences';
 import { useModal } from '@/context/modal';
 
-export default function ProjectReferencesModal({ projectId, token, meshId, cameraAngleMode, selectedRefId, onSelectReference, onClose, onAdded, onDeleted, onProjectReferencesChanged }) {
+export default function ProjectReferencesModal({ projectId, token, meshId, cameraAngleMode, singleSelect = false, selectedRefId, onSelectReference, onClose, onAdded, onDeleted, onProjectReferencesChanged }) {
   const { showConfirmModal } = useModal();
   const [projectRefs, setProjectRefs] = useState([]);
   const [meshRefIds, setMeshRefIds] = useState(new Set());
@@ -144,7 +144,7 @@ export default function ProjectReferencesModal({ projectId, token, meshId, camer
       ) : (
         <>
           <p className="text-xs text-gray-500 dark:text-gray-400">
-            Click a thumbnail to {cameraAngleMode ? 'set it as the reference for this camera angle' : meshId ? 'toggle it for this mesh' : 'select it'}. Click the trash icon to delete from the project.
+            Click a thumbnail to {cameraAngleMode ? 'set it as the reference for this camera angle' : singleSelect ? 'select it as the reference for this mesh' : meshId ? 'toggle it for this mesh' : 'select it'}. Click the trash icon to delete from the project.
           </p>
           <div
             onDrop={handleDrop}
@@ -183,13 +183,14 @@ export default function ProjectReferencesModal({ projectId, token, meshId, camer
             </div>
 
             {projectRefs.map((ref) => {
-              const isSelected = cameraAngleMode
+              const selectMode = cameraAngleMode || singleSelect;
+              const isSelected = selectMode
                 ? selectedRefId === ref.id
                 : meshRefIds.has(ref.id);
               return (
                 <div
                   key={ref.id}
-                  onClick={() => cameraAngleMode ? onSelectReference?.(ref.id) : handleToggleMeshRef(ref.id)}
+                  onClick={() => selectMode ? onSelectReference?.(ref.id) : handleToggleMeshRef(ref.id)}
                   className={`relative rounded-lg overflow-hidden border-2 cursor-pointer transition group ${
                     isSelected ? 'border-purple-500 ring-1 ring-purple-500' : 'border-gray-200 dark:border-gray-600 hover:border-purple-300'
                   }`}

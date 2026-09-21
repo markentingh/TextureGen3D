@@ -125,6 +125,12 @@ namespace TextureGen3D.API.Services
                 Console.WriteLine($"[Gradio]   Mapped seed {seed.Value} to parameter '{imageModel.SeedPath}'");
             }
 
+            // Texture resolution → scales both input images and the output
+            // (see modules/refcontrol_depth.py depth_to_image's resolution arg)
+            var resolution = request.Width > 0 ? request.Width : 1024;
+            bodyParams["resolution"] = resolution;
+            Console.WriteLine($"[Gradio]   Mapped resolution {resolution} to parameter 'resolution'");
+
             var jsonBody = JsonSerializer.Serialize(bodyParams);
             Console.WriteLine($"[Gradio] Request body: {jsonBody}");
 

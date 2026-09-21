@@ -1,8 +1,9 @@
 import React, { useState, useEffect } from 'react';
 import Select from '@/components/forms/select';
 import Spinner from '@/components/ui/spinner';
+import MaskedUvmapThumb from './MaskedUvmapThumb';
 
-export default function StitchLayersModal({ layers, projectId, meshDbId, token, imageModels, layerApi, onClose, onStitched }) {
+export default function StitchLayersModal({ layers, projectId, meshDbId, token, imageModels, layerApi, layerMasksRef, viewerRef, onClose, onStitched }) {
   const [selectedLayerIds, setSelectedLayerIds] = useState([]);
   const [selectedModelId, setSelectedModelId] = useState('');
   const [stitching, setStitching] = useState(false);
@@ -65,11 +66,13 @@ export default function StitchLayersModal({ layers, projectId, meshDbId, token, 
                   className="relative rounded border border-gray-200 dark:border-gray-600 overflow-hidden bg-gray-100 dark:bg-gray-700"
                   style={{ width: 100, height: 100 }}
                 >
-                  <img
-                    src={layerApi.uvmapThumbUrl(projectId, meshDbId, layer.id)}
-                    alt={layer.name}
-                    className="w-full h-full object-cover"
-                    onError={(e) => { e.target.style.display = 'none'; }}
+                  <MaskedUvmapThumb
+                    layerId={layer.id}
+                    uvmapUrl={layerApi.uvmapThumbUrl(projectId, meshDbId, layer.id)}
+                    maskUrl={layerApi.maskThumbUrl(projectId, meshDbId, layer.id)}
+                    token={token}
+                    layerMasksRef={layerMasksRef}
+                    viewerRef={viewerRef}
                   />
                   <input
                     type="checkbox"
@@ -95,6 +98,8 @@ export default function StitchLayersModal({ layers, projectId, meshDbId, token, 
             name="imageModel"
             value={selectedModelId}
             onChange={(e) => setSelectedModelId(e.target.value)}
+            fitContent
+            className="mb-0"
             options={type0Models.map((m) => ({
               value: m.id?.toString() || '',
               label: m.name || m.model || m.modelKey,

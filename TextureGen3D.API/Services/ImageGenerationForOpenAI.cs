@@ -34,13 +34,20 @@ namespace TextureGen3D.API.Services
             if (string.IsNullOrWhiteSpace(request.Prompt))
                 throw new ArgumentException("Prompt is required.", nameof(request));
 
+            // OpenAI's edit API caps input edges at 3840px — 1K/2K inputs pass
+            // through unchanged, 4K downsizes to 3840.
             if (request.InputImages != null && request.InputImages.Count > 0)
             {
                 var resized = new List<byte[]>(request.InputImages.Count);
                 foreach (var img in request.InputImages)
-                    resized.Add(await _imageService.ResizeImageMaxAsync(img, 1024));
+                    resized.Add(await _imageService.ResizeImageMaxAsync(img, 3840));
                 request.InputImages = resized;
             }
+
+            // The mask must match the base image's dimensions or the edit API
+            // ignores/misapplies it
+            if (request.InputMask != null && request.InputMask.Length > 0)
+                request.InputMask = await _imageService.ResizeImageMaxAsync(request.InputMask, 3840);
 
             if (request.UseResponsesApi)
                 return await GenerateViaResponsesApiAsync(request);
@@ -162,23 +169,22 @@ namespace TextureGen3D.API.Services
                 formContent.Add(new StringContent(size), "size");
                 formContent.Add(new StringContent(quality), "quality");
 
-                var baseImage = request.InputImages[0];
-                var imageContent = new ByteArrayContent(baseImage);
-                imageContent.Headers.ContentType = new MediaTypeHeaderValue("image/png");
-                formContent.Add(imageContent, "image", "image.png");
+                // All input images go under "image[]" — mixing a single "image"
+                // part with "image[]" parts makes OpenAI reject the request
+                // ("parameter already has a different value")
+                for (var i = 0; i < request.InputImages.Count; i++)
+                {
+                    var img = request.InputImages[i];
+                    if (img == null || img.Length == 0) continue;
+                    var imgContent = new ByteArrayContent(img);
+                    imgContent.Headers.ContentType = new MediaTypeHeaderValue("image/png");
+                    formContent.Add(imgContent, "image[]", $"image_{i}.png");
+                }
 
+                // The mask is a separate multipart field, not an input image
                 var maskContent = new ByteArrayContent(request.InputMask);
                 maskContent.Headers.ContentType = new MediaTypeHeaderValue("image/png");
                 formContent.Add(maskContent, "mask", "mask.png");
-
-                for (var i = 1; i < request.InputImages.Count; i++)
-                {
-                    var extraImg = request.InputImages[i];
-                    if (extraImg == null || extraImg.Length == 0) continue;
-                    var extraContent = new ByteArrayContent(extraImg);
-                    extraContent.Headers.ContentType = new MediaTypeHeaderValue("image/png");
-                    formContent.Add(extraContent, "image[]", $"image_{i}.png");
-                }
 
                 using var maskRequest = new HttpRequestMessage(HttpMethod.Post, config.ImageEditEndpoint) { Content = formContent };
                 maskRequest.Headers.Authorization = new AuthenticationHeaderValue("Bearer", config.ApiKey);

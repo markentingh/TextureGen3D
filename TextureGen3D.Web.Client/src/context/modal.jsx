@@ -1,12 +1,14 @@
 import React, { createContext, useContext, useState, useCallback } from 'react';
 import Modal from '@/components/ui/modal';
 import Button from '@/components/ui/button';
+import WarningModal from '@/components/ui/warning-modal';
 
 const ModalContext = createContext(null);
 
 export function ModalProvider({ children }) {
   const [modal, setModal] = useState(null);
   const [confirm, setConfirm] = useState(null);
+  const [warning, setWarning] = useState(null);
 
   const showModal = useCallback((content) => {
     setModal(content);
@@ -42,8 +44,32 @@ export function ModalProvider({ children }) {
     setConfirm(null);
   }, [confirm]);
 
+  const showWarningModal = useCallback((opts) => {
+    setWarning({
+      title: opts.title || 'Warning',
+      message: opts.message || '',
+      confirmLabel: opts.confirmLabel || 'OK',
+      onConfirm: opts.onConfirm || (() => {}),
+      onClose: opts.onClose || (() => {}),
+    });
+  }, []);
+
+  const hideWarningModal = useCallback(() => {
+    setWarning(null);
+  }, []);
+
+  const handleWarningConfirm = useCallback(() => {
+    if (warning?.onConfirm) warning.onConfirm();
+    setWarning(null);
+  }, [warning]);
+
+  const handleWarningClose = useCallback(() => {
+    if (warning?.onClose) warning.onClose();
+    setWarning(null);
+  }, [warning]);
+
   return (
-    <ModalContext.Provider value={{ showModal, hideModal, showConfirmModal, hideConfirmModal }}>
+    <ModalContext.Provider value={{ showModal, hideModal, showConfirmModal, hideConfirmModal, showWarningModal, hideWarningModal }}>
       {children}
       {modal && (
         <Modal title={modal.title || ''} onClose={modal.onClose || hideModal} className={modal.className}>
@@ -64,6 +90,16 @@ export function ModalProvider({ children }) {
             )}
           </div>
         </Modal>
+      )}
+      {warning && (
+        <WarningModal
+          show
+          title={warning.title}
+          message={warning.message}
+          confirmLabel={warning.confirmLabel}
+          onConfirm={handleWarningConfirm}
+          onClose={handleWarningClose}
+        />
       )}
     </ModalContext.Provider>
   );

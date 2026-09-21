@@ -14,6 +14,7 @@ namespace TextureGen3D.Data.Interfaces.Projects
         Task UpdateKeyAsync(Guid id, Guid appUserId, string key);
         Task UpdateImageModelAsync(Guid id, Guid appUserId, int? imageModelId);
         Task UpdateSeedAsync(Guid id, Guid appUserId, int seed);
+        Task UpdateTextureResolutionAsync(Guid id, Guid appUserId, int textureResolution);
         Task DeleteAsync(Guid id, Guid appUserId);
         Task UnarchiveAsync(Guid id, Guid appUserId);
     }

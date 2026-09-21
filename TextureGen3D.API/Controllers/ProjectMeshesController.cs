@@ -13,13 +13,16 @@ namespace TextureGen3D.API.Controllers
     {
         readonly IProjectRepository _projectRepo;
         readonly IProjectMeshRepository _meshRepo;
+        readonly IImageService _imageService;
 
         public ProjectMeshesController(
             IProjectRepository projectRepo,
-            IProjectMeshRepository meshRepo)
+            IProjectMeshRepository meshRepo,
+            IImageService imageService)
         {
             _projectRepo = projectRepo;
             _meshRepo = meshRepo;
+            _imageService = imageService;
         }
 
         [HttpGet("{projectId}")]
@@ -144,6 +147,72 @@ namespace TextureGen3D.API.Controllers
             }
         }
 
+        public class SyncMeshesRequest
+        {
+            public Guid ModelId { get; set; }
+            public List<CreateMeshRequest> Meshes { get; set; } = new();
+        }
+
+        // Re-upload of an existing model: incoming meshes update the existing
+        // record with the same name (preserving its Id so layers/camera angles
+        // keep pointing at it); unmatched names create new records.
+        // Returns the resulting records aligned to the incoming order.
+        [HttpPost("{projectId}/sync")]
+        public async Task<IActionResult> Sync(Guid projectId, [FromBody] SyncMeshesRequest request)
+        {
+            try
+            {
+                var userId = GetUserId();
+                if (userId == Guid.Empty)
+                    return Json(new ApiResponse { success = false, message = "Could not find user" });
+
+                var project = await _projectRepo.GetByIdAsync(projectId, userId);
+                if (project == null)
+                    return Json(new ApiResponse { success = false, message = "Project not found" });
+
+                // Queue of existing records per name — consumed in order so
+                // duplicate mesh names each map to a distinct record
+                var existing = (await _meshRepo.GetByModelIdAsync(request.ModelId, projectId))
+                    .GroupBy(m => m.Name ?? "")
+                    .ToDictionary(g => g.Key, g => new Queue<ProjectMesh>(g));
+
+                var results = new List<ProjectMesh>();
+                foreach (var incoming in request.Meshes)
+                {
+                    var name = incoming.Name ?? "";
+                    if (existing.TryGetValue(name, out var queue) && queue.Count > 0)
+                    {
+                        var match = queue.Dequeue();
+                        await _meshRepo.UpdateDataAsync(match.Id, projectId, incoming.MeshData, incoming.UVMapData, incoming.Triangles, incoming.Vertices);
+                        match.MeshData = incoming.MeshData;
+                        match.UVMapData = incoming.UVMapData;
+                        match.Triangles = incoming.Triangles;
+                        match.Vertices = incoming.Vertices;
+                        results.Add(match);
+                    }
+                    else
+                    {
+                        var mesh = new ProjectMesh
+                        {
+                            ProjectId = projectId,
+                            ModelId = request.ModelId,
+                            Name = name,
+                            MeshData = incoming.MeshData,
+                            UVMapData = incoming.UVMapData,
+                            Triangles = incoming.Triangles,
+                            Vertices = incoming.Vertices,
+                        };
+                        results.Add(await _meshRepo.CreateAsync(mesh));
+                    }
+                }
+                return Json(new ApiResponse { success = true, data = results });
+            }
+            catch (Exception ex)
+            {
+                return Json(new ApiResponse { success = false, message = ex.Message });
+            }
+        }
+
         [HttpPost("{projectId}/{meshId}/delete")]
         public async Task<IActionResult> Delete(Guid projectId, Guid meshId)
         {
@@ -157,6 +226,9 @@ namespace TextureGen3D.API.Controllers
                 if (project == null)
                     return Json(new ApiResponse { success = false, message = "Project not found" });
 
+                // Layers/references/angles cascade via FK; the mesh's on-disk
+                // folder (uvmaps, masks, layer images) needs explicit removal
+                await _imageService.DeleteProjectMeshFolderAsync(projectId, meshId);
                 await _meshRepo.DeleteAsync(meshId, projectId);
                 return Json(new ApiResponse { success = true });
             }

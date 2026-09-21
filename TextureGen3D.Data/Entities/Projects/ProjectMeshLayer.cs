@@ -9,6 +9,7 @@ namespace TextureGen3D.Data.Entities.Projects
         public int Index { get; set; }
         public string CameraAngle { get; set; } = "";
         public bool Visible { get; set; } = true;
+        public bool Inpaint { get; set; }
         public DateTime Created { get; set; }
     }
 }

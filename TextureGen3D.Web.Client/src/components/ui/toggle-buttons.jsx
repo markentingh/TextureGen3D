@@ -14,7 +14,7 @@ export default function ToggleButtons({ options, value, onChange, className = ''
           onClick={() => onChange(opt.value)}
           className={`flex-1 px-3 py-1.5 text-xs font-medium rounded-lg border ${
             value === opt.value
-              ? 'bg-purple-600 text-white border-purple-600'
+              ? 'bg-purple-50 dark:bg-purple-900/30 border-purple-500 text-purple-700 dark:text-purple-300'
               : 'text-gray-600 dark:text-gray-300 border-gray-300 dark:border-gray-600 hover:border-purple-400'
           }`}
         >

@@ -371,6 +371,24 @@ namespace TextureGen3D.API.Controllers
             }
         }
 
+        [HttpPost("update-texture-resolution")]
+        public async Task<IActionResult> UpdateTextureResolution([FromBody] UpdateProjectTextureResolutionRequest request)
+        {
+            try
+            {
+                var userId = GetUserId();
+                if (userId == Guid.Empty)
+                    return Json(new ApiResponse { success = false, message = "Could not find user" });
+
+                await _projectRepo.UpdateTextureResolutionAsync(request.Id, userId, request.TextureResolution);
+                return Json(new ApiResponse { success = true });
+            }
+            catch (Exception ex)
+            {
+                return Json(new ApiResponse { success = false, message = ex.Message });
+            }
+        }
+
         [HttpPost("{id}/save-thumb")]
         public async Task<IActionResult> SaveThumb(Guid id, [FromBody] SaveProjectThumbRequest request)
         {
