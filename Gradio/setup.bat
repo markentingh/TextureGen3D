@@ -29,13 +29,50 @@ if %errorlevel%==0 (
     )
 )
 echo.
-REM Check if all key dependencies are already installed
-python -c "import gradio, diffusers, transformers, accelerate, peft, einops, omegaconf" >nul 2>&1
-if %errorlevel%==0 (
-    echo Dependencies already installed. Skipping.
+REM Check each dependency individually; collect missing ones by pip name
+set "MISSING_PKGS="
+for %%p in (gradio accelerate safetensors sentencepiece peft ninja pybind11 einops omegaconf huggingface_hub rembg onnxruntime) do (
+    python -c "import %%p" >nul 2>&1
+    if errorlevel 1 (
+        echo   Missing: %%p
+        set "MISSING_PKGS=!MISSING_PKGS! %%p"
+    ) else (
+        echo   Installed: %%p
+    )
+)
+python -c "from google import protobuf" >nul 2>&1
+if errorlevel 1 (
+    echo   Missing: protobuf
+    set "MISSING_PKGS=!MISSING_PKGS! protobuf"
 ) else (
-    echo Installing other dependencies...
-    pip install gradio diffusers transformers accelerate safetensors sentencepiece protobuf peft ninja pybind11 einops opencv-python omegaconf huggingface_hub
+    echo   Installed: protobuf
+)
+python -c "import cv2" >nul 2>&1
+if errorlevel 1 (
+    echo   Missing: opencv-python
+    set "MISSING_PKGS=!MISSING_PKGS! opencv-python"
+) else (
+    echo   Installed: opencv-python
+)
+python -c "import transformers; from packaging.version import Version; assert Version(transformers.__version__) >= Version('5.17')" >nul 2>&1
+if errorlevel 1 (
+    echo   Missing/outdated: transformers^>=5.17
+    set "MISSING_PKGS=!MISSING_PKGS! transformers>=5.17"
+) else (
+    echo   Installed: transformers^>=5.17
+)
+python -c "from diffusers import QwenImage21Pipeline" >nul 2>&1
+if errorlevel 1 (
+    echo   Missing/outdated: diffusers with QwenImage21Pipeline support
+    set "MISSING_PKGS=!MISSING_PKGS! git+https://github.com/huggingface/diffusers"
+) else (
+    echo   Installed: diffusers with QwenImage21Pipeline support
+)
+if not defined MISSING_PKGS (
+    echo All dependencies already installed. Skipping.
+) else (
+    echo Installing missing dependencies...
+    pip install!MISSING_PKGS!
 )
 echo.
 echo ============================================
@@ -46,7 +83,7 @@ exit /b 0
 
 :amd
 echo.
-echo AMD GPU detected. Using native ROCm 7.2.1 wheels (no ZLUDA needed).
+echo AMD GPU detected. Using native ROCm 7.2.1 wheels.
 echo.
 
 REM Check if venv already exists with torch installed
@@ -128,18 +165,51 @@ if %errorlevel%==0 (
 
 :amd_deps
 echo.
-REM Check if all key dependencies are already installed in the venv
-venv\Scripts\python.exe -c "import gradio, diffusers, transformers, accelerate, peft, einops, omegaconf" >nul 2>&1
-if %errorlevel%==0 (
-    echo Dependencies already installed. Skipping.
-) else (
-    echo Installing other dependencies...
-    venv\Scripts\pip install gradio diffusers transformers accelerate safetensors sentencepiece protobuf peft ninja pybind11 einops opencv-python omegaconf huggingface_hub
+REM Check each dependency individually; collect missing ones by pip name
+set "MISSING_PKGS="
+for %%p in (gradio accelerate safetensors sentencepiece peft ninja pybind11 einops omegaconf huggingface_hub rembg onnxruntime) do (
+    venv\Scripts\python.exe -c "import %%p" >nul 2>&1
+    if errorlevel 1 (
+        echo   Missing: %%p
+        set "MISSING_PKGS=!MISSING_PKGS! %%p"
+    ) else (
+        echo   Installed: %%p
+    )
 )
-
-echo.
-echo Cleaning up old ZLUDA files...
-if exist ".zluda" rmdir /s /q .zluda
+venv\Scripts\python.exe -c "from google import protobuf" >nul 2>&1
+if errorlevel 1 (
+    echo   Missing: protobuf
+    set "MISSING_PKGS=!MISSING_PKGS! protobuf"
+) else (
+    echo   Installed: protobuf
+)
+venv\Scripts\python.exe -c "import cv2" >nul 2>&1
+if errorlevel 1 (
+    echo   Missing: opencv-python
+    set "MISSING_PKGS=!MISSING_PKGS! opencv-python"
+) else (
+    echo   Installed: opencv-python
+)
+venv\Scripts\python.exe -c "import transformers; from packaging.version import Version; assert Version(transformers.__version__) >= Version('5.17')" >nul 2>&1
+if errorlevel 1 (
+    echo   Missing/outdated: transformers^>=5.17
+    set "MISSING_PKGS=!MISSING_PKGS! transformers>=5.17"
+) else (
+    echo   Installed: transformers^>=5.17
+)
+venv\Scripts\python.exe -c "from diffusers import QwenImage21Pipeline" >nul 2>&1
+if errorlevel 1 (
+    echo   Missing/outdated: diffusers with QwenImage21Pipeline support
+    set "MISSING_PKGS=!MISSING_PKGS! git+https://github.com/huggingface/diffusers"
+) else (
+    echo   Installed: diffusers with QwenImage21Pipeline support
+)
+if not defined MISSING_PKGS (
+    echo All dependencies already installed. Skipping.
+) else (
+    echo Installing missing dependencies...
+    venv\Scripts\pip install!MISSING_PKGS!
+)
 
 echo.
 echo ============================================

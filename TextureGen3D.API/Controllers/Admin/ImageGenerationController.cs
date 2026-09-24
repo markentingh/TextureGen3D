@@ -61,6 +61,8 @@ namespace TextureGen3D.API.Controllers.Admin
                     seedPath = m.SeedPath,
                     prompt = m.Prompt,
                     endpointUrl = m.EndpointUrl,
+                    paramMappings = m.ParamMappings,
+                    pricingType = m.PricingType,
                     active = m.Active
                 }).ToList();
 
@@ -106,6 +108,8 @@ namespace TextureGen3D.API.Controllers.Admin
                         existing.SeedPath = request.SeedPath;
                         existing.Prompt = request.Prompt;
                         existing.EndpointUrl = request.EndpointUrl;
+                        existing.ParamMappings = request.ParamMappings;
+                        existing.PricingType = request.PricingType;
                         existing.Active = request.Active;
                         await _repo.UpdateAsync(existing);
                     }
@@ -132,6 +136,8 @@ namespace TextureGen3D.API.Controllers.Admin
                         SeedPath = request.SeedPath,
                         Prompt = request.Prompt,
                         EndpointUrl = request.EndpointUrl,
+                        ParamMappings = request.ParamMappings,
+                        PricingType = request.PricingType,
                         Active = request.Active
                     };
                     await _repo.CreateAsync(model);

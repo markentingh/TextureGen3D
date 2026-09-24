@@ -425,13 +425,13 @@ export default function AdminOpenAI() {
                                 </td>
                                 <td className="px-4 py-3">{model.name || '(not configured)'}</td>
                                 <td className="px-4 py-3">{model.model || '-'}</td>
-                                <td className="px-4 py-3">{model.type === 1 ? 'Per Megapixel' : 'Per Million'}</td>
-                                <td className="px-4 py-3">{model.type === 1 ? '-' : `$${model.cpmitTokens}`}</td>
-                                <td className="px-4 py-3">{model.type === 1 ? '-' : `$${model.cpmiiTokens}`}</td>
-                                <td className="px-4 py-3">{model.type === 1 ? '-' : `$${model.cpmoTokens}`}</td>
-                                <td className="px-4 py-3">{model.type === 1 ? `$${model.cp1k}` : '-'}</td>
-                                <td className="px-4 py-3">{model.type === 1 ? `$${model.cp2k}` : '-'}</td>
-                                <td className="px-4 py-3">{model.type === 1 ? `$${model.cp4k}` : '-'}</td>
+                                <td className="px-4 py-3">{model.pricingType === 1 ? 'Per Megapixel' : 'Per Million'}</td>
+                                <td className="px-4 py-3">{model.pricingType === 1 ? '-' : `$${model.cpmitTokens}`}</td>
+                                <td className="px-4 py-3">{model.pricingType === 1 ? '-' : `$${model.cpmiiTokens}`}</td>
+                                <td className="px-4 py-3">{model.pricingType === 1 ? '-' : `$${model.cpmoTokens}`}</td>
+                                <td className="px-4 py-3">{model.pricingType === 1 ? `$${model.cp1k}` : '-'}</td>
+                                <td className="px-4 py-3">{model.pricingType === 1 ? `$${model.cp2k}` : '-'}</td>
+                                <td className="px-4 py-3">{model.pricingType === 1 ? `$${model.cp4k}` : '-'}</td>
                                 <td className="px-4 py-3" onClick={(e) => e.stopPropagation()}>
                                     <div className="flex items-center gap-2">
                                         <ButtonIcon name="edit" onClick={() => handleImageModelClick(model)} title="Edit model" />

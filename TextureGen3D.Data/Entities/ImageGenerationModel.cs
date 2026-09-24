@@ -21,6 +21,8 @@ namespace TextureGen3D.Data.Entities
         public string? SeedPath { get; set; }
         public string? Prompt { get; set; }
         public string? EndpointUrl { get; set; }
+        public string? ParamMappings { get; set; }
+        public int PricingType { get; set; } = 0;
         public bool Active { get; set; } = true;
         public DateTime DateCreated { get; set; }
         public DateTime DateUpdated { get; set; }

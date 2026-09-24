@@ -104,38 +104,79 @@ namespace TextureGen3D.API.Services
 
             // 2. Build the request body using the parameter names from the model
             var bodyParams = new Dictionary<string, object>();
+            var resolution = request.Width > 0 ? request.Width : 1024;
 
             Console.WriteLine($"[Gradio] Parameter mapping: DepthMapPath='{imageModel.DepthMapPath}', InputImagesPath='{imageModel.InputImagesPath}', PromptPath='{imageModel.PromptPath}'");
 
-            if (!string.IsNullOrWhiteSpace(imageModel.DepthMapPath) && depthMapPath != null)
+            if (imageModel.Type == 4 || imageModel.Type == 2)
             {
-                bodyParams[imageModel.DepthMapPath] = new { path = depthMapPath, meta = new { _type = "gradio.FileData" } };
-                Console.WriteLine($"[Gradio]   Mapped depth map to parameter '{imageModel.DepthMapPath}'");
+                // Background Removal (4) / Inpainting (2) — the first input
+                // image (inputImages[0], uploaded above into depthMapPath)
+                // maps to the 'Reference Image' role param; inpainting also
+                // maps the alpha-masked composite to the 'Mask Image' role
+                // param. Roles resolve from ParamMappings JSON first,
+                // falling back to the legacy path columns.
+                var roleToParam = ParseRoleMappings(imageModel);
+                if (roleToParam.TryGetValue("Reference Image", out var refParam) && depthMapPath != null)
+                {
+                    bodyParams[refParam] = new { path = depthMapPath, meta = new { _type = "gradio.FileData" } };
+                    Console.WriteLine($"[Gradio]   Mapped input image to parameter '{refParam}'");
+                }
+                if (imageModel.Type == 2
+                    && request.InputMask != null && request.InputMask.Length > 0
+                    && roleToParam.TryGetValue("Mask Image", out var maskParam))
+                {
+                    var maskPath = await UploadFileAsync(client, endpoint, request.InputMask, $"mask_{uploadId}.png", cancellationToken);
+                    bodyParams[maskParam] = new { path = maskPath, meta = new { _type = "gradio.FileData" } };
+                    Console.WriteLine($"[Gradio]   Mapped mask image to parameter '{maskParam}'");
+                }
+                if (roleToParam.TryGetValue("Prompt", out var promptParam) && !string.IsNullOrWhiteSpace(request.Prompt))
+                {
+                    bodyParams[promptParam] = request.Prompt;
+                    Console.WriteLine($"[Gradio]   Mapped prompt to parameter '{promptParam}'");
+                }
+                if (roleToParam.TryGetValue("Seed", out var seedParam) && seed.HasValue)
+                {
+                    bodyParams[seedParam] = seed.Value;
+                    Console.WriteLine($"[Gradio]   Mapped seed {seed.Value} to parameter '{seedParam}'");
+                }
+                if (roleToParam.TryGetValue("Resolution", out var resParam))
+                {
+                    bodyParams[resParam] = resolution;
+                    Console.WriteLine($"[Gradio]   Mapped resolution {resolution} to parameter '{resParam}'");
+                }
             }
-            if (!string.IsNullOrWhiteSpace(imageModel.InputImagesPath) && referenceImagePath != null)
+            else
             {
-                bodyParams[imageModel.InputImagesPath] = new { path = referenceImagePath, meta = new { _type = "gradio.FileData" } };
-                Console.WriteLine($"[Gradio]   Mapped reference image to parameter '{imageModel.InputImagesPath}'");
-            }
-            // Note: prompt is not sent to Gradio — the RefControl LoRA uses only
-            // the depth map and reference image for conditioning.
-            if (!string.IsNullOrWhiteSpace(imageModel.SeedPath) && seed.HasValue)
-            {
-                bodyParams[imageModel.SeedPath] = seed.Value;
-                Console.WriteLine($"[Gradio]   Mapped seed {seed.Value} to parameter '{imageModel.SeedPath}'");
-            }
+                if (!string.IsNullOrWhiteSpace(imageModel.DepthMapPath) && depthMapPath != null)
+                {
+                    bodyParams[imageModel.DepthMapPath] = new { path = depthMapPath, meta = new { _type = "gradio.FileData" } };
+                    Console.WriteLine($"[Gradio]   Mapped depth map to parameter '{imageModel.DepthMapPath}'");
+                }
+                if (!string.IsNullOrWhiteSpace(imageModel.InputImagesPath) && referenceImagePath != null)
+                {
+                    bodyParams[imageModel.InputImagesPath] = new { path = referenceImagePath, meta = new { _type = "gradio.FileData" } };
+                    Console.WriteLine($"[Gradio]   Mapped reference image to parameter '{imageModel.InputImagesPath}'");
+                }
+                // Note: prompt is not sent to Gradio — the RefControl LoRA uses only
+                // the depth map and reference image for conditioning.
+                if (!string.IsNullOrWhiteSpace(imageModel.SeedPath) && seed.HasValue)
+                {
+                    bodyParams[imageModel.SeedPath] = seed.Value;
+                    Console.WriteLine($"[Gradio]   Mapped seed {seed.Value} to parameter '{imageModel.SeedPath}'");
+                }
 
-            // Texture resolution → scales both input images and the output
-            // (see modules/refcontrol_depth.py depth_to_image's resolution arg)
-            var resolution = request.Width > 0 ? request.Width : 1024;
-            bodyParams["resolution"] = resolution;
-            Console.WriteLine($"[Gradio]   Mapped resolution {resolution} to parameter 'resolution'");
+                // Texture resolution → scales both input images and the output
+                // (see modules/refcontrol_depth.py depth_to_image's resolution arg)
+                bodyParams["resolution"] = resolution;
+                Console.WriteLine($"[Gradio]   Mapped resolution {resolution} to parameter 'resolution'");
+            }
 
             var jsonBody = JsonSerializer.Serialize(bodyParams);
             Console.WriteLine($"[Gradio] Request body: {jsonBody}");
 
             // 3. POST to start the generation
-            progress?.Report((20, "Starting generation..."));
+            progress?.Report((20, "Applying depth map to image..."));
             using var postContent = new StringContent(jsonBody, Encoding.UTF8, "application/json");
             using var postResponse = await client.PostAsync(postUrl, postContent, cancellationToken);
             var postResponseContent = await postResponse.Content.ReadAsStringAsync(cancellationToken);
@@ -150,7 +191,7 @@ namespace TextureGen3D.API.Services
                 ?? throw new InvalidOperationException("Gradio POST did not return an event_id.");
 
             // 4. Stream the SSE result
-            progress?.Report((30, "Waiting for generation..."));
+            progress?.Report((30, "Applying depth map to image..."));
             var sseUrl = $"{endpoint}/gradio_api/call/{apiName}/{eventId}";
 
             using var sseResponse = await client.GetAsync(sseUrl, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
@@ -172,7 +213,7 @@ namespace TextureGen3D.API.Services
                     var eventType = line.Substring("event:".Length).Trim();
                     if (eventType == "complete")
                     {
-                        progress?.Report((90, "Generation complete, fetching output..."));
+                        progress?.Report((90, "Generation complete, fetching image..."));
                     }
                     else if (eventType == "error")
                     {
@@ -222,6 +263,36 @@ namespace TextureGen3D.API.Services
             progress?.Report((100, "Done."));
 
             return new ImageGenerationResult { ImageBytes = imageBytes };
+        }
+
+        /// <summary>
+        /// Build a role→paramName lookup for a model: the four legacy path
+        /// columns first, then ParamMappings JSON ({ paramName: role }) on top.
+        /// </summary>
+        static Dictionary<string, string> ParseRoleMappings(ImageGenerationModel model)
+        {
+            var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            if (!string.IsNullOrWhiteSpace(model.DepthMapPath)) map["Depth Map"] = model.DepthMapPath;
+            if (!string.IsNullOrWhiteSpace(model.InputImagesPath)) map["Reference Image"] = model.InputImagesPath;
+            if (!string.IsNullOrWhiteSpace(model.PromptPath)) map["Prompt"] = model.PromptPath;
+            if (!string.IsNullOrWhiteSpace(model.SeedPath)) map["Seed"] = model.SeedPath;
+            if (!string.IsNullOrWhiteSpace(model.ParamMappings))
+            {
+                try
+                {
+                    var parsed = JsonSerializer.Deserialize<Dictionary<string, string>>(model.ParamMappings);
+                    if (parsed != null)
+                    {
+                        foreach (var kv in parsed)
+                        {
+                            if (!string.IsNullOrWhiteSpace(kv.Key) && !string.IsNullOrWhiteSpace(kv.Value))
+                                map[kv.Value] = kv.Key;
+                        }
+                    }
+                }
+                catch { /* malformed JSON — legacy mappings still apply */ }
+            }
+            return map;
         }
 
         /// <summary>

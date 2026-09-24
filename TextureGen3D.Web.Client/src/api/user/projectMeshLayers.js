@@ -4,7 +4,7 @@ const ProjectMeshLayers = (args) => Api({ ...args }).endpoints(({ api }) => {
   const apiPath = '/api/project-mesh-layers';
   return {
     getByMesh: (projectId, meshId) => api.get(`${apiPath}/${projectId}/mesh/${meshId}`),
-    create: (projectId, meshId, name, cameraAngle, inpaint = false) => api.post(`${apiPath}/${projectId}`, { meshId, name, cameraAngle, inpaint }),
+    create: (projectId, meshId, name, cameraAngle, inpaint = false, referenceId = null) => api.post(`${apiPath}/${projectId}`, { meshId, name, cameraAngle, inpaint, referenceId }),
     updateName: (projectId, layerId, name) => api.post(`${apiPath}/${projectId}/${layerId}/update-name`, { name }),
     reorder: (projectId, meshId, orderedIds) => api.post(`${apiPath}/${projectId}/reorder`, { meshId, orderedIds }),
     delete: (projectId, layerId) => api.post(`${apiPath}/${projectId}/${layerId}/delete`),

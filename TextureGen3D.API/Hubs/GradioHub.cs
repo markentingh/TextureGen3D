@@ -83,8 +83,11 @@ namespace TextureGen3D.API.Hubs
                 // Build input images: depth map first, then reference image
                 var inputImages = new List<byte[]>();
 
-                // Read the depth map from storage (uploaded via API before connecting to hub)
-                var depthMapBytes = await _imageService.GetProjectMeshLayerDepthMapAsync(projectId, meshId, layerId);
+                // Read the depth map from storage (uploaded via API before connecting to hub).
+                // Type 4 (Background Removal) models take a single image — no depth map.
+                var depthMapBytes = imageModel.Type == 4
+                    ? null
+                    : await _imageService.GetProjectMeshLayerDepthMapAsync(projectId, meshId, layerId);
                 Console.WriteLine($"[GradioHub] Depth map for layer {layerId}: {depthMapBytes?.Length ?? 0} bytes");
                 if (depthMapBytes != null && depthMapBytes.Length > 0)
                     inputImages.Add(depthMapBytes);

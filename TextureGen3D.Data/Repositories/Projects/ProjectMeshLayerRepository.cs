@@ -22,8 +22,8 @@ namespace TextureGen3D.Data.Repositories.Projects
                 layer.Created = DateTime.UtcNow;
 
             const string query = @"
-                INSERT INTO public.""ProjectMeshLayers"" (""Id"", ""ProjectId"", ""ProjectMeshId"", ""Name"", ""Index"", ""CameraAngle"", ""Visible"", ""Inpaint"", ""Created"")
-                VALUES (@Id, @ProjectId, @ProjectMeshId, @Name, @Index, @CameraAngle, @Visible, @Inpaint, @Created)
+                INSERT INTO public.""ProjectMeshLayers"" (""Id"", ""ProjectId"", ""ProjectMeshId"", ""Name"", ""Index"", ""CameraAngle"", ""Visible"", ""Inpaint"", ""ReferenceId"", ""Created"")
+                VALUES (@Id, @ProjectId, @ProjectMeshId, @Name, @Index, @CameraAngle, @Visible, @Inpaint, @ReferenceId, @Created)
                 RETURNING *";
             return await _dbConnection.QueryFirstAsync<ProjectMeshLayer>(query, layer);
         }

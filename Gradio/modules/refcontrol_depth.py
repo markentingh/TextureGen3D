@@ -4,24 +4,21 @@ import time
 from PIL import Image
 from diffusers import Flux2KleinPipeline
 
-#BASE_MODEL = "black-forest-labs/FLUX.2-klein-4B"
-# Match the ComfyUI workflow: flux-2-klein-base-4b-fp8 is the BASE model,
-# not the distilled 4-step variant. The base model supports real CFG guidance
-# and produces far more stable output with the RefControl LoRA.
-BASE_MODEL = "black-forest-labs/FLUX.2-klein-base-4B"
-# FP8 transformer checkpoint (same file ComfyUI loads via UNETLoader) —
-# 4GB instead of ~8GB bf16. Loaded as a pipeline component when supported.
-TRANSFORMER_FP8 = "https://huggingface.co/black-forest-labs/FLUX.2-klein-base-4b-fp8/resolve/main/flux-2-klein-base-4b-fp8.safetensors"
+#BASE_MODEL = "black-forest-labs/FLUX.2-klein-base-4B"
+# Distilled 4-step klein — much faster than the base model (which needs ~20
+# steps). Trade-off vs the base model the LoRA card's workflow uses: the
+# distilled variant can't apply real CFG guidance (runs at guidance 1.0), so
+# the LoRA conditioning may be slightly weaker.
+BASE_MODEL = "black-forest-labs/FLUX.2-klein-4B"
+# FP8 transformer checkpoint — 4GB instead of ~8GB bf16. Loaded as a
+# pipeline component when supported.
+TRANSFORMER_FP8 = "https://huggingface.co/black-forest-labs/FLUX.2-klein-4b-fp8/resolve/main/flux-2-klein-4b-fp8.safetensors"
 LORA_MODEL = "thedeoxen/refcontrol-FLUX.2-klein-4B-reference-depth-lora"
 
-# Match the ComfyUI workflow settings:
-#   Flux2Scheduler steps=20, CFGGuider cfg=5, empty negative prompt,
-#   positive prompt is literally "refcontrol" (the LoRA trigger word).
-# NOTE: 4 steps is only correct for the *distilled* klein model — the base
-# model is not step-distilled, so 4 steps leaves it under-denoised and the
-# output comes out dark/muted.
-NUM_STEPS = 20
-GUIDANCE_SCALE = 5.0
+# Distilled klein settings: 4 steps, guidance 1.0 — the model is
+# step-distilled, so more steps over-denoise and real CFG doesn't apply.
+NUM_STEPS = 4
+GUIDANCE_SCALE = 1.0
 # RefControl LoRA weight — at full strength (1.0) the depth LoRA can
 # over-saturate dark boundaries; 0.8 keeps natural lighting. Passed through
 # attention_kwargs -> joint_attention_kwargs on the transformer.

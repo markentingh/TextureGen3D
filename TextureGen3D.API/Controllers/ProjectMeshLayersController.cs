@@ -76,6 +76,7 @@ namespace TextureGen3D.API.Controllers
             public string Name { get; set; } = "";
             public string? CameraAngle { get; set; }
             public bool Inpaint { get; set; }
+            public Guid? ReferenceId { get; set; }
         }
 
         [HttpPost("{projectId}")]
@@ -100,6 +101,7 @@ namespace TextureGen3D.API.Controllers
                     Index = nextIndex,
                     CameraAngle = request.CameraAngle ?? "",
                     Inpaint = request.Inpaint,
+                    ReferenceId = request.ReferenceId,
                 };
                 var created = await _layerRepo.CreateAsync(layer);
                 return Json(new ApiResponse { success = true, data = created });
@@ -362,8 +364,8 @@ namespace TextureGen3D.API.Controllers
 
                 await _imageService.SaveProjectMeshLayerImageAsync(projectId, request.MeshId, layerId, imageBytes);
 
-                // Generate 100x100 thumbnail
-                var thumbBytes = await _imageService.GenerateThumbnailAsync(imageBytes, 100);
+                // Generate 100x100 thumbnail (PNG — keeps alpha)
+                var thumbBytes = await _imageService.GenerateThumbnailAsync(imageBytes, 100, preserveTransparency: true);
                 await _imageService.SaveProjectMeshLayerThumbAsync(projectId, request.MeshId, layerId, thumbBytes);
 
                 return Json(new ApiResponse { success = true });
@@ -399,8 +401,8 @@ namespace TextureGen3D.API.Controllers
 
                 await _imageService.SaveProjectMeshLayerUvMapAsync(projectId, request.MeshId, layerId, uvmapBytes);
 
-                // Generate and save a thumbnail of the UV map
-                var uvThumbBytes = await _imageService.GenerateThumbnailAsync(uvmapBytes, 100);
+                // Generate and save a thumbnail of the UV map (PNG — keeps alpha)
+                var uvThumbBytes = await _imageService.GenerateThumbnailAsync(uvmapBytes, 100, preserveTransparency: true);
                 await _imageService.SaveProjectMeshLayerUvMapThumbAsync(projectId, request.MeshId, layerId, uvThumbBytes);
 
                 return Json(new ApiResponse { success = true });
@@ -609,62 +611,76 @@ namespace TextureGen3D.API.Controllers
                 if (imageModel == null)
                     return Json(new ApiResponse { success = false, message = "Image model not found" });
 
-                // Build input images: depth map first, then active mesh references
+                // Build input images: depth map first, then active mesh references.
+                // Type 4 (Background Removal) models take the caller-supplied image only.
                 var inputImages = new List<byte[]>();
-
-                // Add the depth map (from the canvas)
                 byte[]? depthMapBytes = null;
-                if (!string.IsNullOrWhiteSpace(request.DepthMap))
-                {
-                    var base64 = request.DepthMap.StartsWith("data:") ? request.DepthMap.Substring(request.DepthMap.IndexOf(',') + 1) : request.DepthMap;
-                    depthMapBytes = Convert.FromBase64String(base64);
-                    inputImages.Add(depthMapBytes);
-                }
 
-                // A caller-supplied input image (e.g. an inpainted render) acts as
-                // the sole reference — skip mesh/angle reference lookup entirely
-                if (!string.IsNullOrWhiteSpace(request.InputImage))
+                if (imageModel.Type == 4)
                 {
-                    var imgBase64 = request.InputImage.StartsWith("data:") ? request.InputImage.Substring(request.InputImage.IndexOf(',') + 1) : request.InputImage;
-                    inputImages.Add(Convert.FromBase64String(imgBase64));
-                }
-                // Fetch image references: use camera angle's reference if CameraAngleId is set, otherwise mesh references
-                else if (request.CameraAngleId.HasValue)
-                {
-                    var angle = await _angleRepo.GetByIdAsync(request.CameraAngleId.Value, projectId);
-                    if (angle != null && angle.ProjectReferenceId.HasValue)
+                    if (!string.IsNullOrWhiteSpace(request.InputImage))
                     {
-                        var reference = await _refRepo.GetByIdAsync(angle.ProjectReferenceId.Value, projectId);
-                        if (reference != null)
+                        var imgBase64 = request.InputImage.StartsWith("data:") ? request.InputImage.Substring(request.InputImage.IndexOf(',') + 1) : request.InputImage;
+                        inputImages.Add(Convert.FromBase64String(imgBase64));
+                    }
+                }
+                else
+                {
+                    // Add the depth map (from the canvas)
+                    if (!string.IsNullOrWhiteSpace(request.DepthMap))
+                    {
+                        var base64 = request.DepthMap.StartsWith("data:") ? request.DepthMap.Substring(request.DepthMap.IndexOf(',') + 1) : request.DepthMap;
+                        depthMapBytes = Convert.FromBase64String(base64);
+                        inputImages.Add(depthMapBytes);
+                    }
+
+                    // A caller-supplied input image (e.g. an inpainted render) acts as
+                    // the sole reference — skip mesh/angle reference lookup entirely
+                    if (!string.IsNullOrWhiteSpace(request.InputImage))
+                    {
+                        var imgBase64 = request.InputImage.StartsWith("data:") ? request.InputImage.Substring(request.InputImage.IndexOf(',') + 1) : request.InputImage;
+                        inputImages.Add(Convert.FromBase64String(imgBase64));
+                    }
+                    // Fetch image references: use camera angle's reference if CameraAngleId is set, otherwise mesh references
+                    else if (request.CameraAngleId.HasValue)
+                    {
+                        var angle = await _angleRepo.GetByIdAsync(request.CameraAngleId.Value, projectId);
+                        if (angle != null && angle.ProjectReferenceId.HasValue)
                         {
+                            var reference = await _refRepo.GetByIdAsync(angle.ProjectReferenceId.Value, projectId);
+                            if (reference != null)
+                            {
+                                var refBytes = await _imageService.GetProjectReferenceAsync(projectId, reference.Id, reference.Extension);
+                                if (refBytes != null && refBytes.Length > 0)
+                                    inputImages.Add(refBytes);
+                            }
+                        }
+                    }
+                    else
+                    {
+                        // Fetch active image references for this mesh from ProjectMeshReferences
+                        var meshRefs = await _meshRefRepo.GetByMeshIdAsync(request.MeshId, projectId);
+                        foreach (var meshRef in meshRefs.Where(mr => mr.Active))
+                        {
+                            var reference = await _refRepo.GetByIdAsync(meshRef.ProjectReferenceId, projectId);
+                            if (reference == null) continue;
                             var refBytes = await _imageService.GetProjectReferenceAsync(projectId, reference.Id, reference.Extension);
                             if (refBytes != null && refBytes.Length > 0)
                                 inputImages.Add(refBytes);
                         }
                     }
                 }
-                else
-                {
-                    // Fetch active image references for this mesh from ProjectMeshReferences
-                    var meshRefs = await _meshRefRepo.GetByMeshIdAsync(request.MeshId, projectId);
-                    foreach (var meshRef in meshRefs.Where(mr => mr.Active))
-                    {
-                        var reference = await _refRepo.GetByIdAsync(meshRef.ProjectReferenceId, projectId);
-                        if (reference == null) continue;
-                        var refBytes = await _imageService.GetProjectReferenceAsync(projectId, reference.Id, reference.Extension);
-                        if (refBytes != null && refBytes.Length > 0)
-                            inputImages.Add(refBytes);
-                    }
-                }
 
                 if (inputImages.Count == 0)
-                    return Json(new ApiResponse { success = false, message = "At least one input image (depth map) is required" });
+                    return Json(new ApiResponse { success = false, message = "At least one input image is required" });
 
                 var resolution = request.Resolution > 0 ? request.Resolution
                     : (project.TextureResolution > 0 ? project.TextureResolution : 1024);
                 var hasReferences = inputImages.Count > 1;
                 var albedoInstruction = " The output must be a pure albedo (diffuse color) map — flat, evenly lit surface colors with no shadows, no highlights, no ambient occlusion, no specular reflections, and no directional lighting. Treat the result as if illuminated by uniform, shadowless light from all directions so that only the intrinsic material color of each surface point is captured.";
-                var systemPrompt = hasReferences
+                var systemPrompt = imageModel.Type == 4
+                    ? (request.Prompt ?? "")
+                    : hasReferences
                     ? $"You are generating a texture map for a 3D model. The first input image is a depth map rendered from a specific camera angle of the 3D model's surface — brighter pixels are closer to the camera, darker pixels are farther away. The remaining input images are reference textures that should be projected onto the 3D model's surface as seen from that camera angle. Generate a {resolution}x{resolution} texture that maps the reference imagery onto the geometry indicated by the depth map, preserving the spatial layout and surface contours. The output should look like a coherent texture applied to the 3D model's UV map from this viewpoint, not a flat composite. Respect the depth map's silhouette and surface relief when placing and distorting the reference textures." + albedoInstruction + "\n\n" + (request.Prompt ?? "")
                     : $"You are generating a texture map for a 3D model. The first input image is a depth map rendered from a specific camera angle of the 3D model's surface — brighter pixels are closer to the camera, darker pixels are farther away. Generate a {resolution}x{resolution} texture that follows the surface contours and silhouette indicated by the depth map, producing a coherent texture suitable for the model's UV map from this viewpoint." + albedoInstruction + "\n\n" + (request.Prompt ?? "");
 
@@ -688,7 +704,7 @@ namespace TextureGen3D.API.Controllers
                 await _imageService.SaveProjectMeshLayerImageAsync(projectId, request.MeshId, layerId, result.ImageBytes);
 
                 // Generate and save 100x100 thumbnail
-                var thumbBytes = await _imageService.GenerateThumbnailAsync(result.ImageBytes, 100);
+                var thumbBytes = await _imageService.GenerateThumbnailAsync(result.ImageBytes, 100, preserveTransparency: true);
                 await _imageService.SaveProjectMeshLayerThumbAsync(projectId, request.MeshId, layerId, thumbBytes);
 
                 // Save the camera angle if provided
@@ -788,7 +804,11 @@ namespace TextureGen3D.API.Controllers
 
                 var genService = _allImageGenerations.FirstOrDefault(g => g.ModelKey == imageModel.ModelKey)
                     ?? _imageGeneration;
-                var result = await genService.GenerateAsync(genRequest);
+                // Gradio models need the endpoint + param mappings from the
+                // model record — GenerateAsync alone can't reach them.
+                var result = genService is ImageGenerationForGradio gradioService
+                    ? await gradioService.GenerateWithProgressAsync(genRequest, imageModel, project.Seed)
+                    : await genService.GenerateAsync(genRequest);
                 if (result.ImageBytes == null || result.ImageBytes.Length == 0)
                     return Json(new ApiResponse { success = false, message = "Image generation returned no image" });
 
@@ -838,8 +858,8 @@ namespace TextureGen3D.API.Controllers
                 // Save the generated image to the layer
                 await _imageService.SaveProjectMeshLayerImageAsync(projectId, request.MeshId, layerId, imageBytes);
 
-                // Generate and save 100x100 thumbnail
-                var thumbBytes = await _imageService.GenerateThumbnailAsync(imageBytes, 100);
+                // Generate and save 100x100 thumbnail (PNG — keeps alpha)
+                var thumbBytes = await _imageService.GenerateThumbnailAsync(imageBytes, 100, preserveTransparency: true);
                 await _imageService.SaveProjectMeshLayerThumbAsync(projectId, request.MeshId, layerId, thumbBytes);
 
                 // Save the depth map as JPEG if provided
@@ -983,13 +1003,13 @@ namespace TextureGen3D.API.Controllers
                 // Save the generated image to the new layer
                 await _imageService.SaveProjectMeshLayerImageAsync(projectId, request.MeshId, createdLayer.Id, result.ImageBytes);
 
-                // Generate and save thumbnail
-                var thumbBytes = await _imageService.GenerateThumbnailAsync(result.ImageBytes, 100);
+                // Generate and save thumbnail (PNG — keeps alpha)
+                var thumbBytes = await _imageService.GenerateThumbnailAsync(result.ImageBytes, 100, preserveTransparency: true);
                 await _imageService.SaveProjectMeshLayerThumbAsync(projectId, request.MeshId, createdLayer.Id, thumbBytes);
 
                 // The generated image IS the UV map (it's a stitched UV map texture)
                 await _imageService.SaveProjectMeshLayerUvMapAsync(projectId, request.MeshId, createdLayer.Id, result.ImageBytes);
-                var uvThumbBytes = await _imageService.GenerateThumbnailAsync(result.ImageBytes, 100);
+                var uvThumbBytes = await _imageService.GenerateThumbnailAsync(result.ImageBytes, 100, preserveTransparency: true);
                 await _imageService.SaveProjectMeshLayerUvMapThumbAsync(projectId, request.MeshId, createdLayer.Id, uvThumbBytes);
 
                 return Json(new ApiResponse { success = true, data = new

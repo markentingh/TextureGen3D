@@ -16,8 +16,20 @@ const IG_TYPES = [
 const MODEL_TYPES = [
     { value: 0, label: 'Image Generation' },
     { value: 1, label: 'Depth To Image' },
-    { value: 2, label: 'Inpainting' }
+    { value: 2, label: 'Inpainting' },
+    { value: 3, label: '6-Angle Image Model' },
+    { value: 4, label: 'Background Removal' }
 ];
+
+// Gradio API-parameter role options, keyed by model Type. The dropdown for
+// each Gradio endpoint parameter offers only the roles valid for that type.
+const GRADIO_PARAM_OPTIONS = {
+    0: ['Reference Image', 'Prompt', 'Seed', 'Resolution'],
+    1: ['Depth Map', 'Reference Image', 'Prompt', 'Seed', 'Resolution'],
+    2: ['Reference Image', 'Mask Image', 'Prompt', 'Seed', 'Resolution'],
+    3: ['Front Image', 'Left Image', 'Right Image', 'Back Image', 'Top Image', 'Bottom Image', 'Prompt', 'Seed', 'Resolution'],
+    4: ['Reference Image']
+};
 const RESOLUTIONS = [
     { value: '1024x1024', label: '1024 x 1024' },
     { value: '2048x2048', label: '2048 x 2048' },
@@ -136,7 +148,7 @@ export default function ImageGenerationModal({ model, onClose, onSave }) {
                 cpmiiTokens: model.cpmiiTokens?.toString() || '0',
                 cpmoTokens: model.cpmoTokens?.toString() || '0',
                 type: model.type ?? 0,
-                pricingType: model.type ?? 0,
+                pricingType: model.pricingType ?? 0,
                 cp1k: model.cp1k?.toString() || '0',
                 cp2k: model.cp2k?.toString() || '0',
                 cp4k: model.cp4k?.toString() || '0',
@@ -148,6 +160,7 @@ export default function ImageGenerationModal({ model, onClose, onSave }) {
                 seedPath: model.seedPath || '',
                 prompt: model.prompt || '',
                 endpointUrl: model.endpointUrl || '',
+                paramMappings: model.paramMappings || '',
                 active: model.active !== false
             });
         } else {
@@ -171,6 +184,7 @@ export default function ImageGenerationModal({ model, onClose, onSave }) {
                 seedPath: '',
                 prompt: '',
                 endpointUrl: '',
+                paramMappings: '',
                 active: true
             });
         }
@@ -203,6 +217,20 @@ export default function ImageGenerationModal({ model, onClose, onSave }) {
                 params.push(form.seedPath);
                 mappings[form.seedPath] = 'Seed';
             }
+            // The full param→role map saved in ParamMappings JSON covers roles
+            // the 4 legacy columns can't (Mask Image, the six angle images) —
+            // merge it on top of the column-derived reconstruction.
+            if (form.paramMappings) {
+                try {
+                    const saved = JSON.parse(form.paramMappings);
+                    for (const [paramName, role] of Object.entries(saved)) {
+                        mappings[paramName] = role;
+                        if (!params.includes(paramName)) params.push(paramName);
+                    }
+                } catch {
+                    /* malformed JSON — fall back to the column reconstruction */
+                }
+            }
             setSelectedGradioEndpoint({ fullPath, path: displayPath, parameters: params });
             setGradioParamMappings(mappings);
         } else if (!isGradioModel) {
@@ -211,7 +239,7 @@ export default function ImageGenerationModal({ model, onClose, onSave }) {
             setGradioParamMappings({});
             setGradioEndpoints([]);
         }
-    }, [form.endpointUrl, form.model, form.depthMapPath, form.inputImagesPath, form.promptPath, form.seedPath]); // eslint-disable-line react-hooks/exhaustive-deps
+    }, [form.endpointUrl, form.model, form.depthMapPath, form.inputImagesPath, form.promptPath, form.seedPath, form.paramMappings]); // eslint-disable-line react-hooks/exhaustive-deps
 
     const handleChange = (field, value) => {
         setForm(prev => ({ ...prev, [field]: value }));
@@ -285,6 +313,17 @@ export default function ImageGenerationModal({ model, onClose, onSave }) {
             }
         }
 
+        // Persist the complete param→role map — roles beyond the 4 legacy
+        // columns (Mask Image, Front/Left/Right/Back/Top/Bottom Image) only
+        // exist in this JSON.
+        const paramMappingsJson = isGradio
+            ? JSON.stringify(
+                Object.fromEntries(
+                    Object.entries(gradioParamMappings).filter(([, role]) => role)
+                )
+              )
+            : null;
+
         const payload = {
             id: model?.id || 0,
             modelKey: form.modelKey,
@@ -305,6 +344,8 @@ export default function ImageGenerationModal({ model, onClose, onSave }) {
             seedPath: isComfyUI || isGradio ? seedPath : null,
             prompt: isComfyUI ? form.prompt : null,
             endpointUrl: isGradio ? (selectedGradioEndpoint?.fullPath || form.endpointUrl || null) : null,
+            paramMappings: paramMappingsJson,
+            pricingType: parseInt(form.pricingType) || 0,
             active: form.active
         };
 
@@ -383,7 +424,19 @@ export default function ImageGenerationModal({ model, onClose, onSave }) {
                                 name="modelType"
                                 options={MODEL_TYPES}
                                 value={form.type}
-                                onChange={(e) => handleChange('type', parseInt(e.target.value))}
+                                onChange={(e) => {
+                                    const newType = parseInt(e.target.value);
+                                    handleChange('type', newType);
+                                    // Clear param mappings whose role isn't valid for the new type
+                                    const allowed = new Set(GRADIO_PARAM_OPTIONS[newType] || []);
+                                    setGradioParamMappings((prev) => {
+                                        const next = {};
+                                        for (const [paramName, role] of Object.entries(prev)) {
+                                            next[paramName] = allowed.has(role) ? role : '';
+                                        }
+                                        return next;
+                                    });
+                                }}
                             />
                         </div>
                     </div>
@@ -552,10 +605,10 @@ export default function ImageGenerationModal({ model, onClose, onSave }) {
                                                         name={`gradio-param-${param}`}
                                                         options={[
                                                             { value: '', label: '-- Select --' },
-                                                            { value: 'Depth Map', label: 'Depth Map' },
-                                                            { value: 'Reference Image', label: 'Reference Image' },
-                                                            { value: 'Prompt', label: 'Prompt' },
-                                                            { value: 'Seed', label: 'Seed' }
+                                                            ...(GRADIO_PARAM_OPTIONS[form.type] || GRADIO_PARAM_OPTIONS[0]).map((role) => ({
+                                                                value: role,
+                                                                label: role
+                                                            }))
                                                         ]}
                                                         value={gradioParamMappings[param] || ''}
                                                         onChange={(e) => handleGradioParamChange(param, e.target.value)}

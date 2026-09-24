@@ -12,6 +12,19 @@
   min-height: 100vh;
 }
 
+/* Disable text selection app-wide except on editable fields */
+* {
+  -webkit-user-select: none;
+  user-select: none;
+}
+input,
+textarea,
+select,
+[contenteditable="true"] {
+  -webkit-user-select: text;
+  user-select: text;
+}
+
 /* Purple scrollbar — 8px width, site-wide */
 * {
   scrollbar-width:thin;

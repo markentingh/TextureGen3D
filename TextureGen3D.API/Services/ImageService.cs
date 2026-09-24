@@ -10,7 +10,7 @@ namespace TextureGen3D.API.Services
 {
     public interface IImageService
     {
-        Task<byte[]> GenerateThumbnailAsync(byte[] imageData, int size = 350);
+        Task<byte[]> GenerateThumbnailAsync(byte[] imageData, int size = 350, bool preserveTransparency = false);
         Task<byte[]> ConvertToJpegAsync(byte[] imageData, int quality = 85);
         Task<byte[]> ConvertToHighQualityJpegAsync(byte[] imageData);
         Task SaveProjectThumbAsync(Guid projectId, byte[] imageData);
@@ -74,7 +74,7 @@ namespace TextureGen3D.API.Services
             _activeStorage = (_configuration["Storage:Active"] ?? "filesystem").ToLowerInvariant();
         }
 
-        public async Task<byte[]> GenerateThumbnailAsync(byte[] imageData, int size = 350)
+        public async Task<byte[]> GenerateThumbnailAsync(byte[] imageData, int size = 350, bool preserveTransparency = false)
         {
             using var image = Image.Load(imageData);
             image.Mutate(x => x.Resize(new ResizeOptions
@@ -84,7 +84,12 @@ namespace TextureGen3D.API.Services
             }));
 
             using var ms = new MemoryStream();
-            await image.SaveAsync(ms, new JpegEncoder { Quality = 85 });
+            // PNG keeps the alpha channel — layer image/uvmap thumbs must show
+            // transparency (e.g. background-removed layers), JPEG flattens it.
+            if (preserveTransparency)
+                await image.SaveAsync(ms, new PngEncoder());
+            else
+                await image.SaveAsync(ms, new JpegEncoder { Quality = 85 });
             return ms.ToArray();
         }
 

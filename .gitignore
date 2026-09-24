@@ -14,7 +14,8 @@ RECOVER_*
 *.jfm
 **/storage
 **/venv
-
+**/__pycache__
+Gradio/debug
 
 # Build results
 [Dd]ebug/

@@ -53,6 +53,7 @@ export function ProjectProvider({ children }) {
 
   // ── Image models ──
   const [imageModels, setImageModels] = useState([]);
+  const [allImageModels, setAllImageModels] = useState([]);
   const [refImageModels, setRefImageModels] = useState([]);
   const [inpaintImageModels, setInpaintImageModels] = useState([]);
   const [selectedModelId, setSelectedModelId] = useState('');
@@ -97,12 +98,46 @@ export function ProjectProvider({ children }) {
   const [brushHardness, setBrushHardness] = useState(50); // 0-100
   const [brushSpread, setBrushSpread] = useState(0);   // 0-100 (screen px between stamps)
   const [brushOpacity, setBrushOpacity] = useState(100); // 1-100 (stamp alpha %)
-  const [selectedLayerId, setSelectedLayerId] = useState(null);
+  const [selectedLayerId, setSelectedLayerIdRaw] = useState(null);
+  const [selectedLayerIds, setSelectedLayerIds] = useState([]);
   const [modifiedLayerIds, setModifiedLayerIds] = useState(new Set());
   const [maskThumbVersions, setMaskThumbVersions] = useState({});
+  // Layers whose assets (uvmap/mask/angle thumbs) are still being generated —
+  // the sidebar swaps their thumbs for a spinner until the pipeline finishes.
+  const [assetGeneratingLayerIds, setAssetGeneratingLayerIds] = useState(new Set());
+  const setLayerAssetsGenerating = useCallback((layerId, on) => {
+    setAssetGeneratingLayerIds((prev) => {
+      const next = new Set(prev);
+      if (on) next.add(layerId);
+      else next.delete(layerId);
+      return next;
+    });
+  }, []);
 
   const selectedLayerIdRef = useRef(null);
   useEffect(() => { selectedLayerIdRef.current = selectedLayerId; }, [selectedLayerId]);
+  const selectedLayerIdsRef = useRef([]);
+  useEffect(() => { selectedLayerIdsRef.current = selectedLayerIds; }, [selectedLayerIds]);
+
+  // Single-select — keeps the multi-select array in sync (just this layer).
+  const setSelectedLayerId = useCallback((layerId) => {
+    const next = layerId == null ? [] : [layerId];
+    selectedLayerIdsRef.current = next;
+    setSelectedLayerIds(next);
+    setSelectedLayerIdRaw(layerId);
+  }, []);
+
+  // Ctrl+click toggle — adds/removes the layer from the selection set.
+  // The toggled-on layer becomes the primary (selectedLayerId); toggling
+  // the primary off falls back to the last remaining selection.
+  const toggleLayerSelected = useCallback((layerId) => {
+    const prev = selectedLayerIdsRef.current;
+    const adding = !prev.includes(layerId);
+    const next = adding ? [...prev, layerId] : prev.filter((x) => x !== layerId);
+    selectedLayerIdsRef.current = next;
+    setSelectedLayerIds(next);
+    setSelectedLayerIdRaw(adding ? layerId : (next[next.length - 1] ?? null));
+  }, []);
   const maskToolRef = useRef(maskTool);
   useEffect(() => { maskToolRef.current = maskTool; }, [maskTool]);
   const selectedMeshRef = useRef(null);
@@ -381,6 +416,7 @@ export function ProjectProvider({ children }) {
       spread: brushSpread,
       opacity: brushOpacity,
       getSelectedLayerId: () => selectedLayerIdRef.current,
+      getSelectedLayerIds: () => selectedLayerIdsRef.current,
       getOrCreateLayerMask,
       markMaskModified,
       onStrokeStart: cancelMaskSaveTimer,
@@ -409,7 +445,7 @@ export function ProjectProvider({ children }) {
   useEffect(() => {
     if (maskTool === 'brush' || maskTool === 'eraser') refreshLayerTextures();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedLayerId]);
+  }, [selectedLayerId, selectedLayerIds]);
 
   const cancelInpainting = useCallback(() => setMaskTool('pointer'), []);
 
@@ -457,16 +493,27 @@ export function ProjectProvider({ children }) {
     }
   }, [maskTool]);
 
-  // Auto-select the first layer (or keep selection valid) when layers change
+  // Auto-select the first layer (or keep the selection valid) when layers
+  // change — prunes ids for deleted layers and keeps the primary selected.
   useEffect(() => {
     if (meshLayers.length === 0) {
-      if (selectedLayerId !== null) setSelectedLayerId(null);
+      if (selectedLayerIdsRef.current.length) {
+        selectedLayerIdsRef.current = [];
+        setSelectedLayerIds([]);
+      }
+      if (selectedLayerId !== null) setSelectedLayerIdRaw(null);
       return;
     }
-    if (!meshLayers.some((l) => l.id === selectedLayerId)) {
-      setSelectedLayerId(meshLayers[0].id);
+    const valid = selectedLayerIds.filter((lid) => meshLayers.some((l) => l.id === lid));
+    if (valid.length !== selectedLayerIds.length || valid.length === 0) {
+      const next = valid.length ? valid : [meshLayers[0].id];
+      selectedLayerIdsRef.current = next;
+      setSelectedLayerIds(next);
+      if (!next.includes(selectedLayerId)) setSelectedLayerIdRaw(next[next.length - 1]);
+    } else if (!selectedLayerIds.includes(selectedLayerId)) {
+      setSelectedLayerIdRaw(selectedLayerIds[selectedLayerIds.length - 1]);
     }
-  }, [meshLayers, selectedLayerId]);
+  }, [meshLayers, selectedLayerIds, selectedLayerId]);
 
   const refreshLayerTextures = useCallback(
     async (layers = null, meshKey = null) => {
@@ -546,11 +593,11 @@ export function ProjectProvider({ children }) {
         entries.push({ url, maskTexture, maskDataUrl, layerId: layer.id });
       }
       const hasAny = entries.some((e) => e.url !== null);
-      const paintLayerId =
+      const paintLayerIds =
         (maskToolRef.current === 'brush' || maskToolRef.current === 'eraser')
-          ? selectedLayerIdRef.current
+          ? selectedLayerIdsRef.current
           : null;
-      viewerRef.current.updateLayerTextures(hasAny ? entries : [], { paintLayerId });
+      viewerRef.current.updateLayerTextures(hasAny ? entries : [], { paintLayerIds });
     },
     [id, layerApi, meshDbIds, meshLayers, selectedMesh, token, getOrCreateLayerMask]
   );
@@ -902,6 +949,7 @@ export function ProjectProvider({ children }) {
       setImageModels(depthImageModels);
       setRefImageModels(generationImageModels);
       setInpaintImageModels(inpaintModelsList);
+      setAllImageModels(data.imageModels || []);
 
       const imageModelList = depthImageModels;
       const savedImageModelId = data.project?.imageModelId;
@@ -1104,6 +1152,7 @@ export function ProjectProvider({ children }) {
     setMeshPrompts,
     // image models
     imageModels,
+    allImageModels,
     setImageModels,
     refImageModels,
     setRefImageModels,
@@ -1166,10 +1215,15 @@ export function ProjectProvider({ children }) {
     setBrushOpacity,
     selectedLayerId,
     setSelectedLayerId,
+    selectedLayerIds,
+    toggleLayerSelected,
     modifiedLayerIds,
     setModifiedLayerIds,
     maskThumbVersions,
     setMaskThumbVersions,
+    assetGeneratingLayerIds,
+    setAssetGeneratingLayerIds,
+    setLayerAssetsGenerating,
     layerMasksRef,
     maskPaintConfigRef,
     getOrCreateLayerMask,

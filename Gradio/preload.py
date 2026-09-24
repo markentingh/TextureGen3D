@@ -16,16 +16,20 @@ from huggingface_hub.constants import HF_HUB_CACHE
 # All models/LoRAs used by the modules
 MODELS = [
     {
-        "repo_id": "black-forest-labs/FLUX.2-klein-base-4B",
-        "description": "Base FLUX.2 Klein 4B model (text encoder + VAE + tokenizers)",
+        "repo_id": "black-forest-labs/FLUX.2-klein-4B",
+        "description": "Distilled 4-step FLUX.2 Klein 4B model (text encoder + VAE + tokenizers)",
     },
     {
-        "repo_id": "black-forest-labs/FLUX.2-klein-base-4b-fp8",
-        "description": "FP8 transformer checkpoint (4GB, matches ComfyUI flux-2-klein-base-4b-fp8.safetensors)",
+        "repo_id": "black-forest-labs/FLUX.2-klein-4b-fp8",
+        "description": "FP8 transformer checkpoint (4GB, flux-2-klein-4b-fp8.safetensors)",
     },
     {
         "repo_id": "thedeoxen/refcontrol-FLUX.2-klein-4B-reference-depth-lora",
         "description": "RefControl LoRA for reference+depth fusion",
+    },
+    {
+        "repo_id": "Qwen/Qwen-Image-2.1",
+        "description": "Qwen-Image-2.1 unified T2I + image editing model (7B visual DiT)",
     },
 ]
 
@@ -98,6 +102,25 @@ def main():
             print(f"  ERROR: {e}")
             print()
             return 1
+
+    # U2NET (rembg) — not a HF repo; the onnx weights download to ~/.u2net
+    # on first session creation. Warm it up here so first use isn't a surprise.
+    print(f"[{len(MODELS) + 1}/{len(MODELS) + 1}] u2net (rembg background removal)")
+    if check_only:
+        u2net_dir = Path.home() / ".u2net"
+        cached = u2net_dir.exists() and any(u2net_dir.iterdir())
+        print(f"  Status: {'cached at ' + str(u2net_dir) if cached else 'NOT CACHED'}")
+        if not cached:
+            all_cached = False
+    else:
+        try:
+            from rembg import new_session
+            new_session("u2net")
+            print("  Cached (session created successfully).")
+        except Exception as e:
+            print(f"  ERROR: {e}")
+            return 1
+    print()
 
     print("=" * 60)
     if check_only:

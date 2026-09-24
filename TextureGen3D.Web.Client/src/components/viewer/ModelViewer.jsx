@@ -22,6 +22,45 @@ import Icon from '@/components/ui/icon';
  *   captureThumbnail(size=75) — renders the current view to a data URL thumbnail
  *   getCameraRotation() — returns { x, y, z } rotation of the camera in degrees
  */
+
+// Shared checkerboard texture for the grey material's backface pass —
+// loaded lazily so it matches the layer shader's checker exactly.
+let greyCheckerTex = null;
+function getGreyCheckerTex() {
+  if (!greyCheckerTex) {
+    greyCheckerTex = new THREE.TextureLoader().load('/mesh-checkerboard.jpg');
+    greyCheckerTex.wrapS = greyCheckerTex.wrapT = THREE.RepeatWrapping;
+    greyCheckerTex.flipY = true;
+  }
+  return greyCheckerTex;
+}
+
+// Grey fallback mesh material — DoubleSide; backfaces render as the
+// checkerboard texture (same as the layer shader) so polys facing away are
+// unmistakable. userData.uDimBackface toggles it; captures set it to 0 so
+// generated input images keep the undimmed color.
+function makeGreyMeshMaterial() {
+  const mat = new THREE.MeshStandardMaterial({
+    color: 0x9ca3af,
+    metalness: 0.1,
+    roughness: 0.8,
+    side: THREE.DoubleSide,
+  });
+  mat.userData.uDimBackface = { value: 1 };
+  mat.defines = { USE_UV: '' }; // expose vUv for the checker sample
+  mat.onBeforeCompile = (shader) => {
+    shader.uniforms.u_dimBackface = mat.userData.uDimBackface;
+    shader.uniforms.u_backfaceChecker = { value: getGreyCheckerTex() };
+    shader.fragmentShader = (
+      'uniform float u_dimBackface;\nuniform sampler2D u_backfaceChecker;\n' + shader.fragmentShader
+    ).replace(
+      '#include <opaque_fragment>',
+      'if (!gl_FrontFacing && u_dimBackface > 0.5) outgoingLight = texture2D(u_backfaceChecker, vUv * 64.0).rgb * 0.3;\n\t\t#include <opaque_fragment>'
+    );
+  };
+  return mat;
+}
+
 const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded, maskPaintConfig }, ref) {
   const containerRef = useRef(null);
   const sceneRef = useRef(null);
@@ -383,6 +422,7 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
   // Inpainting overlay — mesh-wide mask + repeating tile texture
   const inpaintMaskRef = useRef(null);    // { a, b, front, initialized }
   const inpaintTileTexRef = useRef(null);
+  const checkerTexRef = useRef(null);
   const inpaintActiveRef = useRef(false);
   const inpaintVisibleRef = useRef(true); // eye toggle — hides the overlay without clearing the mask
 
@@ -1181,26 +1221,55 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
       return hit;
     };
 
-    const stampMaskAtHit = (layerId, hit) => {
+    // Fallback when the center ray misses: sample points on the brush ring
+    // circumference so strokes can start/continue where the ring overlaps
+    // the mesh edge even though the cursor center is off the mesh. The hit
+    // is re-centered on the cursor — we project the ring hit's depth back
+    // along the center ray so the painted disc matches the ring's screen
+    // footprint exactly instead of stamping a full circle at the edge.
+    const raycastRingHitAt = (clientX, clientY) => {
+      const cfg = maskPaintCfgRef.current?.current;
+      const cam = cameraRef.current;
+      if (!cam) return null;
+      const rPx = Math.max(0.5, (cfg?.size || 50) / 2);
+      const rect = getCanvasRect();
+      const STEPS = 12;
+      for (let i = 0; i < STEPS; i++) {
+        const a = (i / STEPS) * Math.PI * 2;
+        const hit = raycastHitAt(clientX + Math.cos(a) * rPx, clientY + Math.sin(a) * rPx);
+        if (!hit) continue;
+
+        // Center ray at the cursor (for ortho cams each ray has its own
+        // origin — must recompute rather than reuse the ring hit's ray)
+        maskRayNdc.set(
+          ((clientX - rect.left) / rect.width) * 2 - 1,
+          -((clientY - rect.top) / rect.height) * 2 + 1
+        );
+        raycasterRef.current.setFromCamera(maskRayNdc, cam);
+        const ray = raycasterRef.current.ray;
+        const t = stampTmpVec.subVectors(hit.point, ray.origin).dot(ray.direction);
+        const centerPoint = ray.direction.clone().multiplyScalar(t).add(ray.origin);
+        return { ...hit, point: centerPoint };
+      }
+      return null;
+    };
+
+    const stampMaskAtHit = (layerIds, hit) => {
       const cfg = maskPaintCfgRef.current?.current;
       const renderer = rendererRef.current;
-      if (!cfg || !renderer) return;
+      if (!cfg || !renderer || !layerIds?.length) return;
       const isInpaint = cfg.tool === 'inpaint';
-      const entry = isInpaint ? getInpaintEntry() : cfg.getOrCreateLayerMask?.(layerId);
-      if (!entry) return;
       const rtt = getPaintRtt();
 
       const geom = hit.object.geometry;
       const pos = geom?.attributes?.position;
       const uvAttr = geom?.attributes?.uv;
       if (!pos || !uvAttr) return;
-      if (!entry.initialized) clearMaskTarget(entry, isInpaint ? 0x000000 : 0xffffff);
 
       const R = brushWorldRadius(hit);
 
       const h = cfg.hardness ?? 50;
       const u = rtt.mat.uniforms;
-      u.u_baseTexture.value = entry.front.texture;
       u.u_modelMatrix.value.copy(hit.object.matrixWorld);
       u.u_mouseWorldPos.value.copy(hit.point);
       u.u_brushRadius.value = R;
@@ -1250,39 +1319,48 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
         rtt.coverageMesh = currentMeshRef.current;
       }
 
-      // Paint pass: read front → write back. Auto-clear so pixels outside
-      // islands keep the mask's base color (white = visible for layer masks,
-      // black = unmarked for the inpaint mask) instead of the scene clear color.
-      const back = entry.front === entry.a ? entry.b : entry.a;
+      // Paint pass per selected layer: read front → write back. Auto-clear so
+      // pixels outside islands keep the mask's base color (white = visible for
+      // layer masks, black = unmarked for the inpaint mask) instead of the
+      // scene clear color. The same stamp lands in every selected layer's mask.
+      const bu = rtt.bleedMat.uniforms;
       const prevClear = stampTmpColor;
       renderer.getClearColor(prevClear);
       const prevClearAlpha = renderer.getClearAlpha();
-      renderer.setClearColor(isInpaint ? 0x000000 : 0xffffff, 1);
-      renderer.setRenderTarget(back);
-      renderer.render(rtt.scene, rtt.cam);
+      for (const layerId of layerIds) {
+        const entry = isInpaint ? getInpaintEntry() : cfg.getOrCreateLayerMask?.(layerId);
+        if (!entry) continue;
+        if (!entry.initialized) clearMaskTarget(entry, isInpaint ? 0x000000 : 0xffffff);
+        u.u_baseTexture.value = entry.front.texture;
 
-      // Bleed pass: back → front. Outside-island texels within 2px of an
-      // island edge adopt the nearest inside-island mask value, so the mask
-      // doesn't produce seam lines where a stroke crosses a UV boundary.
-      const bu = rtt.bleedMat.uniforms;
-      bu.u_base.value = back.texture;
-      bu.u_coverage.value = rtt.coverageRT.texture;
-      rtt.paintGroup.visible = false;
-      rtt.bleedQuad.visible = true;
-      renderer.setRenderTarget(entry.front);
-      renderer.render(rtt.scene, rtt.cam);
+        const back = entry.front === entry.a ? entry.b : entry.a;
+        renderer.setClearColor(isInpaint ? 0x000000 : 0xffffff, 1);
+        renderer.setRenderTarget(back);
+        renderer.render(rtt.scene, rtt.cam);
+
+        // Bleed pass: back → front. Outside-island texels within 2px of an
+        // island edge adopt the nearest inside-island mask value, so the mask
+        // doesn't produce seam lines where a stroke crosses a UV boundary.
+        bu.u_base.value = back.texture;
+        bu.u_coverage.value = rtt.coverageRT.texture;
+        rtt.paintGroup.visible = false;
+        rtt.bleedQuad.visible = true;
+        renderer.setRenderTarget(entry.front);
+        renderer.render(rtt.scene, rtt.cam);
+        rtt.bleedQuad.visible = false;
+        rtt.paintGroup.visible = true;
+
+        if (isInpaint) {
+          // front.texture is updated in place — make sure it's bound (e.g. if
+          // the entry was created by this first stroke before beginInpaint ran)
+          bindInpaintOverlay(entry);
+        } else {
+          syncMaskUniform(layerId, entry.front.texture);
+          cfg.markMaskModified?.(layerId);
+        }
+      }
       renderer.setRenderTarget(null);
       renderer.setClearColor(prevClear, prevClearAlpha);
-      rtt.bleedQuad.visible = false;
-
-      if (isInpaint) {
-        // front.texture is updated in place — make sure it's bound (e.g. if
-        // the entry was created by this first stroke before beginInpaint ran)
-        bindInpaintOverlay(entry);
-      } else {
-        syncMaskUniform(layerId, entry.front.texture);
-        cfg.markMaskModified?.(layerId);
-      }
     };
 
     const handlePointerDown = (e) => {
@@ -1291,15 +1369,17 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
       // Mask brush takes over left-click — but only off the gizmos
       const paintCfg = maskPaintCfgRef.current?.current;
       if (!hit && paintCfg && (paintCfg.tool === 'brush' || paintCfg.tool === 'eraser' || paintCfg.tool === 'inpaint') && e.button === 0 && currentMeshRef.current) {
-        const layerId = paintCfg.tool === 'inpaint' ? 'inpaint' : paintCfg.getSelectedLayerId?.();
-        if (layerId) {
+        const layerIds = paintCfg.tool === 'inpaint'
+          ? ['inpaint']
+          : (paintCfg.getSelectedLayerIds?.() || []).slice();
+        if (layerIds.length) {
           e.stopPropagation();
           e.preventDefault();
-          const hit = raycastHitAt(e.clientX, e.clientY);
+          const hit = raycastHitAt(e.clientX, e.clientY) || raycastRingHitAt(e.clientX, e.clientY);
           if (hit) {
             paintCfg.onStrokeStart?.();
-            paintingRef.current = { layerId, lastX: e.clientX, lastY: e.clientY };
-            stampMaskAtHit(layerId, hit);
+            paintingRef.current = { layerIds, lastX: e.clientX, lastY: e.clientY };
+            stampMaskAtHit(layerIds, hit);
           }
           return;
         }
@@ -1376,8 +1456,8 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
         const cfg = maskPaintCfgRef.current?.current;
         const spread = cfg?.spread ?? 0;
         if (spread <= 0) {
-          const hit = raycastHitAt(e.clientX, e.clientY);
-          if (hit) stampMaskAtHit(painting.layerId, hit);
+          const hit = raycastHitAt(e.clientX, e.clientY) || raycastRingHitAt(e.clientX, e.clientY);
+          if (hit) stampMaskAtHit(painting.layerIds, hit);
           painting.lastX = e.clientX;
           painting.lastY = e.clientY;
         } else {
@@ -1386,8 +1466,8 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
             const t = spread / dist;
             painting.lastX += (e.clientX - painting.lastX) * t;
             painting.lastY += (e.clientY - painting.lastY) * t;
-            const hit = raycastHitAt(painting.lastX, painting.lastY);
-            if (hit) stampMaskAtHit(painting.layerId, hit);
+            const hit = raycastHitAt(painting.lastX, painting.lastY) || raycastRingHitAt(painting.lastX, painting.lastY);
+            if (hit) stampMaskAtHit(painting.layerIds, hit);
             dist = Math.hypot(e.clientX - painting.lastX, e.clientY - painting.lastY);
           }
         }
@@ -1609,6 +1689,8 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
       disposeInpaintEntry();
       inpaintTileTexRef.current?.dispose();
       inpaintTileTexRef.current = null;
+      checkerTexRef.current?.dispose();
+      checkerTexRef.current = null;
     };
   }, []);
 
@@ -1861,6 +1943,14 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
      * Generate a 1024x1024 depth map from the current camera view.
      * Returns a PNG data URL with a black background.
      */
+    /**
+     * Render a depth map of the mesh, shaped to match the distribution the
+     * RefControl depth LoRA was trained on (DepthAnythingV2 maps of scene
+     * images): subject sits in the mid-gray range rather than spanning the
+     * full 0–255, and the background is a subtle far-field gradient instead
+     * of pure-black void. Geometry depth is still exact — we only remap
+     * values after the render.
+     */
     captureDepthMap(size = 1024, rotation = null) {
       const mainCamera = cameraRef.current;
       const mesh = currentMeshRef.current;
@@ -1875,16 +1965,17 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
 
       const depthRenderer = new THREE.WebGLRenderer({
         canvas: hiddenCanvas,
-        antialias: false,
-        alpha: false,
+        antialias: true,
+        alpha: true,
         preserveDrawingBuffer: true,
       });
       depthRenderer.setPixelRatio(1);
       depthRenderer.setSize(size, size);
-      depthRenderer.setClearColor(0x000000, 1);
+      // Alpha 0 marks background pixels unambiguously — depth value 0 would
+      // collide with the mesh's farthest surfaces
+      depthRenderer.setClearColor(0x000000, 0);
 
       const depthScene = new THREE.Scene();
-      depthScene.background = new THREE.Color(0x000000);
 
       try {
         // Clone the mesh with depth material
@@ -1941,15 +2032,44 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
           depthCamera.lookAt(0, 0, 0);
         }
 
-        // Tighten near/far planes tightly around the mesh so depth values
-        // span the full 0–1 range — brighter whites for near surfaces,
-        // darker greys for far surfaces.
+        // Tighten near/far planes around the mesh so depth values span
+        // most of the 0–1 range before the post-remap below.
         depthCamera.near = camDistance - maxDim / 2 * 1.05;
         depthCamera.far = camDistance + maxDim / 2 * 1.05;
         depthCamera.updateProjectionMatrix();
 
         depthRenderer.render(depthScene, depthCamera);
-        return hiddenCanvas.toDataURL('image/png');
+
+        // Post-process into DepthAnythingV2-style statistics: copy the WebGL
+        // canvas into a 2D canvas (a canvas can't hold both contexts), then
+        // remap subject depth into the mid-range and replace the alpha-0
+        // background with a vertical far-field gradient (darker at top,
+        // slightly nearer at bottom — like a floor receding into distance).
+        const out = document.createElement('canvas');
+        out.width = size;
+        out.height = size;
+        const ctx = out.getContext('2d');
+        ctx.drawImage(hiddenCanvas, 0, 0);
+        const img = ctx.getImageData(0, 0, size, size);
+        const d = img.data;
+        for (let y = 0; y < size; y++) {
+          // 35 → 70 top-to-bottom; always darker than the remapped subject
+          const bg = Math.round(35 + 35 * (y / size));
+          for (let x = 0; x < size; x++) {
+            const i = (y * size + x) * 4;
+            const v = d[i + 3] === 0
+              ? bg
+              : Math.min(255, Math.round(100 + d[i] * 0.49)); // 0–255 → ~100–225
+            d[i] = v;
+            d[i + 1] = v;
+            d[i + 2] = v;
+            d[i + 3] = 255;
+          }
+        }
+        ctx.putImageData(img, 0, 0);
+        const dataUrl = out.toDataURL('image/png');
+        out.remove();
+        return dataUrl;
       } finally {
         // Always clean up: dispose renderer, lose WebGL context, remove hidden canvas
         depthScene.traverse((obj) => {
@@ -1974,16 +2094,30 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
     captureCompositeImage(size = 1024) {
       const mats = [];
       currentMeshRef.current?.traverse((c) => {
-        if (c.isMesh && c.material?.uniforms) mats.push(c.material);
+        if (c.isMesh && c.material) {
+          (Array.isArray(c.material) ? c.material : [c.material]).forEach((m) => mats.push(m));
+        }
       });
       mats.forEach((m) => {
-        if (m.uniforms.u_unlit) m.uniforms.u_unlit.value = 1;
-        if (m.uniforms.u_hasInpaint) m.uniforms.u_hasInpaint.value = 0;
+        if (m.uniforms?.u_unlit) m.uniforms.u_unlit.value = 1;
+        if (m.uniforms?.u_hasInpaint) m.uniforms.u_hasInpaint.value = 0;
+        if (m.uniforms?.u_dimBackface) m.uniforms.u_dimBackface.value = 0;
+        if (m.userData?.uDimBackface) m.userData.uDimBackface.value = 0;
+        // Backface culling — the inpaint inputs should only include faces
+        // pointing at the camera. side is rasterizer state, no recompile.
+        m.userData._captureSide = m.side;
+        m.side = THREE.FrontSide;
       });
       const dataUrl = captureMeshViewImage(size, { clearColor: 0xffffff });
       mats.forEach((m) => {
-        if (m.uniforms.u_unlit) m.uniforms.u_unlit.value = unlitRef.current ? 1 : 0;
-        if (m.uniforms.u_hasInpaint) m.uniforms.u_hasInpaint.value = inpaintActiveRef.current && inpaintVisibleRef.current ? 1 : 0;
+        if (m.uniforms?.u_unlit) m.uniforms.u_unlit.value = unlitRef.current ? 1 : 0;
+        if (m.uniforms?.u_hasInpaint) m.uniforms.u_hasInpaint.value = inpaintActiveRef.current && inpaintVisibleRef.current ? 1 : 0;
+        if (m.uniforms?.u_dimBackface) m.uniforms.u_dimBackface.value = 1;
+        if (m.userData?.uDimBackface) m.userData.uDimBackface.value = 1;
+        if (m.userData._captureSide !== undefined) {
+          m.side = m.userData._captureSide;
+          delete m.userData._captureSide;
+        }
       });
       return dataUrl;
     },
@@ -2014,7 +2148,7 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
               gl_FragColor = vec4(vec3(m), 1.0);
             }
           `,
-          side: THREE.DoubleSide,
+          side: THREE.FrontSide, // backface culling — mask only on camera-facing faces
         }),
       });
     },
@@ -2248,6 +2382,25 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
               }
             }
 
+            // Coverage mask: white wherever the projection painted a pixel
+            // (uvmap alpha > 0), black elsewhere. Captured before the color
+            // bleed below so the 2px padding ring isn't included — the mask
+            // represents exactly the mesh area the image projected onto.
+            const maskCanvas = document.createElement('canvas');
+            maskCanvas.width = uvMapSize;
+            maskCanvas.height = uvMapSize;
+            const maskCtx = maskCanvas.getContext('2d');
+            const maskImageData = maskCtx.createImageData(uvMapSize, uvMapSize);
+            for (let i = 0; i < uvImageData.data.length; i += 4) {
+              const v = uvImageData.data[i + 3] > 0 ? 255 : 0;
+              maskImageData.data[i] = v;
+              maskImageData.data[i + 1] = v;
+              maskImageData.data[i + 2] = v;
+              maskImageData.data[i + 3] = 255;
+            }
+            maskCtx.putImageData(maskImageData, 0, 0);
+            const maskDataUrl = maskCanvas.toDataURL('image/png');
+
             // Dilate colored pixels 2px into transparent areas to bleed colors
             // outside UV island edges and avoid creases on the mesh
             const bleedPixels = 2;
@@ -2303,7 +2456,7 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
 
             const result = uvCanvas.toDataURL('image/png');
             console.log('[UVProject] UV map data URL length:', result?.length);
-            resolve(result);
+            resolve({ uvMap: result, mask: maskDataUrl });
           } catch (err) {
             console.error('[UVProject] Error:', err);
             cleanup();
@@ -2368,16 +2521,17 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
      * shader samples a constant number of textures regardless of layer count.
      * @param {Array} entries - [{ url, maskDataUrl, maskTexture, layerId }]
      *   ordered top→bottom (legacy callers may pass plain url strings)
-     * @param {Object} opts - { paintLayerId } — with the brush/eraser active,
-     *   the selected layer keeps its own uvmap + live mask sampler (strokes
-     *   draw in real-time) while the layers above and below it are each baked
-     *   into a single combined texture.
+     * @param {Object} opts - { paintLayerIds } — with the brush/eraser active,
+     *   each selected layer keeps its own uvmap + live mask sampler (strokes
+     *   draw in real-time on all of them) while contiguous runs of
+     *   non-selected layers bake into single combined textures, preserving
+     *   true stack order even for non-adjacent selections.
      */
     updateLayerTextures(entries, opts = {}) {
       const mesh = currentMeshRef.current;
       if (!mesh) return;
       const buildId = ++layerBuildIdRef.current;
-      const paintLayerId = opts.paintLayerId ?? null;
+      const paintLayerIds = opts.paintLayerIds ?? null;
 
       const items = (entries || [])
         .map((e) => (typeof e === 'string' ? { url: e } : e))
@@ -2390,6 +2544,16 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
         whiteMaskTexRef.current.needsUpdate = true;
       }
       const white = whiteMaskTexRef.current;
+
+      // Checkerboard underlay — tiled beneath every layer stack so
+      // transparent regions (e.g. background-removed images) read as
+      // checker instead of showing through the mesh.
+      if (!checkerTexRef.current) {
+        const t = new THREE.TextureLoader().load('/mesh-checkerboard.jpg');
+        t.wrapS = t.wrapT = THREE.RepeatWrapping;
+        t.flipY = true;
+        checkerTexRef.current = t;
+      }
 
       const freeGpu = () => {
         for (const t of layerGpuRef.current.textures) t.dispose();
@@ -2406,12 +2570,7 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
               if (Array.isArray(child.material)) child.material.forEach((m) => m.dispose());
               else child.material.dispose();
             }
-            child.material = new THREE.MeshStandardMaterial({
-              color: 0x9ca3af,
-              metalness: 0.1,
-              roughness: 0.8,
-              side: THREE.DoubleSide,
-            });
+            child.material = makeGreyMeshMaterial();
           }
         });
       };
@@ -2428,9 +2587,11 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
       const inpaintUniforms = () => ({
         u_inpaintMask: { value: inpaintActiveRef.current ? (inpaintMaskRef.current?.front.texture || white) : white },
         u_inpaintTile: { value: inpaintTileTexRef.current || white },
+        u_checker: { value: checkerTexRef.current || white },
         u_inpaintOffset: { value: 0 },
         u_unlit: { value: unlitRef.current ? 1 : 0 },
         u_hasInpaint: { value: inpaintActiveRef.current && inpaintVisibleRef.current ? 1 : 0 },
+        u_dimBackface: { value: 1 },
       });
 
       const vertexShader = `
@@ -2447,7 +2608,11 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
 
       // Shadow-only lighting + inpaint overlay — identical for both variants
       const shaderTail = `
-          if (color.a < 0.01) discard;
+          // Bottom checkerboard layer — layer-stack alpha blends over it so
+          // transparent regions read as checker instead of seeing through.
+          vec4 checker = texture2D(u_checker, vUv * 64.0);
+          color.rgb = mix(checker.rgb, color.rgb, color.a);
+          color.a = 1.0;
 
           // Shadow-only lighting: don't brighten the texture, only darken areas facing away from the light
           vec3 normal = normalize(vNormal);
@@ -2457,6 +2622,10 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
           float shadow = mix(0.35, 1.0, clamp(NdotL * 0.5 + 0.5, 0.0, 1.0));
 
           vec3 shaded = mix(color.rgb * shadow, color.rgb, u_unlit);
+          // Backfaces render as checkerboard dimmed 70% — a viewing aid so
+          // polys facing away are unmistakable. u_dimBackface goes to 0
+          // during image captures so generated inputs keep the real texture.
+          if (!gl_FrontFacing && u_dimBackface > 0.5) shaded = checker.rgb * 0.3;
           // Inpainting overlay: lerp to the repeating tile where the mask is
           // painted — tile alpha is respected so transparent parts of the
           // pattern let the layers underneath show through
@@ -2474,60 +2643,19 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
         uniform sampler2D u_combined;
         uniform float u_hasCombined;
         uniform vec3 dir1Pos;
+        uniform sampler2D u_checker;
         uniform sampler2D u_inpaintMask;
         uniform sampler2D u_inpaintTile;
         uniform float u_inpaintOffset;
         uniform float u_hasInpaint;
         uniform float u_unlit;
+        uniform float u_dimBackface;
         varying vec2 vUv;
         varying vec3 vNormal;
         varying vec3 vWorldPos;
         void main() {
           vec4 color = vec4(0.0);
           if (u_hasCombined > 0.5) color = texture2D(u_combined, vUv);
-${shaderTail}`;
-
-      // Brush/eraser: baked below stack → selected layer with live mask →
-      // baked above stack. mask0/hasMask0 keep the per-layer naming so
-      // syncMaskUniform + bindLayerMask work via shaderLayerIdsRef slot 0.
-      const paintFragment = `
-        uniform sampler2D u_below;
-        uniform float u_hasBelow;
-        uniform sampler2D u_above;
-        uniform float u_hasAbove;
-        uniform sampler2D layer0;
-        uniform sampler2D mask0;
-        uniform float hasMask0;
-        uniform vec3 dir1Pos;
-        uniform sampler2D u_inpaintMask;
-        uniform sampler2D u_inpaintTile;
-        uniform float u_inpaintOffset;
-        uniform float u_hasInpaint;
-        uniform float u_unlit;
-        varying vec2 vUv;
-        varying vec3 vNormal;
-        varying vec3 vWorldPos;
-        void main() {
-          vec4 color = vec4(0.0);
-          if (u_hasBelow > 0.5) {
-            vec4 c = texture2D(u_below, vUv);
-            color.rgb = mix(color.rgb, c.rgb, c.a);
-            color.a = max(color.a, c.a);
-          }
-          {
-            vec4 layerColor0 = texture2D(layer0, vUv);
-            float contentMask0 = step(0.01, length(layerColor0.rgb));
-            // LERP alpha: start=0, end=uvmap alpha, weight=mask (white=visible, black=hidden)
-            float paintMask0 = mix(1.0, texture2D(mask0, vUv).r, hasMask0);
-            float alpha0 = mix(0.0, layerColor0.a, paintMask0);
-            color.rgb = mix(color.rgb, layerColor0.rgb, contentMask0 * alpha0);
-            color.a = max(color.a, alpha0 * contentMask0);
-          }
-          if (u_hasAbove > 0.5) {
-            vec4 c = texture2D(u_above, vUv);
-            color.rgb = mix(color.rgb, c.rgb, c.a);
-            color.a = max(color.a, c.a);
-          }
 ${shaderTail}`;
 
       (async () => {
@@ -2540,44 +2668,92 @@ ${shaderTail}`;
           for (const u of gpu.blobUrls) URL.revokeObjectURL(u);
         };
 
-        const selIdx = paintLayerId ? items.findIndex((e) => e.layerId === paintLayerId) : -1;
+        const selSet = new Set(paintLayerIds || []);
+        const selIdxSet = new Set();
+        items.forEach((e, i) => { if (selSet.has(e.layerId)) selIdxSet.add(i); });
 
         try {
-          if (selIdx >= 0) {
-            // Bake the stacks above and below the paint-target layer
-            const [belowCanvas, aboveCanvas] = await Promise.all([
-              compositeLayerImages(items.slice(selIdx + 1)),
-              compositeLayerImages(items.slice(0, selIdx)),
-            ]);
-            if (buildId !== layerBuildIdRef.current) { bail(); return; }
-
-            const selTex = await new THREE.TextureLoader().loadAsync(items[selIdx].url);
-            selTex.flipY = true;
-            gpu.textures.push(selTex);
-            if (items[selIdx].url.startsWith('blob:')) gpu.blobUrls.push(items[selIdx].url);
-
-            const below = belowCanvas ? await canvasToLayerTexture(belowCanvas) : null;
-            const above = aboveCanvas ? await canvasToLayerTexture(aboveCanvas) : null;
-            for (const c of [below, above]) {
-              if (!c) continue;
-              gpu.textures.push(c.tex);
-              gpu.blobUrls.push(c.url);
+          if (selIdxSet.size > 0) {
+            // Render ops bottom→top (items are top→bottom): contiguous runs
+            // of non-selected layers bake into one texture per run; every
+            // selected layer gets a live layerN/maskN slot so brush strokes
+            // update its mask in real time.
+            const ops = [];
+            for (let i = items.length - 1; i >= 0;) {
+              if (selIdxSet.has(i)) {
+                ops.push({ type: 'live', item: items[i] });
+                i--;
+              } else {
+                const seg = [];
+                while (i >= 0 && !selIdxSet.has(i)) { seg.unshift(items[i]); i--; }
+                ops.push({ type: 'bake', items: seg });
+              }
             }
+
+            await Promise.all(ops.map(async (op) => {
+              if (op.type === 'bake') {
+                const c = await compositeLayerImages(op.items);
+                op.tex = c ? await canvasToLayerTexture(c) : null; // { tex, url }
+              } else {
+                const t = await new THREE.TextureLoader().loadAsync(op.item.url);
+                t.flipY = true;
+                op.tex = t;
+              }
+            }));
             if (buildId !== layerBuildIdRef.current) { bail(); return; }
 
-            layerIds = [paintLayerId]; // slot 0 → mask0/hasMask0
-            uniforms = {
-              layer0: { value: selTex },
-              mask0: { value: items[selIdx].maskTexture || white },
-              hasMask0: { value: items[selIdx].maskTexture ? 1 : 0 },
-              u_below: { value: below ? below.tex : white },
-              u_hasBelow: { value: below ? 1 : 0 },
-              u_above: { value: above ? above.tex : white },
-              u_hasAbove: { value: above ? 1 : 0 },
-              dir1Pos: { value: dir1Pos },
-              ...inpaintUniforms(),
-            };
-            fragmentShader = paintFragment;
+            for (const op of ops) {
+              if (op.type === 'bake') {
+                if (!op.tex) continue;
+                gpu.textures.push(op.tex.tex);
+                gpu.blobUrls.push(op.tex.url);
+              } else {
+                gpu.textures.push(op.tex);
+                if (op.item.url.startsWith('blob:')) gpu.blobUrls.push(op.item.url);
+              }
+            }
+
+            // Generate the fragment shader — one blend block per op so
+            // interleaved selections keep their true z-order.
+            let bakeN = 0;
+            let liveN = 0;
+            const decls = [];
+            const body = [];
+            uniforms = { dir1Pos: { value: dir1Pos }, ...inpaintUniforms() };
+            for (const op of ops) {
+              if (op.type === 'bake') {
+                const s = bakeN++;
+                decls.push(`uniform sampler2D u_bake${s}; uniform float u_hasBake${s};`);
+                body.push(`if (u_hasBake${s} > 0.5) { vec4 c${s} = texture2D(u_bake${s}, vUv); color.rgb = mix(color.rgb, c${s}.rgb, c${s}.a); color.a = max(color.a, c${s}.a); }`);
+                uniforms[`u_bake${s}`] = { value: op.tex ? op.tex.tex : white };
+                uniforms[`u_hasBake${s}`] = { value: op.tex ? 1 : 0 };
+              } else {
+                const s = liveN++;
+                decls.push(`uniform sampler2D layer${s}; uniform sampler2D mask${s}; uniform float hasMask${s};`);
+                body.push(`{ vec4 lc${s} = texture2D(layer${s}, vUv); float cm${s} = step(0.01, length(lc${s}.rgb)); float pm${s} = mix(1.0, texture2D(mask${s}, vUv).r, hasMask${s}); float a${s} = mix(0.0, lc${s}.a, pm${s}); color.rgb = mix(color.rgb, lc${s}.rgb, cm${s} * a${s}); color.a = max(color.a, a${s} * cm${s}); }`);
+                uniforms[`layer${s}`] = { value: op.tex };
+                uniforms[`mask${s}`] = { value: op.item.maskTexture || white };
+                uniforms[`hasMask${s}`] = { value: op.item.maskTexture ? 1 : 0 };
+                layerIds.push(op.item.layerId);
+              }
+            }
+            fragmentShader = `
+        uniform vec3 dir1Pos;
+        uniform sampler2D u_checker;
+        uniform sampler2D u_inpaintMask;
+        uniform sampler2D u_inpaintTile;
+        uniform float u_inpaintOffset;
+        uniform float u_hasInpaint;
+        uniform float u_unlit;
+        uniform float u_dimBackface;
+        ${decls.join('\n        ')}
+        varying vec2 vUv;
+        varying vec3 vNormal;
+        varying vec3 vWorldPos;
+        void main() {
+          vec4 color = vec4(0.0);
+          ${body.join('\n          ')}
+${shaderTail}`;
           } else {
             const canvas = await compositeLayerImages(items);
             if (buildId !== layerBuildIdRef.current) { bail(); return; }
@@ -2761,6 +2937,21 @@ ${shaderTail}`;
       if (!entry) return null;
       return this.maskToDataURL(entry);
     },
+
+    // Clear the inpaint overlay mask back to empty (all black). No-op if the
+    // inpaint tool was never activated on this mesh.
+    clearInpaintMask() {
+      if (!inpaintMaskRef.current) return;
+      clearMaskTarget(inpaintMaskRef.current, 0x000000);
+    },
+
+    // Load a mask bitmap (white = painted) into the inpaint overlay mask —
+    // e.g. seeding the inpaint tool from a layer's saved mask.png. Decode
+    // with imageOrientation:'flipY', same as uploadMaskImage's callers.
+    loadInpaintMask(bitmap) {
+      if (!bitmap) return;
+      this.uploadMaskImage(getInpaintEntry(), bitmap);
+    },
   }), []);
 
   // Load / swap mesh when selection changes
@@ -2812,12 +3003,7 @@ ${shaderTail}`;
             child.material.dispose();
           }
         }
-        child.material = new THREE.MeshStandardMaterial({
-          color: 0x9ca3af,
-          metalness: 0.1,
-          roughness: 0.8,
-          side: THREE.DoubleSide,
-        });
+        child.material = makeGreyMeshMaterial();
         if (child.geometry && !child.geometry.attributes.normal) {
           child.geometry.computeVertexNormals();
         }

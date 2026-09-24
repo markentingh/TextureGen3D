@@ -59,8 +59,13 @@ export default function GenerateImagesPanel({ showPanel, setShowPanel }) {
     setCompletedAngleIds,
     layerThumbVersion,
     setLayerThumbVersion,
+    setMaskThumbVersions,
+    assetGeneratingLayerIds,
+    setAssetGeneratingLayerIds,
+    setLayerAssetsGenerating,
     meshLayers,
     addMeshLayer,
+    prependMeshLayer,
     viewerRef,
     promptDebounceRef,
     layerApi,
@@ -71,7 +76,7 @@ export default function GenerateImagesPanel({ showPanel, setShowPanel }) {
 
   const [currentGeneratingAngleId, setCurrentGeneratingAngleId] = useState(null);
   const seedDebounceRef = useRef(null);
-  const { generateViaHub, activeHubConnectionRef } = useHubGeneration();
+  const { generateViaHub, removeBackground, activeHubConnectionRef } = useHubGeneration();
   const cancelRequestedRef = useRef(false);
 
   // ── Camera angle checkboxes (persisted to localStorage) ──
@@ -479,10 +484,25 @@ export default function GenerateImagesPanel({ showPanel, setShowPanel }) {
           ? viewerRef.current.getCameraAngle()
           : null;
         const cameraAngleJson = cameraAngle ? JSON.stringify(cameraAngle) : '';
-        const layerRes = await layerApi.create(id, meshDbId, `Layer ${layerNum}`, cameraAngleJson);
+        const layerRes = await layerApi.create(id, meshDbId, `Layer ${layerNum}`, cameraAngleJson, false, meshRefView.find((r) => r.active)?.id ?? null);
         if (!layerRes.data?.success) throw new Error('Failed to create layer');
         const layer = layerRes.data.data;
-        addMeshLayer(meshDbId, layer);
+        prependMeshLayer(meshDbId, layer);
+        // New single-image layers go to the top of the stack — index 0 draws
+        // last in the composite shader and renders first in the sidebar list.
+        await layerApi.reorder(id, meshDbId, [layer.id, ...meshLayers.map((l) => l.id)]);
+        setLayerAssetsGenerating(layer.id, true);
+
+        // Camera-angle thumbnail — arbitrary angles don't match a stored
+        // camera angle, so persist our own angle_thumb.png like inpaint does.
+        const angleThumb = viewerRef.current?.captureThumbnail?.(75, cameraAngle);
+        if (angleThumb) {
+          try {
+            await layerApi.saveAngleThumb(id, layer.id, meshDbId, angleThumb);
+          } catch (err) {
+            console.warn('Failed to save layer angle thumbnail:', err);
+          }
+        }
 
         // Use the captured camera angle — the user may rotate the mesh
         // while generation is in flight.
@@ -522,21 +542,33 @@ export default function GenerateImagesPanel({ showPanel, setShowPanel }) {
           generatedImage = genRes.data.data?.image;
         }
 
+        // Second pass: strip the background via the active type-4 model —
+        // the processed image becomes the layer image + projection source.
         if (generatedImage) {
-          const uvMapPromise = viewerRef.current?.projectImageToUvMap(
+          generatedImage = await removeBackground({ generatedImage, layer, meshDbId, cameraAngleJson });
+        }
+
+        if (generatedImage) {
+          const projectPromise = viewerRef.current?.projectImageToUvMap(
             generatedImage,
             cameraAngle,
             textureResolution
           );
-          if (uvMapPromise) {
-            const uvMapDataUrl = await uvMapPromise;
-            if (uvMapDataUrl) {
-              await layerApi.saveUvMap(id, layer.id, meshDbId, uvMapDataUrl);
+          if (projectPromise) {
+            const projected = await projectPromise;
+            if (projected?.uvMap) {
+              await layerApi.saveUvMap(id, layer.id, meshDbId, projected.uvMap);
+            }
+            // Coverage mask — white where the projection painted the UV map
+            if (projected?.mask) {
+              await layerApi.saveMasks(id, meshDbId, [{ layerId: layer.id, base64Mask: projected.mask }]);
+              setMaskThumbVersions((prev) => ({ ...prev, [layer.id]: (prev[layer.id] || 0) + 1 }));
             }
           }
           const updatedLayers = await loadMeshLayers(meshDbId);
           await refreshLayerTextures(updatedLayers);
         }
+        setLayerAssetsGenerating(layer.id, false);
       } else {
         const angles = [...cameraAngles].filter((a) => usedAngleIds?.has(a.id) ?? true);
         const totalAngles = angles.length;
@@ -572,11 +604,12 @@ export default function GenerateImagesPanel({ showPanel, setShowPanel }) {
 
           const layerNum = meshLayers.length + i + 1;
           const cameraAngleJson = JSON.stringify(angle.rotation);
-          const layerRes = await layerApi.create(id, meshDbId, `Layer ${layerNum}`, cameraAngleJson);
+          const layerRes = await layerApi.create(id, meshDbId, `Layer ${layerNum}`, cameraAngleJson, false, angle.projectReferenceId ?? null);
           if (!layerRes.data?.success)
             throw new Error(`Failed to create layer for angle ${angleNum}`);
           const layer = layerRes.data.data;
           addMeshLayer(meshDbId, layer);
+          setLayerAssetsGenerating(layer.id, true);
 
           viewerRef.current?.setCameraRotation(angle.rotation);
           await new Promise((r) => setTimeout(r, 50));
@@ -626,17 +659,26 @@ export default function GenerateImagesPanel({ showPanel, setShowPanel }) {
 
           if (cancelRequestedRef.current) break;
 
+          // Second pass: strip the background via the active type-4 model
+          if (generatedImage) {
+            generatedImage = await removeBackground({ generatedImage, layer, meshDbId, cameraAngleJson });
+          }
+
           if (generatedImage) {
             try {
-              const uvMapPromise = viewerRef.current?.projectImageToUvMap(
+              const projectPromise = viewerRef.current?.projectImageToUvMap(
                 generatedImage,
                 angle.rotation,
                 textureResolution
               );
-              if (uvMapPromise) {
-                const uvMapDataUrl = await uvMapPromise;
-                if (uvMapDataUrl) {
-                  await layerApi.saveUvMap(id, layer.id, meshDbId, uvMapDataUrl);
+              if (projectPromise) {
+                const projected = await projectPromise;
+                if (projected?.uvMap) {
+                  await layerApi.saveUvMap(id, layer.id, meshDbId, projected.uvMap);
+                }
+                if (projected?.mask) {
+                  await layerApi.saveMasks(id, meshDbId, [{ layerId: layer.id, base64Mask: projected.mask }]);
+                  setMaskThumbVersions((prev) => ({ ...prev, [layer.id]: (prev[layer.id] || 0) + 1 }));
                 }
               }
             } catch (err) {
@@ -647,6 +689,7 @@ export default function GenerateImagesPanel({ showPanel, setShowPanel }) {
           const updatedLayers = await loadMeshLayers(meshDbId);
           setLayerThumbVersion((v) => v + 1);
           await refreshLayerTextures(updatedLayers);
+          setLayerAssetsGenerating(layer.id, false);
 
           setCompletedAngleIds((prev) => new Set(prev).add(angle.id));
           setComfyMessage(`Image ${angleNum}/${totalAngles}: Complete`);
@@ -661,6 +704,8 @@ export default function GenerateImagesPanel({ showPanel, setShowPanel }) {
       setGeneratingAngleIds(new Set());
       setCompletedAngleIds(new Set());
       setCurrentGeneratingAngleId(null);
+      // Safety net — clear any layer flags left set by an error/cancel
+      setAssetGeneratingLayerIds(new Set());
     }
   };
 

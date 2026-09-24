@@ -14,6 +14,7 @@ export function useHubGeneration() {
     token,
     id,
     selectedModelId,
+    allImageModels,
     layerApi,
     textureResolution,
     setComfyProgress,
@@ -23,7 +24,7 @@ export function useHubGeneration() {
   const activeHubConnectionRef = useRef(null);
 
   const generateViaHub = useCallback(
-    async ({ hubUrl, hubName, layer, meshDbId, fullPrompt, angleId, angleNum, totalAngles, inputImage }) => {
+    async ({ hubUrl, hubName, layer, meshDbId, fullPrompt, angleId, angleNum, totalAngles, inputImage, imageModelId }) => {
       // Upload the caller-supplied reference image via REST — SignalR's 32KB
       // message limit can't carry image data. The hub reads it back by id.
       let inputImageId = null;
@@ -85,7 +86,7 @@ export function useHubGeneration() {
             console.log(`[${hubName}] Connection started, invoking GenerateImage...`);
             connection.invoke(
               'GenerateImage',
-              parseInt(selectedModelId),
+              imageModelId ? parseInt(imageModelId) : parseInt(selectedModelId),
               fullPrompt,
               id,
               meshDbId,
@@ -106,5 +107,47 @@ export function useHubGeneration() {
     [token, id, selectedModelId, layerApi, setComfyProgress, setComfyMessage, textureResolution]
   );
 
-  return { generateViaHub, activeHubConnectionRef };
+  // Second-pass background removal — runs a generated image through the
+  // first (lowest-Id) active type-4 model and returns the processed image.
+  // The hub path also saves it as the layer's image.png via
+  // saveComfyUiResult; the REST path saves it inside the generate endpoint.
+  // Returns the original image unchanged when no type-4 model is configured.
+  const removeBackground = useCallback(
+    async ({ generatedImage, layer, meshDbId, cameraAngleJson }) => {
+      const bgModel = (allImageModels || []).find((m) => m.type === 4 && m.active !== false);
+      if (!bgModel || !generatedImage) return generatedImage;
+
+      setComfyMessage('Removing background...');
+      const vendor = (bgModel.model || '').toLowerCase();
+      if (vendor === 'gradio' || vendor === 'comfyui') {
+        return await generateViaHub({
+          hubUrl: vendor === 'comfyui' ? '/hubs/comfyui' : '/hubs/gradio',
+          hubName: vendor === 'comfyui' ? 'ComfyUI' : 'Gradio',
+          layer,
+          meshDbId,
+          fullPrompt: '',
+          inputImage: generatedImage,
+          imageModelId: bgModel.id,
+        });
+      }
+
+      const res = await layerApi.generate(
+        id,
+        layer.id,
+        meshDbId,
+        bgModel.id,
+        '',
+        null,
+        cameraAngleJson || null,
+        null,
+        generatedImage,
+        textureResolution
+      );
+      if (!res.data?.success) throw new Error(res.data?.message || 'Background removal failed');
+      return res.data.data?.image;
+    },
+    [allImageModels, generateViaHub, layerApi, id, textureResolution, setComfyMessage]
+  );
+
+  return { generateViaHub, removeBackground, activeHubConnectionRef };
 }

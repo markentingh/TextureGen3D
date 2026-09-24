@@ -1,6 +1,5 @@
-import React, { useEffect } from 'react';
+import React, { useEffect, useState } from 'react';
 import { useProject } from '@/context/project';
-import { Projects } from '@/api/user/projects';
 import { useHubGeneration } from './useHubGeneration';
 import ReferenceImagesSection from './ReferenceImagesSection';
 import TextArea from '@/components/forms/textarea';
@@ -62,18 +61,14 @@ export default function InpaintPanel({ showPanel, setShowPanel }) {
     setInpaintPrompt,
     inpaintMaskVisible,
     setInpaintMaskVisible,
-    imageModels,
     inpaintImageModels,
-    selectedModelId,
-    setSelectedModelId,
     inpaintModelId,
     setInpaintModelId,
     inpaintModelOptions,
-    textureResolution,
+    allImageModels,
     isComfyUI,
     isGradio,
-    setProject,
-    imageModelOptions,
+    textureResolution,
     viewerRef,
     layerApi,
     prependMeshLayer,
@@ -87,8 +82,12 @@ export default function InpaintPanel({ showPanel, setShowPanel }) {
     setComfyMessage,
     setLayerThumbVersion,
     setMaskThumbVersions,
+    setLayerAssetsGenerating,
   } = useProject();
-  const { generateViaHub } = useHubGeneration();
+  const { generateViaHub, removeBackground } = useHubGeneration();
+  const [useDepthStep, setUseDepthStep] = useState(
+    () => localStorage.getItem('inpaintUseDepthStep') !== '0'
+  );
 
   // Sync the eye toggle with the shader overlay
   useEffect(() => {
@@ -96,22 +95,6 @@ export default function InpaintPanel({ showPanel, setShowPanel }) {
   }, [inpaintMaskVisible, viewerRef]);
 
   if (!showPanel || models.length === 0) return null;
-
-  const handleImageModelChange = async (e) => {
-    const modelId = e.target.value;
-    setSelectedModelId(modelId);
-    setProject((prev) => (prev ? { ...prev, imageModelId: modelId } : prev));
-    const selectedModel = imageModels.find((m) => m.id?.toString() === modelId);
-    if (selectedModel?.modelKey) {
-      localStorage.setItem('preferredImageModel', selectedModel.modelKey);
-    }
-    try {
-      const projectsApi = Projects({ token });
-      await projectsApi.updateImageModel({ id, imageModelId: modelId ? parseInt(modelId, 10) : null });
-    } catch (err) {
-      console.error('Failed to save preferred image model:', err);
-    }
-  };
 
   const handleInpaintModelChange = (e) => {
     const modelId = e.target.value;
@@ -130,6 +113,7 @@ export default function InpaintPanel({ showPanel, setShowPanel }) {
     setGenerating(true);
     setComfyProgress(0);
     setComfyMessage('Capturing view...');
+    let newLayerId = null; // tracked so the assets spinner clears on error too
 
     try {
       const cameraAngle = viewerRef.current?.getCameraAngle?.();
@@ -167,10 +151,12 @@ export default function InpaintPanel({ showPanel, setShowPanel }) {
       setComfyProgress(60);
       setComfyMessage('Projecting onto new layer...');
       const layerNum = meshLayers.length + 1;
-      const layerRes = await layerApi.create(id, meshDbId, `Layer ${layerNum}`, cameraAngleJson, true);
+      const layerRes = await layerApi.create(id, meshDbId, `Layer ${layerNum}`, cameraAngleJson, true, referenceIds[0] ?? null);
       if (!layerRes.data?.success) throw new Error('Failed to create layer');
       const layer = layerRes.data.data;
       prependMeshLayer(meshDbId, layer);
+      newLayerId = layer.id;
+      setLayerAssetsGenerating(layer.id, true);
       // New inpaint layers go to the top of the stack — index 0 draws last
       // in the composite shader and renders first in the sidebar list.
       await layerApi.reorder(id, meshDbId, [layer.id, ...meshLayers.map((l) => l.id)]);
@@ -186,43 +172,62 @@ export default function InpaintPanel({ showPanel, setShowPanel }) {
         }
       }
 
-      // Depth map must match the captured camera angle, not the live
-      // camera — the user may have rotated the mesh mid-inpaint.
-      const depthMap = viewerRef.current?.captureDepthMap(textureResolution, cameraAngle);
-      if (!depthMap) throw new Error('Failed to generate depth map');
-
       setComfyProgress(75);
-      setComfyMessage('Generating projection...');
       let generatedImage;
-      if (isComfyUI || isGradio) {
-        // Same path as the Generate Images panel — the hub reads the depth map
-        // from storage and reports progress over SignalR
-        const hubUrl = isComfyUI ? '/hubs/comfyui' : '/hubs/gradio';
-        const hubName = isComfyUI ? 'ComfyUI' : 'Gradio';
-        await layerApi.saveDepthMap(id, layer.id, meshDbId, depthMap);
-        generatedImage = await generateViaHub({
-          hubUrl,
-          hubName,
-          layer,
-          meshDbId,
-          fullPrompt: inpaintPrompt,
-          inputImage: inpaintedImage,
-        });
+      if (useDepthStep) {
+        // Depth map must match the captured camera angle, not the live
+        // camera — the user may have rotated the mesh mid-inpaint.
+        const depthMap = viewerRef.current?.captureDepthMap(textureResolution, cameraAngle);
+        if (!depthMap) throw new Error('Failed to generate depth map');
+
+        // Projection always runs through the first active Depth to Image
+        // (type 1) model in the ImageGeneration table — no dropdown.
+        const projectionModel = (allImageModels || []).find((m) => m.type === 1 && m.active !== false);
+        if (!projectionModel) throw new Error('No Depth to Image model configured');
+
+        setComfyMessage('Generating projection...');
+        if (isComfyUI || isGradio) {
+          // Same path as the Generate Images panel — the hub reads the depth map
+          // from storage and reports progress over SignalR
+          const hubUrl = isComfyUI ? '/hubs/comfyui' : '/hubs/gradio';
+          const hubName = isComfyUI ? 'ComfyUI' : 'Gradio';
+          await layerApi.saveDepthMap(id, layer.id, meshDbId, depthMap);
+          generatedImage = await generateViaHub({
+            hubUrl,
+            hubName,
+            layer,
+            meshDbId,
+            fullPrompt: inpaintPrompt,
+            inputImage: inpaintedImage,
+            imageModelId: projectionModel.id,
+          });
+        } else {
+          const genRes = await layerApi.generate(
+            id,
+            layer.id,
+            meshDbId,
+            projectionModel.id,
+            inpaintPrompt,
+            depthMap,
+            cameraAngleJson,
+            null,
+            inpaintedImage,
+            textureResolution
+          );
+          if (!genRes.data?.success) throw new Error(genRes.data?.message || 'Projection generation failed');
+          generatedImage = genRes.data.data?.image;
+        }
       } else {
-        const genRes = await layerApi.generate(
-          id,
-          layer.id,
-          meshDbId,
-          parseInt(selectedModelId),
-          inpaintPrompt,
-          depthMap,
-          cameraAngleJson,
-          null,
-          inpaintedImage,
-          textureResolution
-        );
-        if (!genRes.data?.success) throw new Error(genRes.data?.message || 'Projection generation failed');
-        generatedImage = genRes.data.data?.image;
+        // Depth step skipped — the inpaint model's output goes straight
+        // through the background-removal model.
+        generatedImage = inpaintedImage;
+      }
+
+      // Second pass: strip the background via the active type-4 model —
+      // the processed image becomes the projection source.
+      if (generatedImage) {
+        setComfyMessage('Removing background...');
+        generatedImage = await removeBackground({ generatedImage, layer, meshDbId, cameraAngleJson });
       }
 
       if (generatedImage) {
@@ -230,7 +235,8 @@ export default function InpaintPanel({ showPanel, setShowPanel }) {
         // constrains visibility to the painted region, not the UV map alpha.
         // Project using the captured camera angle — the live camera may have
         // moved since the composite/mask were captured.
-        const uvMapDataUrl = await viewerRef.current?.projectImageToUvMap(generatedImage, cameraAngle, textureResolution);
+        const projected = await viewerRef.current?.projectImageToUvMap(generatedImage, cameraAngle, textureResolution);
+        const uvMapDataUrl = projected?.uvMap;
         if (uvMapDataUrl) {
           await layerApi.saveUvMap(id, layer.id, meshDbId, uvMapDataUrl);
         }
@@ -252,6 +258,8 @@ export default function InpaintPanel({ showPanel, setShowPanel }) {
         setLayerThumbVersion((v) => v + 1);
         setMaskThumbVersions((prev) => ({ ...prev, [layer.id]: (prev[layer.id] || 0) + 1 }));
       }
+      setLayerAssetsGenerating(layer.id, false);
+      newLayerId = null;
 
       setComfyProgress(100);
       setComfyMessage('Done');
@@ -261,6 +269,7 @@ export default function InpaintPanel({ showPanel, setShowPanel }) {
       console.error('Inpaint failed:', err);
       setComfyMessage(`Error: ${err.message}`);
     } finally {
+      if (newLayerId) setLayerAssetsGenerating(newLayerId, false);
       setGenerating(false);
     }
   };
@@ -283,15 +292,25 @@ export default function InpaintPanel({ showPanel, setShowPanel }) {
           </button>
           <h3 className="text-sm font-semibold text-gray-800 dark:text-gray-200">Inpaint Tool</h3>
         </div>
-        <button
-          onClick={() => setShowPanel(false)}
-          className="p-1 rounded hover:bg-gray-100 dark:hover:bg-gray-700 text-gray-500 dark:text-gray-400"
-          aria-label="Collapse panel"
-        >
-          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
-          </svg>
-        </button>
+        <div className="flex items-center">
+          <button
+            onClick={() => viewerRef.current?.clearInpaintMask?.()}
+            className="p-1 rounded hover:bg-gray-100 dark:hover:bg-gray-700 text-gray-500 dark:text-gray-400 mr-1"
+            aria-label="Clear inpaint mask"
+            title="Clear inpaint mask"
+          >
+            <Icon name="deselect" className="text-xl" />
+          </button>
+          <button
+            onClick={() => setShowPanel(false)}
+            className="p-1 rounded hover:bg-gray-100 dark:hover:bg-gray-700 text-gray-500 dark:text-gray-400"
+            aria-label="Collapse panel"
+          >
+            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+            </svg>
+          </button>
+        </div>
       </div>
 
       <div className="flex-1 overflow-y-auto p-3 space-y-4">
@@ -316,14 +335,18 @@ export default function InpaintPanel({ showPanel, setShowPanel }) {
           />
         </div>
 
-        <div>
-          <label className="block text-xs font-medium text-gray-700 dark:text-gray-300 mb-1">Projection Image Model</label>
-          <Select
-            value={selectedModelId}
-            onChange={handleImageModelChange}
-            options={imageModelOptions}
+        <label className="flex items-center gap-2 cursor-pointer">
+          <input
+            type="checkbox"
+            checked={useDepthStep}
+            onChange={(e) => {
+              setUseDepthStep(e.target.checked);
+              localStorage.setItem('inpaintUseDepthStep', e.target.checked ? '1' : '0');
+            }}
+            className="w-4 h-4 cursor-pointer accent-purple-500"
           />
-        </div>
+          <span className="text-xs font-medium text-gray-700 dark:text-gray-300">Use Depth To Image Step</span>
+        </label>
       </div>
 
       <div className="p-3 border-t border-gray-200 dark:border-gray-700">

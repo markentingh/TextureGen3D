@@ -4,6 +4,9 @@ import { generateAngleThumbnails } from '@/helpers/camera-angle';
 import { useProject } from '@/context/project';
 import { ProjectModels } from '@/api/user/projectModels';
 import { ProjectMeshes } from '@/api/user/projectMeshes';
+import { ProjectMeshReferences } from '@/api/user/projectMeshReferences';
+import { ProjectCameraAngles } from '@/api/user/projectCameraAngles';
+import { ProjectReferences } from '@/api/user/projectReferences';
 import { Projects } from '@/api/user/projects';
 import Icon from '@/components/ui/icon';
 import Spinner from '@/components/ui/spinner';
@@ -11,7 +14,36 @@ import Select from '@/components/forms/select';
 import ToggleButtons from '@/components/ui/toggle-buttons';
 import { useModal } from '@/context/modal';
 import StitchLayersModal from './StitchLayersModal';
-import MaskThumb from './MaskThumb';
+import MaskThumb, { CHECKERBOARD_BG } from './MaskThumb';
+import { useHubGeneration } from './useHubGeneration';
+
+// Union two mask images (white = painted) — 'lighten' composites per-channel
+// max, so painted regions from either mask stay painted. Returns a Blob.
+async function mergeMaskImages(baseDataUrl, layerBlob) {
+  const loadImg = (src) => new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = reject;
+    img.src = src;
+  });
+  const layerUrl = URL.createObjectURL(layerBlob);
+  try {
+    const [baseImg, layerImg] = await Promise.all([
+      loadImg(baseDataUrl),
+      loadImg(layerUrl),
+    ]);
+    const canvas = document.createElement('canvas');
+    canvas.width = baseImg.width;
+    canvas.height = baseImg.height;
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(baseImg, 0, 0, canvas.width, canvas.height);
+    ctx.globalCompositeOperation = 'lighten';
+    ctx.drawImage(layerImg, 0, 0, canvas.width, canvas.height);
+    return await new Promise((resolve) => canvas.toBlob(resolve, 'image/png'));
+  } finally {
+    URL.revokeObjectURL(layerUrl);
+  }
+}
 
 export default function RightSidebar() {
   const {
@@ -39,8 +71,12 @@ export default function RightSidebar() {
     layerApi,
     layerThumbVersion,
     maskThumbVersions,
+    setMaskThumbVersions,
+    assetGeneratingLayerIds,
     selectedLayerId,
     setSelectedLayerId,
+    selectedLayerIds,
+    toggleLayerSelected,
     imageModels,
     refImageModels,
     layerMasksRef,
@@ -53,6 +89,8 @@ export default function RightSidebar() {
     setSelectedAngleId,
     angleRefView,
     setAngleRefView,
+    meshRefView,
+    setMeshReferences,
     allCameraAngles,
     setAllCameraAngles,
     thumbnailCache,
@@ -68,8 +106,12 @@ export default function RightSidebar() {
     removeMeshLayer,
     refreshLayerTextures,
     formatTriangleCount,
+    maskTool,
+    setMaskTool,
+    setInpaintMaskVisible,
   } = useProject();
   const { showModal, hideModal } = useModal();
+  const { removeBackground } = useHubGeneration();
 
   // ── Local state ──
   const [editingLayerId, setEditingLayerId] = useState(null);
@@ -77,6 +119,8 @@ export default function RightSidebar() {
   const [layerMenuOpenId, setLayerMenuOpenId] = useState(null);
   const [layerMenuPos, setLayerMenuPos] = useState({ top: 0, right: 0 });
   const dragLayerIndexRef = useRef(null);
+  const [draggingLayerIdx, setDraggingLayerIdx] = useState(null);
+  const [dropIndicatorIdx, setDropIndicatorIdx] = useState(null);
   const [uploading, setUploading] = useState(false);
   const [uploadError, setUploadError] = useState(null);
   const [dragOver, setDragOver] = useState(false);
@@ -85,6 +129,10 @@ export default function RightSidebar() {
   const reuploadModelIdRef = useRef(null);
   const [projectionMode, setProjectionMode] = useState('orthographic');
   const [downloadingUvmap, setDownloadingUvmap] = useState(false);
+  const [layersMenuOpen, setLayersMenuOpen] = useState(false);
+  const [layersMenuPos, setLayersMenuPos] = useState({ top: 0, right: 0 });
+  const [reprojectingAll, setReprojectingAll] = useState(false);
+  const [removingBgLayerId, setRemovingBgLayerId] = useState(null);
 
   // ── formatFileSize ──
   const formatFileSize = (bytes) => {
@@ -490,6 +538,16 @@ export default function RightSidebar() {
     setEditingLayerName(layer.name);
   };
 
+  // Keep the allMeshLayers cache in sync with local meshLayers edits —
+  // loadMeshLayers reads from the cache, so a setMeshLayers-only change
+  // (visibility, rename, reorder) would be silently reverted on the next
+  // layer reload.
+  const syncAllMeshLayers = (layers) => {
+    const meshDbId = selectedMesh ? meshDbIds[selectedMesh.key] : null;
+    if (!meshDbId) return;
+    setAllMeshLayers((prev) => ({ ...prev, [meshDbId]: layers }));
+  };
+
   const handleSaveLayerName = async (layerId) => {
     const name = editingLayerName.trim();
     setEditingLayerId(null);
@@ -497,7 +555,9 @@ export default function RightSidebar() {
     if (!name) return;
     try {
       await layerApi.updateName(id, layerId, name);
-      setMeshLayers((prev) => prev.map((l) => (l.id === layerId ? { ...l, name } : l)));
+      const updatedLayers = meshLayers.map((l) => (l.id === layerId ? { ...l, name } : l));
+      setMeshLayers(updatedLayers);
+      syncAllMeshLayers(updatedLayers);
     } catch (err) {
       console.error('Failed to update layer name:', err);
     }
@@ -509,12 +569,14 @@ export default function RightSidebar() {
       l.id === layer.id ? { ...l, visible: newVisible } : l
     );
     setMeshLayers(updatedLayers);
+    syncAllMeshLayers(updatedLayers);
     try {
       await refreshLayerTextures(updatedLayers);
       await layerApi.toggleVisible(id, layer.id, newVisible);
     } catch (err) {
       console.error('Failed to toggle layer visibility:', err);
       setMeshLayers(meshLayers);
+      syncAllMeshLayers(meshLayers);
     }
   };
 
@@ -533,10 +595,125 @@ export default function RightSidebar() {
     }
   };
 
+  // Fetch the layer's source image and re-project it onto the mesh's UV map
+  // at the layer's stored camera angle. Shared by single + reproject-all.
+  const reprojectLayer = async (layer, meshDbId) => {
+    const imageUrl = layerApi.imageUrl(id, meshDbId, layer.id);
+    const response = await fetch(imageUrl, {
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+    });
+    if (!response.ok) throw new Error('Failed to fetch layer image');
+    const imageBlob = await response.blob();
+    const reader = new FileReader();
+    const imageDataUrl = await new Promise((resolve) => {
+      reader.onloadend = () => resolve(reader.result);
+      reader.readAsDataURL(imageBlob);
+    });
+
+    let rotation = null;
+    if (layer.cameraAngle) {
+      try {
+        rotation = JSON.parse(layer.cameraAngle);
+      } catch {
+        /* ignore */
+      }
+    }
+
+    const projectPromise = viewerRef.current?.projectImageToUvMap(
+      imageDataUrl,
+      rotation,
+      textureResolution
+    );
+    if (!projectPromise) throw new Error('Failed to project image (viewer returned null)');
+    const projected = await projectPromise;
+    if (!projected?.uvMap) throw new Error('Failed to generate UV map');
+
+    await layerApi.saveUvMap(id, layer.id, meshDbId, projected.uvMap);
+    // Reprojection changes the coverage footprint — refresh the mask, but
+    // never overwrite an inpaint layer's painted mask.
+    if (projected.mask && !layer.inpaint) {
+      await layerApi.saveMasks(id, meshDbId, [{ layerId: layer.id, base64Mask: projected.mask }]);
+      setMaskThumbVersions((prev) => ({ ...prev, [layer.id]: (prev[layer.id] || 0) + 1 }));
+    }
+  };
+
   const handleReprojectLayer = async (layer) => {
-    if (!selectedMesh) return;
+    if (!layer || !selectedMesh) return;
     const meshDbId = meshDbIds[selectedMesh.key];
     if (!meshDbId) return;
+    try {
+      await reprojectLayer(layer, meshDbId);
+      const updatedLayers = await loadMeshLayers(meshDbId);
+      await refreshLayerTextures(updatedLayers);
+    } catch (err) {
+      console.error('Reprojection failed:', err);
+    }
+  };
+
+  // Reproject every layer of the selected mesh — a single layer failing
+  // doesn't abort the rest; textures reload once at the end.
+  const handleReprojectAllLayers = async () => {
+    if (!selectedMesh || reprojectingAll) return;
+    const meshDbId = meshDbIds[selectedMesh.key];
+    if (!meshDbId) return;
+    setReprojectingAll(true);
+    try {
+      for (const layer of meshLayers) {
+        try {
+          await reprojectLayer(layer, meshDbId);
+        } catch (err) {
+          console.error(`Reprojection failed for layer "${layer.name}":`, err);
+        }
+      }
+      const updatedLayers = await loadMeshLayers(meshDbId);
+      await refreshLayerTextures(updatedLayers);
+    } finally {
+      setReprojectingAll(false);
+    }
+  };
+
+  // Load the layer's saved mask.png into the inpaint overlay mask and switch
+  // to the inpaint tool — the mask becomes the painted region. Ctrl/Cmd+click
+  // adds the mask to the existing inpaint mask (union) instead of replacing.
+  // No stopPropagation: the click also selects the layer like the angle thumb.
+  const handleMaskThumbClick = async (layer, e) => {
+    if (!layer || !selectedMesh) return;
+    const meshDbId = meshDbIds[selectedMesh.key];
+    if (!meshDbId) return;
+    try {
+      const res = await fetch(layerApi.maskUrl(id, meshDbId, layer.id), {
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      });
+      if (!res.ok) return;
+      let blob = await res.blob();
+      if (blob.size === 0) return;
+
+      const additive = e?.ctrlKey || e?.metaKey;
+      if (additive) {
+        // Merge with the current inpaint mask — 'lighten' gives the union of
+        // both painted regions (per-channel max). Both are PNG-orientation.
+        const curDataUrl = viewerRef.current?.inpaintMaskToDataURL?.();
+        if (curDataUrl) blob = await mergeMaskImages(curDataUrl, blob);
+      }
+
+      const bitmap = await createImageBitmap(blob, { imageOrientation: 'flipY' });
+      viewerRef.current?.loadInpaintMask?.(bitmap);
+      bitmap.close();
+      setInpaintMaskVisible(true);
+      setMaskTool('inpaint');
+    } catch (err) {
+      console.warn('Failed to load layer mask into inpaint:', err);
+    }
+  };
+
+  // Run the layer's existing image through the active Background Removal
+  // (type-4) model, save it back as the layer image, then reproject so the
+  // removed background shows through to the checkerboard on the mesh.
+  const handleRemoveBackgroundLayer = async (layer) => {
+    if (!layer || !selectedMesh || removingBgLayerId) return;
+    const meshDbId = meshDbIds[selectedMesh.key];
+    if (!meshDbId) return;
+    setRemovingBgLayerId(layer.id);
     try {
       const imageUrl = layerApi.imageUrl(id, meshDbId, layer.id);
       const response = await fetch(imageUrl, {
@@ -550,6 +727,14 @@ export default function RightSidebar() {
         reader.readAsDataURL(imageBlob);
       });
 
+      const processed = await removeBackground({
+        generatedImage: imageDataUrl,
+        layer,
+        meshDbId,
+        cameraAngleJson: layer.cameraAngle,
+      });
+      if (!processed) throw new Error('Background removal returned no image');
+
       let rotation = null;
       if (layer.cameraAngle) {
         try {
@@ -558,39 +743,66 @@ export default function RightSidebar() {
           /* ignore */
         }
       }
-
-      const uvMapPromise = viewerRef.current?.projectImageToUvMap(
-        imageDataUrl,
+      const uvMapDataUrl = await viewerRef.current?.projectImageToUvMap(
+        processed,
         rotation,
         textureResolution
       );
-      if (!uvMapPromise) throw new Error('Failed to project image (viewer returned null)');
-      const uvMapDataUrl = await uvMapPromise;
-      if (!uvMapDataUrl) throw new Error('Failed to generate UV map');
+      if (uvMapDataUrl) await layerApi.saveUvMap(id, layer.id, meshDbId, uvMapDataUrl);
 
-      await layerApi.saveUvMap(id, layer.id, meshDbId, uvMapDataUrl);
       const updatedLayers = await loadMeshLayers(meshDbId);
       await refreshLayerTextures(updatedLayers);
     } catch (err) {
-      console.error('Reprojection failed:', err);
+      console.error('Background removal failed:', err);
+    } finally {
+      setRemovingBgLayerId(null);
     }
   };
 
   const handleLayerDragStart = (e, index) => {
     dragLayerIndexRef.current = index;
     e.dataTransfer.effectAllowed = 'move';
+    e.dataTransfer.setData('text/plain', String(index)); // required by Firefox
+    // Drag ghost = a snapshot of the whole row, grabbed at the pointer's
+    // position within the row so it follows the cursor naturally.
+    const row = e.currentTarget.closest('li');
+    if (row) {
+      const rect = row.getBoundingClientRect();
+      e.dataTransfer.setDragImage(row, e.clientX - rect.left, e.clientY - rect.top);
+    }
+    // The snapshot is taken synchronously, so hiding the row via state is
+    // safe — React flushes it after this handler returns.
+    setDraggingLayerIdx(index);
   };
 
-  const handleLayerDrop = async (e, dropIndex) => {
+  // Track the gap (0..length) the dragged layer would drop into — the row's
+  // top half maps to the gap above it, bottom half to the gap below.
+  const handleLayerDragOver = (e, index) => {
+    e.preventDefault();
+    if (dragLayerIndexRef.current === null) return;
+    const rect = e.currentTarget.getBoundingClientRect();
+    setDropIndicatorIdx(e.clientY < rect.top + rect.height / 2 ? index : index + 1);
+  };
+
+  const endLayerDrag = () => {
+    dragLayerIndexRef.current = null;
+    setDraggingLayerIdx(null);
+    setDropIndicatorIdx(null);
+  };
+
+  const handleLayerDrop = async (e) => {
     e.preventDefault();
     const dragIndex = dragLayerIndexRef.current;
-    dragLayerIndexRef.current = null;
-    if (dragIndex === null || dragIndex === dropIndex) return;
+    const dropGap = dropIndicatorIdx;
+    endLayerDrag();
+    if (dragIndex === null || dropGap === null) return;
+    if (dropGap === dragIndex || dropGap === dragIndex + 1) return; // same spot
 
     const reordered = [...meshLayers];
     const [moved] = reordered.splice(dragIndex, 1);
-    reordered.splice(dropIndex, 0, moved);
+    reordered.splice(dropGap > dragIndex ? dropGap - 1 : dropGap, 0, moved);
     setMeshLayers(reordered);
+    syncAllMeshLayers(reordered);
 
     const meshDbId = selectedMesh ? meshDbIds[selectedMesh.key] : null;
     if (meshDbId) {
@@ -601,6 +813,29 @@ export default function RightSidebar() {
       }
     }
     refreshLayerTextures(reordered);
+  };
+
+  const openStitchModal = () => {
+    if (!selectedMesh) return;
+    showModal({
+      title: 'Stitch Layers',
+      className: 'w-full max-w-2xl',
+      onClose: hideModal,
+      body: (
+        <StitchLayersModal
+          layers={meshLayers}
+          projectId={id}
+          meshDbId={meshDbIds[selectedMesh.key]}
+          token={token}
+          imageModels={refImageModels}
+          layerApi={layerApi}
+          layerMasksRef={layerMasksRef}
+          viewerRef={viewerRef}
+          onClose={hideModal}
+          onStitched={handleStitched}
+        />
+      ),
+    });
   };
 
   const handleStitched = async () => {
@@ -635,6 +870,44 @@ export default function RightSidebar() {
       });
     } catch (err) {
       console.error('Failed to load layer reference image:', err);
+    }
+  };
+
+  // Clicking a layer's reference thumb loads that reference into whichever
+  // panel is displayed: the selected camera angle's ref in angles mode, or
+  // the mesh's reference list for single generation / inpainting.
+  const handleReferenceThumbClick = async (layer) => {
+    const ref = projectRefs.find((r) => r.id === layer.referenceId);
+    const meshDbId = selectedMesh ? meshDbIds[selectedMesh.key] : null;
+    if (!ref || !meshDbId) return;
+    try {
+      if (maskTool !== 'inpaint' && generationMode === 'angles' && selectedAngleId) {
+        const anglesApi = ProjectCameraAngles({ token });
+        await anglesApi.updateReference(id, selectedAngleId, ref.id);
+        setCameraAngles((prev) => prev.map((a) => a.id === selectedAngleId ? { ...a, projectReferenceId: ref.id } : a));
+        setAngleRefView([{ ...ref, active: true }]);
+        return;
+      }
+      const meshRefApi = ProjectMeshReferences({ token });
+      const existing = meshRefView.find((r) => r.id === ref.id);
+      for (const r of meshRefView) {
+        if (r.meshRefId && r.id !== ref.id) {
+          await meshRefApi.delete(id, r.meshRefId);
+        }
+      }
+      if (existing?.meshRefId) {
+        if (!existing.active) {
+          await meshRefApi.updateActive(id, existing.meshRefId, true);
+        }
+      } else {
+        await meshRefApi.add(id, meshDbId, ref.id);
+      }
+      const res = await meshRefApi.getByMesh(id, meshDbId);
+      if (res.data?.success) {
+        setMeshReferences((prev) => ({ ...prev, [meshDbId]: res.data.data || [] }));
+      }
+    } catch (err) {
+      console.error('Failed to set layer reference:', err);
     }
   };
 
@@ -740,36 +1013,6 @@ export default function RightSidebar() {
               <h3 className="text-sm font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-400">Layers</h3>
               <div className="flex items-center gap-1">
                 <button
-                  onClick={() => {
-                    if (!selectedMesh) return;
-                    showModal({
-                      title: 'Stitch Layers',
-                      className: 'w-full max-w-2xl',
-                      onClose: hideModal,
-                      body: (
-                        <StitchLayersModal
-                          layers={meshLayers}
-                          projectId={id}
-                          meshDbId={meshDbIds[selectedMesh.key]}
-                          token={token}
-                          imageModels={refImageModels}
-                          layerApi={layerApi}
-                          layerMasksRef={layerMasksRef}
-                          viewerRef={viewerRef}
-                          onClose={hideModal}
-                          onStitched={handleStitched}
-                        />
-                      ),
-                    });
-                  }}
-                  disabled={!selectedMesh || meshLayers.length === 0}
-                  className="p-1 rounded text-gray-500 hover:text-green-600 dark:hover:text-green-400 disabled:opacity-30 disabled:cursor-not-allowed transition"
-                  aria-label="Stitch all layers together"
-                  title="Stitch all layers together"
-                >
-                  <Icon name="photo_auto_merge" className="text-lg" />
-                </button>
-                <button
                   onClick={handleDownloadUvmap}
                   disabled={!selectedMesh || meshLayers.length === 0 || downloadingUvmap}
                   className="p-1 rounded text-gray-500 hover:text-purple-600 dark:hover:text-purple-400 disabled:opacity-30 disabled:cursor-not-allowed transition"
@@ -782,6 +1025,27 @@ export default function RightSidebar() {
                     <Icon name="download" className="text-lg" />
                   )}
                 </button>
+                <button
+                  onClick={(e) => {
+                    if (layersMenuOpen) {
+                      setLayersMenuOpen(false);
+                    } else {
+                      const rect = e.currentTarget.getBoundingClientRect();
+                      setLayersMenuPos({ top: rect.bottom + 4, right: window.innerWidth - rect.right });
+                      setLayersMenuOpen(true);
+                    }
+                  }}
+                  disabled={!selectedMesh || meshLayers.length === 0}
+                  className="p-1 rounded text-gray-500 hover:text-gray-700 dark:hover:text-gray-300 disabled:opacity-30 disabled:cursor-not-allowed transition"
+                  aria-label="Layer actions"
+                  title="Layer actions"
+                >
+                  {reprojectingAll ? (
+                    <Spinner className="text-lg" />
+                  ) : (
+                    <Icon name="more_vert" className="text-lg" />
+                  )}
+                </button>
               </div>
             </div>
             <div className="overflow-y-auto flex-1">
@@ -792,24 +1056,36 @@ export default function RightSidebar() {
               ) : (
                 <ul className="divide-y divide-gray-100 dark:divide-gray-700/50">
                   {meshLayers.map((layer, index) => (
+                    <React.Fragment key={layer.id}>
+                    {dropIndicatorIdx === index && (
+                      <li
+                        onDragOver={(e) => e.preventDefault()}
+                        onDrop={handleLayerDrop}
+                        className="h-0.5 bg-purple-500 rounded mx-1"
+                      />
+                    )}
                     <li
-                      key={layer.id}
-                      onDragOver={(e) => e.preventDefault()}
-                      onDrop={(e) => handleLayerDrop(e, index)}
-                      onClick={() => setSelectedLayerId(layer.id)}
+                      onDragOver={(e) => handleLayerDragOver(e, index)}
+                      onDrop={handleLayerDrop}
+                      onClick={(e) => {
+                        if (e.ctrlKey || e.metaKey) toggleLayerSelected(layer.id);
+                        else setSelectedLayerId(layer.id);
+                      }}
                       className={`px-2 py-2 group cursor-pointer transition ${
-                        selectedLayerId === layer.id
+                        index === draggingLayerIdx
+                          ? 'hidden'
+                          : selectedLayerIds.includes(layer.id)
                           ? 'bg-purple-50 dark:bg-purple-900/30 outline-none ring-2 ring-purple-500 ring-inset'
                           : 'hover:bg-gray-50 dark:hover:bg-gray-700/50'
                       }`}
-                      style={selectedLayerId === layer.id ? { boxShadow: 'inset 0 0 0 2px #a855f7' } : undefined}
+                      style={selectedLayerIds.includes(layer.id) && index !== draggingLayerIdx ? { boxShadow: 'inset 0 0 0 2px #a855f7' } : undefined}
                     >
                       <div className="flex items-stretch gap-2">
                         {/* Drag handle — the grip column is the only drag source */}
                         <span
                           draggable
                           onDragStart={(e) => handleLayerDragStart(e, index)}
-                          onDragEnd={() => { dragLayerIndexRef.current = null; }}
+                          onDragEnd={endLayerDrag}
                           onClick={(e) => e.stopPropagation()}
                           className="cursor-grab active:cursor-grabbing text-gray-300 dark:text-gray-600 hover:text-gray-500 dark:hover:text-gray-400 flex-shrink-0"
                           style={{ display: 'flex', alignItems: 'center' }}
@@ -822,14 +1098,20 @@ export default function RightSidebar() {
                         <div className="min-w-0 flex-1 flex flex-col">
                           {/* Row 1: eye toggle + name + edit + 3-dots */}
                           <div className="flex items-center gap-1">
-                            <button
-                              onClick={() => handleToggleLayerVisible(layer)}
-                              className={`flex-shrink-0 translate-y-1 pr-1 transition ${layer.visible !== false ? 'text-gray-500 hover:text-gray-700 dark:hover:text-gray-300' : 'text-gray-300 dark:text-gray-600 hover:text-gray-500'}`}
-                              aria-label={layer.visible !== false ? 'Hide layer' : 'Show layer'}
-                              title={layer.visible !== false ? 'Hide layer' : 'Show layer'}
-                            >
-                              <Icon name={layer.visible !== false ? 'visibility' : 'visibility_off'} className="text-2xl" />
-                            </button>
+                            {removingBgLayerId === layer.id ? (
+                              <span className="flex-shrink-0 translate-y-1 pr-1" title="Removing background...">
+                                <Spinner className="text-2xl" />
+                              </span>
+                            ) : (
+                              <button
+                                onClick={() => handleToggleLayerVisible(layer)}
+                                className={`flex-shrink-0 translate-y-1 pr-1 transition ${layer.visible !== false ? 'text-gray-500 hover:text-gray-700 dark:hover:text-gray-300' : 'text-gray-300 dark:text-gray-600 hover:text-gray-500'}`}
+                                aria-label={layer.visible !== false ? 'Hide layer' : 'Show layer'}
+                                title={layer.visible !== false ? 'Hide layer' : 'Show layer'}
+                              >
+                                <Icon name={layer.visible !== false ? 'visibility' : 'visibility_off'} className="text-2xl" />
+                              </button>
+                            )}
 
                             <div className="min-w-0 flex-1">
                               {editingLayerId === layer.id ? (
@@ -852,6 +1134,12 @@ export default function RightSidebar() {
                                 </p>
                               )}
                             </div>
+
+                            {layer.inpaint && (
+                              <span className="flex-shrink-0 pr-2 text-green-600 dark:text-green-500 text-[10px] font-bold">
+                                Inpainted
+                              </span>
+                            )}
 
                             {/* Edit icon */}
                             <button
@@ -888,10 +1176,20 @@ export default function RightSidebar() {
                           {/* Row 2: UV map thumb + camera angle thumb + mask thumb + delete */}
                           <div className="flex items-center justify-between mt-1">
                             <div className="flex items-center gap-2">
-                              {/* UV map thumb */}
+                              {assetGeneratingLayerIds?.has(layer.id) ? (
+                                <div className="flex items-center gap-2" style={{ height: 47 }}>
+                                  <Spinner className="text-lg" />
+                                  <span className="text-xs text-gray-500 dark:text-gray-400 whitespace-nowrap">
+                                    Generating layer assets...
+                                  </span>
+                                </div>
+                              ) : (
+                                <>
+                              {/* UV map thumb — checkerboard so transparent
+                                  areas (removed background) are visible */}
                               <div
-                                className="flex-shrink-0 rounded border border-gray-200 dark:border-gray-600 overflow-hidden bg-gray-100 dark:bg-gray-700"
-                                style={{ width: 47, height: 47 }}
+                                className="flex-shrink-0 rounded border border-gray-200 dark:border-gray-600 overflow-hidden"
+                                style={{ width: 47, height: 47, ...CHECKERBOARD_BG }}
                               >
                                 {layer.hasImage !== false && (
                                   <img
@@ -904,47 +1202,42 @@ export default function RightSidebar() {
                                 )}
                               </div>
 
-                              {/* Mask thumb — inverted mask on the alpha channel of a white image */}
+                              {/* Mask thumb — inverted mask on the alpha channel of a white image.
+                                  Click loads the layer's mask into the inpaint tool. */}
                               <MaskThumb
                                 url={`${layerApi.maskThumbUrl(id, meshDbIds[selectedMesh.key], layer.id)}?r=${maskThumbVersions?.[layer.id] ?? 0}`}
                                 version={maskThumbVersions?.[layer.id] ?? 0}
                                 size={47}
+                                onClick={(e) => handleMaskThumbClick(layer, e)}
                               />
 
                               {/* Camera angle thumb + inpaint tag — clicking the
                                   thumb snaps the main camera to the layer's angle */}
                               {(() => {
                                 const angleThumb = getAngleThumbForLayer(layer);
-                                const applyLayerAngle = (e) => {
-                                  e.stopPropagation();
+                                const applyLayerAngle = () => {
+                                  // No stopPropagation — let the click bubble to
+                                  // the row's onClick so the layer also selects
                                   try {
                                     const rotation = JSON.parse(layer.cameraAngle || '{}');
                                     if (rotation.x == null && rotation.y == null && rotation.z == null) return;
                                     viewerRef.current?.setCameraRotation(rotation);
                                   } catch { /* malformed JSON — ignore */ }
                                 };
-                                const inpaintTag = layer.inpaint ? (
-                                  <span className="self-end text-green-600 dark:text-green-500 text-[10px] font-bold">
-                                    Inpainted
-                                  </span>
-                                ) : null;
                                 const thumbCls = "rounded border border-gray-200 dark:border-gray-600 overflow-hidden bg-gray-100 dark:bg-gray-700 cursor-pointer hover:ring-1 hover:ring-purple-500 transition";
                                 if (angleThumb) {
                                   return (
-                                    <div className="flex items-end gap-1 flex-shrink-0">
-                                      <div
-                                        className={thumbCls}
-                                        style={{ width: 47, height: 47 }}
-                                        onClick={applyLayerAngle}
-                                        title="Snap camera to this layer's angle"
-                                      >
-                                        <img
-                                          src={angleThumb}
-                                          alt="Camera angle"
-                                          className="w-full h-full object-cover"
-                                        />
-                                      </div>
-                                      {inpaintTag}
+                                    <div
+                                      className={`${thumbCls} flex-shrink-0`}
+                                      style={{ width: 47, height: 47 }}
+                                      onClick={applyLayerAngle}
+                                      title="Snap camera to this layer's angle"
+                                    >
+                                      <img
+                                        src={angleThumb}
+                                        alt="Camera angle"
+                                        className="w-full h-full object-cover"
+                                      />
                                     </div>
                                   );
                                 }
@@ -952,40 +1245,57 @@ export default function RightSidebar() {
                                 // layer's own saved angle thumbnail (e.g. inpaint
                                 // layers with arbitrary camera angles)
                                 return (
-                                  <div className="flex items-end gap-1 flex-shrink-0" style={{ display: 'none' }}>
-                                    <div
-                                      className={thumbCls}
-                                      style={{ width: 47, height: 47 }}
-                                      onClick={applyLayerAngle}
-                                      title="Snap camera to this layer's angle"
-                                    >
-                                      <img
-                                        src={`${layerApi.angleThumbUrl(id, meshDbIds[selectedMesh.key], layer.id)}?r=${layerThumbVersion}`}
-                                        alt="Camera angle"
-                                        className="w-full h-full object-cover"
-                                        onLoad={(e) => { e.target.parentElement.parentElement.style.display = ''; }}
-                                        onError={(e) => { e.target.parentElement.parentElement.style.display = 'none'; }}
-                                      />
-                                    </div>
-                                    {inpaintTag}
+                                  <div
+                                    className={`${thumbCls} flex-shrink-0`}
+                                    style={{ width: 47, height: 47, display: 'none' }}
+                                    onClick={applyLayerAngle}
+                                    title="Snap camera to this layer's angle"
+                                  >
+                                    <img
+                                      src={`${layerApi.angleThumbUrl(id, meshDbIds[selectedMesh.key], layer.id)}?r=${layerThumbVersion}`}
+                                      alt="Camera angle"
+                                      className="w-full h-full object-cover"
+                                      onLoad={(e) => { e.target.parentElement.style.display = ''; }}
+                                      onError={(e) => { e.target.parentElement.style.display = 'none'; }}
+                                    />
                                   </div>
                                 );
                               })()}
-                            </div>
 
-                            <button
-                              onClick={() => handleDeleteLayerClick(layer)}
-                              className="flex-shrink-0 text-gray-400 hover:text-red-600 dark:hover:text-red-400 transition"
-                              aria-label="Delete layer"
-                              title="Delete layer"
-                            >
-                              <Icon name="delete" className="text-base" />
-                            </button>
+                              {/* Reference image thumb — click loads this
+                                  layer's reference into the displayed panel */}
+                              {layer.referenceId && (
+                                <div
+                                  className="flex-shrink-0 rounded border border-gray-200 dark:border-gray-600 overflow-hidden bg-gray-100 dark:bg-gray-700 cursor-pointer hover:ring-1 hover:ring-purple-500 transition"
+                                  style={{ width: 47, height: 47 }}
+                                  onClick={() => handleReferenceThumbClick(layer)}
+                                  title="Use this reference image in the current panel"
+                                >
+                                  <img
+                                    src={ProjectReferences({ token }).thumbUrl(id, layer.referenceId)}
+                                    alt="Reference"
+                                    className="w-full h-full object-cover"
+                                    onLoad={(e) => { e.target.style.display = ''; }}
+                                    onError={(e) => { e.target.style.display = 'none'; }}
+                                  />
+                                </div>
+                              )}
+                                </>
+                              )}
+                            </div>
                           </div>
                         </div>
                       </div>
                     </li>
+                    </React.Fragment>
                   ))}
+                  {dropIndicatorIdx === meshLayers.length && (
+                    <li
+                      onDragOver={(e) => e.preventDefault()}
+                      onDrop={handleLayerDrop}
+                      className="h-0.5 bg-purple-500 rounded mx-1"
+                    />
+                  )}
                 </ul>
               )}
             </div>
@@ -1151,6 +1461,36 @@ export default function RightSidebar() {
         </div>
       </div>
 
+      {/* Fixed-position layers-header dropdown menu (escapes overflow containers) */}
+      {layersMenuOpen && (
+        <>
+          <div
+            className="fixed inset-0 z-40"
+            onClick={() => setLayersMenuOpen(false)}
+          />
+          <div
+            className="fixed z-50 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-600 rounded-lg shadow-lg py-1 min-w-[180px]"
+            style={{ top: layersMenuPos.top, right: layersMenuPos.right }}
+          >
+            <button
+              onClick={() => { setLayersMenuOpen(false); openStitchModal(); }}
+              className="w-full text-left px-3 py-1.5 text-sm text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 transition flex items-center gap-2"
+            >
+              <Icon name="photo_auto_merge" className="text-sm" />
+              Stitch All Layers
+            </button>
+            <button
+              onClick={() => { setLayersMenuOpen(false); handleReprojectAllLayers(); }}
+              disabled={reprojectingAll}
+              className="w-full text-left px-3 py-1.5 text-sm text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 disabled:opacity-50 disabled:cursor-not-allowed transition flex items-center gap-2"
+            >
+              <Icon name="3d_rotation" className="text-sm" />
+              Reproject All Layers
+            </button>
+          </div>
+        </>
+      )}
+
       {/* Fixed-position layer dropdown menu (escapes overflow containers) */}
       {layerMenuOpenId && (
         <>
@@ -1168,6 +1508,13 @@ export default function RightSidebar() {
             >
               <Icon name="3d_rotation" className="text-sm" />
               Reproject Image
+            </button>
+            <button
+              onClick={() => { const lid = layerMenuOpenId; setLayerMenuOpenId(null); const layer = meshLayers.find((l) => l.id === lid); if (layer) handleRemoveBackgroundLayer(layer); }}
+              className="w-full text-left px-3 py-1.5 text-sm text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 transition flex items-center gap-2"
+            >
+              <Icon name="layers_clear" className="text-sm" />
+              Remove Background
             </button>
             <button
               onClick={() => { const lid = layerMenuOpenId; setLayerMenuOpenId(null); const layer = meshLayers.find((l) => l.id === lid); if (layer) handleViewLayerReference(layer); }}

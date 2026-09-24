@@ -21,6 +21,8 @@ namespace TextureGen3D.API.Models.ImageGeneration
         public string? SeedPath { get; set; }
         public string? Prompt { get; set; }
         public string? EndpointUrl { get; set; }
+        public string? ParamMappings { get; set; }
+        public int PricingType { get; set; }
         public bool Active { get; set; } = true;
     }
 

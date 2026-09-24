@@ -209,6 +209,7 @@ namespace TextureGen3D.API.Controllers
                             name = m.Name,
                             model = m.Model,
                             type = m.Type,
+                            active = m.Active,
                             cp1k = m.CP1K,
                             cp2k = m.CP2K,
                             cp4k = m.CP4K,
