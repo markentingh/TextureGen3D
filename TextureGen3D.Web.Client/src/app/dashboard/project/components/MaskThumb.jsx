@@ -82,6 +82,7 @@ export default function MaskThumb({ url, version = 0, size = 47, onClick }) {
         <img
           src={thumbUrl}
           alt="Mask"
+          draggable={false}
           className="w-full h-full object-cover"
         />
       )}

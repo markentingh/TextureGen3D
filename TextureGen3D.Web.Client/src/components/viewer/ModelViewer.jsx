@@ -597,7 +597,11 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
       const d = imgData.data;
       for (let p = 0; p < d.length; p += 4) {
         const r = d[p], g = d[p + 1], b = d[p + 2];
-        if (r * r + g * g + b * b < 7) {
+        // Near-black cull only applies to mask-less layers — when a mask is
+        // present it alone defines visibility (same as the live shader's
+        // cm = hasMask ? 1 : step). Culling masked dark content opens holes
+        // that read as a dark fringe around the mask boundary.
+        if (!md && r * r + g * g + b * b < 7) {
           d[p + 3] = 0;
         } else if (md) {
           d[p + 3] = Math.round((d[p + 3] * md[p]) / 255);
@@ -606,6 +610,42 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
       tctx.putImageData(imgData, 0, 0);
       ctx.drawImage(tmp, 0, 0);
     }
+
+    // Dilate edge colors ~3px into transparent areas. Masked-out texels keep
+    // their (usually dark) rgb — mipmapped sampling then blends that hidden
+    // dark rgb into visible edge texels, producing a dark fringe around the
+    // mask boundary. Filling transparent texels with the nearest visible
+    // color makes mip levels fade to the edge color instead.
+    const cd = ctx.getImageData(0, 0, w, h);
+    const cdData = cd.data;
+    const filled = new Uint8Array(w * h);
+    for (let pass = 0; pass < 3; pass++) {
+      const src = cdData.slice();
+      const filledPrev = filled.slice();
+      for (let y = 0; y < h; y++) {
+        for (let x = 0; x < w; x++) {
+          const i = (y * w + x) * 4;
+          if (src[i + 3] !== 0 || filledPrev[y * w + x]) continue;
+          let r = 0, g = 0, b = 0, n = 0;
+          for (let k = 0; k < 4; k++) {
+            const nx = x + (k === 0 ? 1 : k === 1 ? -1 : 0);
+            const ny = y + (k === 2 ? 1 : k === 3 ? -1 : 0);
+            if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue;
+            const j = (ny * w + nx) * 4;
+            if (src[j + 3] > 0 || filledPrev[ny * w + nx]) {
+              r += src[j]; g += src[j + 1]; b += src[j + 2]; n++;
+            }
+          }
+          if (n) {
+            cdData[i] = r / n;
+            cdData[i + 1] = g / n;
+            cdData[i + 2] = b / n;
+            filled[y * w + x] = 1;
+          }
+        }
+      }
+    }
+    ctx.putImageData(cd, 0, 0);
     return canvas;
   };
 

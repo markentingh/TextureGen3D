@@ -950,9 +950,9 @@ export default function RightSidebar() {
       const rect = row.getBoundingClientRect();
       e.dataTransfer.setDragImage(row, e.clientX - rect.left, e.clientY - rect.top);
     }
-    // The snapshot is taken synchronously, so hiding the row via state is
-    // safe — React flushes it after this handler returns.
-    setDraggingLayerIdx(index);
+    // Defer hiding the row until the browser has started the drag —
+    // display:none on the drag source during dragstart cancels the drag.
+    requestAnimationFrame(() => setDraggingLayerIdx(index));
   };
 
   // Track the gap (0..length) the dragged layer would drop into — the row's
@@ -1464,6 +1464,9 @@ export default function RightSidebar() {
                       />
                     )}
                     <li
+                      draggable
+                      onDragStart={(e) => handleLayerDragStart(e, index)}
+                      onDragEnd={endLayerDrag}
                       onDragOver={(e) => handleLayerDragOver(e, index)}
                       onDrop={handleLayerDrop}
                       onClick={(e) => {
@@ -1480,11 +1483,8 @@ export default function RightSidebar() {
                       style={selectedLayerIds.includes(layer.id) && index !== draggingLayerIdx ? { boxShadow: 'inset 0 0 0 2px #a855f7' } : undefined}
                     >
                       <div className="flex items-stretch gap-2">
-                        {/* Drag handle — the grip column is the only drag source */}
+                        {/* Drag handle — visual affordance; the whole row drags */}
                         <span
-                          draggable
-                          onDragStart={(e) => handleLayerDragStart(e, index)}
-                          onDragEnd={endLayerDrag}
                           onClick={(e) => e.stopPropagation()}
                           className="cursor-grab active:cursor-grabbing text-gray-300 dark:text-gray-600 hover:text-gray-500 dark:hover:text-gray-400 flex-shrink-0"
                           style={{ display: 'flex', alignItems: 'center' }}
@@ -1503,7 +1503,7 @@ export default function RightSidebar() {
                               </span>
                             ) : (
                               <button
-                                onClick={() => handleToggleLayerVisible(layer)}
+                                onClick={(e) => { e.stopPropagation(); handleToggleLayerVisible(layer); }}
                                 className={`flex-shrink-0 translate-y-1 pr-1 transition ${layer.visible !== false ? 'text-gray-500 hover:text-gray-700 dark:hover:text-gray-300' : 'text-gray-300 dark:text-gray-600 hover:text-gray-500'}`}
                                 aria-label={layer.visible !== false ? 'Hide layer' : 'Show layer'}
                                 title={layer.visible !== false ? 'Hide layer' : 'Show layer'}
@@ -1600,6 +1600,7 @@ export default function RightSidebar() {
                                   <img
                                     src={`${layerApi.uvmapThumbUrl(id, meshDbIds[selectedMesh.key], layer.id)}?r=${layerThumbVersion}`}
                                     alt={layer.name}
+                                    draggable={false}
                                     className="w-full h-full object-cover"
                                     onLoad={(e) => { e.target.style.display = ''; }}
                                     onError={(e) => { e.target.style.display = 'none'; }}
@@ -1641,6 +1642,7 @@ export default function RightSidebar() {
                                       <img
                                         src={angleThumb}
                                         alt="Camera angle"
+                                        draggable={false}
                                         className="w-full h-full object-cover"
                                       />
                                     </div>
@@ -1659,6 +1661,7 @@ export default function RightSidebar() {
                                     <img
                                       src={`${layerApi.angleThumbUrl(id, meshDbIds[selectedMesh.key], layer.id)}?r=${layerThumbVersion}`}
                                       alt="Camera angle"
+                                      draggable={false}
                                       className="w-full h-full object-cover"
                                       onLoad={(e) => { e.target.parentElement.style.display = ''; }}
                                       onError={(e) => { e.target.parentElement.style.display = 'none'; }}
@@ -1679,6 +1682,7 @@ export default function RightSidebar() {
                                   <img
                                     src={ProjectReferences({ token }).thumbUrl(id, layer.referenceId)}
                                     alt="Reference"
+                                    draggable={false}
                                     className="w-full h-full object-cover"
                                     onLoad={(e) => { e.target.style.display = ''; }}
                                     onError={(e) => { e.target.style.display = 'none'; }}
