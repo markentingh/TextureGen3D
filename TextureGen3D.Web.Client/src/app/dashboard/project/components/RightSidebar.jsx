@@ -17,20 +17,163 @@ import StitchLayersModal from './StitchLayersModal';
 import MaskThumb, { CHECKERBOARD_BG } from './MaskThumb';
 import { useHubGeneration } from './useHubGeneration';
 
+const loadImage = (src) => new Promise((resolve, reject) => {
+  const img = new Image();
+  img.onload = () => resolve(img);
+  img.onerror = reject;
+  img.src = src;
+});
+
+const blobToDataUrl = (blob) => new Promise((resolve) => {
+  const reader = new FileReader();
+  reader.onloadend = () => resolve(reader.result);
+  reader.readAsDataURL(blob);
+});
+
+// Mirror an image horizontally, returning a PNG data URL.
+async function flipImageDataUrl(dataUrl) {
+  const img = await loadImage(dataUrl);
+  const canvas = document.createElement('canvas');
+  canvas.width = img.width;
+  canvas.height = img.height;
+  const ctx = canvas.getContext('2d');
+  ctx.translate(img.width, 0);
+  ctx.scale(-1, 1);
+  ctx.drawImage(img, 0, 0);
+  return canvas.toDataURL('image/png');
+}
+
+// Convert a projected image to a binary layer mask — white where the
+// projection painted a bright pixel (alpha + luminance), black elsewhere.
+async function projectionToMask(dataUrl) {
+  const img = await loadImage(dataUrl);
+  const canvas = document.createElement('canvas');
+  canvas.width = img.width;
+  canvas.height = img.height;
+  const ctx = canvas.getContext('2d');
+  ctx.drawImage(img, 0, 0);
+  const d = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  for (let i = 0; i < d.data.length; i += 4) {
+    const luma = d.data[i] * 0.299 + d.data[i + 1] * 0.587 + d.data[i + 2] * 0.114;
+    const v = d.data[i + 3] > 0 && luma > 127 ? 255 : 0;
+    d.data[i] = v;
+    d.data[i + 1] = v;
+    d.data[i + 2] = v;
+    d.data[i + 3] = 255;
+  }
+  ctx.putImageData(d, 0, 0);
+  return canvas.toDataURL('image/png');
+}
+
+// Align two silhouette renders (white mesh on transparent bg): extract each
+// mesh outline, flip the source horizontally, then find the translation that
+// maximizes outline overlap with the (2px-dilated) target outline. Returns
+// the offset in full-resolution pixels — apply with drawImageAtOffset.
+async function findOutlineOffset(srcDataUrl, tgtDataUrl) {
+  const S = 128;
+  const [srcImg, tgtImg] = await Promise.all([loadImage(srcDataUrl), loadImage(tgtDataUrl)]);
+  const alphaOf = (image) => {
+    const c = document.createElement('canvas');
+    c.width = c.height = S;
+    const cx = c.getContext('2d');
+    cx.drawImage(image, 0, 0, S, S);
+    const d = cx.getImageData(0, 0, S, S).data;
+    const a = new Uint8Array(S * S);
+    for (let i = 0; i < a.length; i++) a[i] = d[i * 4 + 3] > 32 ? 1 : 0;
+    return a;
+  };
+  const srcA = alphaOf(srcImg);
+  const tgtA = alphaOf(tgtImg);
+
+  // Flip the source alpha horizontally (mirroring = source view flipped).
+  const srcF = new Uint8Array(S * S);
+  for (let y = 0; y < S; y++) {
+    for (let x = 0; x < S; x++) srcF[y * S + x] = srcA[y * S + (S - 1 - x)];
+  }
+
+  // Outline = inside pixel with at least one outside 4-neighbor.
+  const outlineOf = (a) => {
+    const o = new Uint8Array(S * S);
+    for (let y = 0; y < S; y++) {
+      for (let x = 0; x < S; x++) {
+        const i = y * S + x;
+        if (!a[i]) continue;
+        if (x === 0 || x === S - 1 || y === 0 || y === S - 1 ||
+            !a[i - 1] || !a[i + 1] || !a[i - S] || !a[i + S]) o[i] = 1;
+      }
+    }
+    return o;
+  };
+  const srcO = outlineOf(srcF);
+  const tgtO = outlineOf(tgtA);
+
+  // Dilate the target outline ±2px — mirrored silhouettes aren't pixel-
+  // identical, so near-misses should still count.
+  const tgtD = new Uint8Array(S * S);
+  for (let y = 0; y < S; y++) {
+    for (let x = 0; x < S; x++) {
+      if (!tgtO[y * S + x]) continue;
+      for (let dy = -2; dy <= 2; dy++) {
+        for (let dx = -2; dx <= 2; dx++) {
+          const nx = x + dx, ny = y + dy;
+          if (nx >= 0 && nx < S && ny >= 0 && ny < S) tgtD[ny * S + nx] = 1;
+        }
+      }
+    }
+  }
+
+  const srcPx = [];
+  for (let i = 0; i < srcO.length; i++) if (srcO[i]) srcPx.push(i);
+  const overlap = (dx, dy) => {
+    let n = 0;
+    for (let p = 0; p < srcPx.length; p++) {
+      const i = srcPx[p];
+      const x = (i % S) + dx;
+      const y = ((i / S) | 0) + dy;
+      if (x >= 0 && x < S && y >= 0 && y < S && tgtD[y * S + x]) n++;
+    }
+    return n;
+  };
+
+  let best = { dx: 0, dy: 0, n: overlap(0, 0) };
+  const half = S / 2;
+  for (let dy = -half; dy <= half; dy += 4) {
+    for (let dx = -half; dx <= half; dx += 4) {
+      const n = overlap(dx, dy);
+      if (n > best.n) best = { dx, dy, n };
+    }
+  }
+  for (let dy = best.dy - 4; dy <= best.dy + 4; dy++) {
+    for (let dx = best.dx - 4; dx <= best.dx + 4; dx++) {
+      const n = overlap(dx, dy);
+      if (n > best.n) best = { dx, dy, n };
+    }
+  }
+  return { dx: best.dx * srcImg.width / S, dy: best.dy * srcImg.height / S };
+}
+
+// Draw an image onto a same-size white canvas at a pixel offset — opaque
+// output matching the composite capture's white background.
+async function drawImageAtOffset(imgDataUrl, dx, dy) {
+  const img = await loadImage(imgDataUrl);
+  const out = document.createElement('canvas');
+  out.width = img.width;
+  out.height = img.height;
+  const ctx = out.getContext('2d');
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 0, out.width, out.height);
+  ctx.drawImage(img, dx, dy);
+  return out.toDataURL('image/png');
+}
+
 // Union two mask images (white = painted) — 'lighten' composites per-channel
 // max, so painted regions from either mask stay painted. Returns a Blob.
 async function mergeMaskImages(baseDataUrl, layerBlob) {
-  const loadImg = (src) => new Promise((resolve, reject) => {
-    const img = new Image();
-    img.onload = () => resolve(img);
-    img.onerror = reject;
-    img.src = src;
-  });
   const layerUrl = URL.createObjectURL(layerBlob);
   try {
     const [baseImg, layerImg] = await Promise.all([
-      loadImg(baseDataUrl),
-      loadImg(layerUrl),
+      loadImage(baseDataUrl),
+      loadImage(layerUrl),
     ]);
     const canvas = document.createElement('canvas');
     canvas.width = baseImg.width;
@@ -70,15 +213,20 @@ export default function RightSidebar() {
     setAllMeshLayers,
     layerApi,
     layerThumbVersion,
+    setLayerThumbVersion,
     maskThumbVersions,
     setMaskThumbVersions,
     assetGeneratingLayerIds,
+    setLayerAssetsGenerating,
     selectedLayerId,
     setSelectedLayerId,
     selectedLayerIds,
     toggleLayerSelected,
     imageModels,
     refImageModels,
+    allImageModels,
+    isComfyUI,
+    isGradio,
     layerMasksRef,
     viewerRef,
     meshPrompts,
@@ -111,7 +259,7 @@ export default function RightSidebar() {
     setInpaintMaskVisible,
   } = useProject();
   const { showModal, hideModal } = useModal();
-  const { removeBackground } = useHubGeneration();
+  const { generateViaHub, removeBackground } = useHubGeneration();
 
   // ── Local state ──
   const [editingLayerId, setEditingLayerId] = useState(null);
@@ -129,10 +277,12 @@ export default function RightSidebar() {
   const reuploadModelIdRef = useRef(null);
   const [projectionMode, setProjectionMode] = useState('orthographic');
   const [downloadingUvmap, setDownloadingUvmap] = useState(false);
+  const [addingLayer, setAddingLayer] = useState(false);
   const [layersMenuOpen, setLayersMenuOpen] = useState(false);
   const [layersMenuPos, setLayersMenuPos] = useState({ top: 0, right: 0 });
   const [reprojectingAll, setReprojectingAll] = useState(false);
   const [removingBgLayerId, setRemovingBgLayerId] = useState(null);
+  const [mirroringLayerId, setMirroringLayerId] = useState(null);
 
   // ── formatFileSize ──
   const formatFileSize = (bytes) => {
@@ -467,6 +617,36 @@ export default function RightSidebar() {
   };
 
   // ── Layer handlers ──
+  // Create a new empty layer at the top of the stack — the stamp tool's draw
+  // target. Records the current camera angle so the row gets an angle thumb.
+  const handleAddLayer = async () => {
+    const meshDbId = selectedMesh ? meshDbIds[selectedMesh.key] : null;
+    if (!meshDbId || addingLayer) return;
+    setAddingLayer(true);
+    try {
+      const res = await layerApi.create(
+        id,
+        meshDbId,
+        `Layer ${meshLayers.length + 1}`,
+        JSON.stringify(viewerRef.current?.getCameraAngle?.() || {}),
+        false,
+        null
+      );
+      if (!res.data?.success) throw new Error('Failed to create layer');
+      const newLayer = res.data.data;
+      const newList = [newLayer, ...meshLayers];
+      setMeshLayers(newList);
+      syncAllMeshLayers(newList);
+      await layerApi.reorder(id, meshDbId, newList.map((l) => l.id));
+      setSelectedLayerId(newLayer.id);
+      await refreshLayerTextures(newList);
+    } catch (err) {
+      console.error('Failed to add layer:', err);
+    } finally {
+      setAddingLayer(false);
+    }
+  };
+
   // Download the combined uvmap.png — every visible layer's uvmap with its
   // mask applied to the alpha channel, flattened via the same compositor the
   // shader path uses.
@@ -743,12 +923,12 @@ export default function RightSidebar() {
           /* ignore */
         }
       }
-      const uvMapDataUrl = await viewerRef.current?.projectImageToUvMap(
+      const projected = await viewerRef.current?.projectImageToUvMap(
         processed,
         rotation,
         textureResolution
       );
-      if (uvMapDataUrl) await layerApi.saveUvMap(id, layer.id, meshDbId, uvMapDataUrl);
+      if (projected?.uvMap) await layerApi.saveUvMap(id, layer.id, meshDbId, projected.uvMap);
 
       const updatedLayers = await loadMeshLayers(meshDbId);
       await refreshLayerTextures(updatedLayers);
@@ -871,6 +1051,212 @@ export default function RightSidebar() {
     } catch (err) {
       console.error('Failed to load layer reference image:', err);
     }
+  };
+
+  // Mirror a layer onto the opposite side of the mesh: the layer's image is
+  // flipped horizontally and projected from its camera angle orbited 180°,
+  // saved as a new layer directly above the source in the stack.
+  const handleMirrorLayer = async (layer) => {
+    const meshDbId = selectedMesh ? meshDbIds[selectedMesh.key] : null;
+    if (!meshDbId || layer.hasImage === false) return;
+    let newLayer = null;
+    try {
+      // 1 — mirrored angle: orbit the layer's stored camera angle 180° on Y
+      let rotation = {};
+      try { rotation = JSON.parse(layer.cameraAngle || '{}'); } catch { /* ignore */ }
+      const mirroredRotation = { ...rotation, y: (rotation.y || 0) + 180 };
+      const mirroredJson = JSON.stringify(mirroredRotation);
+
+      // 2 — render the unlit albedo composite at the layer's stored angle and
+      // flip it. image.png is the raw model output (baked lighting, single
+      // layer) — the composite render is the actual mesh albedo in that view.
+      // Falls back to the saved image.png if the capture fails.
+      let flippedDataUrl = null;
+      const composite = viewerRef.current?.captureCompositeImage?.(textureResolution, rotation);
+      if (composite) {
+        flippedDataUrl = await flipImageDataUrl(composite);
+      }
+      if (!flippedDataUrl) {
+        const response = await fetch(layerApi.imageUrl(id, meshDbId, layer.id), {
+          headers: token ? { Authorization: `Bearer ${token}` } : {},
+        });
+        if (!response.ok) throw new Error('Failed to fetch layer image');
+        flippedDataUrl = await flipImageDataUrl(await blobToDataUrl(await response.blob()));
+      }
+
+      // 2b — source mask → screen-space render at the source angle → flipped.
+      // Gives the flipped albedo its transparent-background cutout for
+      // alignment, and later re-projects as the mirrored layer's mask.
+      let flippedMaskView = null;
+      try {
+        const maskRes = await fetch(layerApi.maskUrl(id, meshDbId, layer.id), {
+          headers: token ? { Authorization: `Bearer ${token}` } : {},
+        });
+        if (maskRes.ok) {
+          const maskView = await viewerRef.current?.captureMaskViewImage?.(
+            await blobToDataUrl(await maskRes.blob()), rotation, textureResolution
+          );
+          if (maskView) flippedMaskView = await flipImageDataUrl(maskView);
+        }
+      } catch (err) {
+        console.warn('Failed to render layer mask view:', err);
+      }
+
+      // 2c — align the flipped albedo by matching mesh outlines: silhouette
+      // renders from the source and mirrored angles, flip the source outline,
+      // find the max-overlap offset, apply it to the flipped image.
+      let alignedDataUrl = flippedDataUrl;
+      try {
+        const srcSilhouette = viewerRef.current?.captureSilhouetteImage?.(rotation, textureResolution);
+        const tgtSilhouette = viewerRef.current?.captureSilhouetteImage?.(mirroredRotation, textureResolution);
+        if (srcSilhouette && tgtSilhouette) {
+          const { dx, dy } = await findOutlineOffset(srcSilhouette, tgtSilhouette);
+          alignedDataUrl = await drawImageAtOffset(flippedDataUrl, dx, dy);
+        }
+      } catch (err) {
+        console.warn('Mirror image alignment failed:', err);
+      }
+
+      // 3 — create "<name> Mirrored" and insert it directly above the source
+      const layerRes = await layerApi.create(id, meshDbId, `${layer.name} Mirrored`, mirroredJson, false, layer.referenceId ?? null, true);
+      if (!layerRes.data?.success) throw new Error('Failed to create layer');
+      newLayer = layerRes.data.data;
+      const insertAt = Math.max(0, meshLayers.findIndex((l) => l.id === layer.id));
+      const newList = [...meshLayers.slice(0, insertAt), newLayer, ...meshLayers.slice(insertAt)];
+      setMeshLayers(newList);
+      syncAllMeshLayers(newList);
+      await layerApi.reorder(id, meshDbId, newList.map((l) => l.id));
+
+      // 4 — angle thumb from the mirrored view, then save the flipped image
+      const angleThumb = viewerRef.current?.captureThumbnail?.(75, mirroredRotation);
+      if (angleThumb) {
+        try { await layerApi.saveAngleThumb(id, newLayer.id, meshDbId, angleThumb); }
+        catch (err) { console.warn('Failed to save layer angle thumbnail:', err); }
+      }
+      await layerApi.saveImage(id, newLayer.id, meshDbId, alignedDataUrl);
+
+      // Debug artifacts in the layer folder: the albedo render before
+      // alignment, and the flipped+aligned result fed to the model.
+      try {
+        if (composite) await layerApi.saveFile(id, newLayer.id, meshDbId, 'original.png', composite);
+        await layerApi.saveFile(id, newLayer.id, meshDbId, 'original_flipped.png', alignedDataUrl);
+      } catch (err) {
+        console.warn('Failed to save mirror debug images:', err);
+      }
+
+      // 5 — run the flipped image through the projection (Depth to Image)
+      // model conditioned on the mirrored view's depth map, then background
+      // removal — same pipeline as generation/inpaint. The eye icon swaps to
+      // a spinner and the thumbs row shows the generating state meanwhile.
+      setMirroringLayerId(newLayer.id);
+      setLayerAssetsGenerating(newLayer.id, true);
+      let generatedImage;
+      try {
+        const depthMap = viewerRef.current?.captureDepthMap(textureResolution, mirroredRotation);
+        if (!depthMap) throw new Error('Failed to generate depth map');
+
+        const projectionModel = (allImageModels || []).find((m) => m.type === 1 && m.active !== false);
+        if (!projectionModel) throw new Error('No Depth to Image model configured');
+
+        if (isComfyUI || isGradio) {
+          const hubUrl = isComfyUI ? '/hubs/comfyui' : '/hubs/gradio';
+          const hubName = isComfyUI ? 'ComfyUI' : 'Gradio';
+          await layerApi.saveDepthMap(id, newLayer.id, meshDbId, depthMap);
+          generatedImage = await generateViaHub({
+            hubUrl,
+            hubName,
+            layer: newLayer,
+            meshDbId,
+            fullPrompt: '',
+            inputImage: alignedDataUrl,
+            imageModelId: projectionModel.id,
+          });
+        } else {
+          const genRes = await layerApi.generate(
+            id,
+            newLayer.id,
+            meshDbId,
+            projectionModel.id,
+            '',
+            depthMap,
+            mirroredJson,
+            null,
+            alignedDataUrl,
+            textureResolution
+          );
+          if (!genRes.data?.success) throw new Error(genRes.data?.message || 'Projection generation failed');
+          generatedImage = genRes.data.data?.image;
+        }
+
+        if (generatedImage) {
+          generatedImage = await removeBackground({ generatedImage, layer: newLayer, meshDbId, cameraAngleJson: mirroredJson });
+        }
+      } finally {
+        setMirroringLayerId(null);
+      }
+
+      // The generate/saveComfyUiResult + background-removal paths overwrite
+      // image.png with their model output — restore the aligned albedo as
+      // the layer's image.
+      await layerApi.saveImage(id, newLayer.id, meshDbId, alignedDataUrl);
+
+      // 6 — project the model output onto the mesh from the mirrored angle,
+      // and mirror the source mask the same way: render it onto the mesh in a
+      // hidden canvas from the source angle, flip it horizontally, then
+      // re-project onto the mesh from the mirrored angle.
+      let mirroredMask = null;
+      if (generatedImage) {
+        const projected = await viewerRef.current?.projectImageToUvMap(generatedImage, mirroredRotation, textureResolution);
+        if (projected?.uvMap) await layerApi.saveUvMap(id, newLayer.id, meshDbId, projected.uvMap);
+        if (flippedMaskView) {
+          try {
+            const maskProjected = await viewerRef.current?.projectImageToUvMap(flippedMaskView, mirroredRotation, textureResolution);
+            if (maskProjected?.uvMap) mirroredMask = await projectionToMask(maskProjected.uvMap);
+          } catch (err) {
+            console.warn('Failed to mirror layer mask:', err);
+          }
+        }
+        const maskToSave = mirroredMask || projected?.mask;
+        if (maskToSave) {
+          await layerApi.saveMasks(id, meshDbId, [{ layerId: newLayer.id, base64Mask: maskToSave }]);
+        }
+      }
+
+      // 7 — orbit the live camera to the mirrored side and refresh
+      viewerRef.current?.setCameraRotation?.(mirroredRotation);
+      const updatedLayers = await loadMeshLayers(meshDbId);
+      setLayerThumbVersion((v) => v + 1);
+      setMaskThumbVersions((prev) => ({ ...prev, [newLayer.id]: (prev[newLayer.id] || 0) + 1 }));
+      await refreshLayerTextures(updatedLayers);
+      setLayerAssetsGenerating(newLayer.id, false);
+    } catch (err) {
+      console.error('Mirror to new layer failed:', err);
+      if (newLayer) {
+        setMirroringLayerId(null);
+        setLayerAssetsGenerating(newLayer.id, false);
+      }
+    }
+  };
+
+  // UV map thumb click → full-size uvmap.png in a preview modal
+  const handleUvmapThumbClick = (layer) => {
+    const meshDbId = selectedMesh ? meshDbIds[selectedMesh.key] : null;
+    if (!meshDbId || layer.hasImage === false) return;
+    showModal({
+      title: `${layer.name} — UV Map`,
+      className: 'max-w-[90vw] max-h-[90vh]',
+      onClose: hideModal,
+      body: (
+        <div className="flex items-center justify-center" onClick={hideModal}>
+          <img
+            src={`${layerApi.uvmapUrl(id, meshDbId, layer.id)}?r=${layerThumbVersion}`}
+            alt={`${layer.name} UV map`}
+            className="max-w-[85vw] max-h-[80vh] object-contain rounded-lg"
+            onClick={(e) => e.stopPropagation()}
+          />
+        </div>
+      ),
+    });
   };
 
   // Clicking a layer's reference thumb loads that reference into whichever
@@ -1013,6 +1399,19 @@ export default function RightSidebar() {
               <h3 className="text-sm font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-400">Layers</h3>
               <div className="flex items-center gap-1">
                 <button
+                  onClick={handleAddLayer}
+                  disabled={!selectedMesh || addingLayer}
+                  className="p-1 rounded text-gray-500 hover:text-purple-600 dark:hover:text-purple-400 disabled:opacity-30 disabled:cursor-not-allowed transition"
+                  aria-label="New empty layer"
+                  title="New empty layer — added to the top of the stack"
+                >
+                  {addingLayer ? (
+                    <Spinner className="text-lg" />
+                  ) : (
+                    <Icon name="add" className="text-lg" />
+                  )}
+                </button>
+                <button
                   onClick={handleDownloadUvmap}
                   disabled={!selectedMesh || meshLayers.length === 0 || downloadingUvmap}
                   className="p-1 rounded text-gray-500 hover:text-purple-600 dark:hover:text-purple-400 disabled:opacity-30 disabled:cursor-not-allowed transition"
@@ -1098,8 +1497,8 @@ export default function RightSidebar() {
                         <div className="min-w-0 flex-1 flex flex-col">
                           {/* Row 1: eye toggle + name + edit + 3-dots */}
                           <div className="flex items-center gap-1">
-                            {removingBgLayerId === layer.id ? (
-                              <span className="flex-shrink-0 translate-y-1 pr-1" title="Removing background...">
+                            {removingBgLayerId === layer.id || mirroringLayerId === layer.id ? (
+                              <span className="flex-shrink-0 translate-y-1 pr-1" title={mirroringLayerId === layer.id ? 'Generating projection...' : 'Removing background...'}>
                                 <Spinner className="text-2xl" />
                               </span>
                             ) : (
@@ -1135,11 +1534,15 @@ export default function RightSidebar() {
                               )}
                             </div>
 
-                            {layer.inpaint && (
+                            {layer.inpaint ? (
                               <span className="flex-shrink-0 pr-2 text-green-600 dark:text-green-500 text-[10px] font-bold">
                                 Inpainted
                               </span>
-                            )}
+                            ) : layer.generated ? (
+                              <span className="flex-shrink-0 pr-2 text-purple-600 dark:text-purple-400 text-[10px] font-bold">
+                                Generated
+                              </span>
+                            ) : null}
 
                             {/* Edit icon */}
                             <button
@@ -1176,7 +1579,7 @@ export default function RightSidebar() {
                           {/* Row 2: UV map thumb + camera angle thumb + mask thumb + delete */}
                           <div className="flex items-center justify-between mt-1">
                             <div className="flex items-center gap-2">
-                              {assetGeneratingLayerIds?.has(layer.id) ? (
+                              {assetGeneratingLayerIds?.has(layer.id) || mirroringLayerId === layer.id ? (
                                 <div className="flex items-center gap-2" style={{ height: 47 }}>
                                   <Spinner className="text-lg" />
                                   <span className="text-xs text-gray-500 dark:text-gray-400 whitespace-nowrap">
@@ -1188,8 +1591,10 @@ export default function RightSidebar() {
                               {/* UV map thumb — checkerboard so transparent
                                   areas (removed background) are visible */}
                               <div
-                                className="flex-shrink-0 rounded border border-gray-200 dark:border-gray-600 overflow-hidden"
+                                className="flex-shrink-0 rounded border border-gray-200 dark:border-gray-600 overflow-hidden cursor-pointer hover:ring-1 hover:ring-purple-500 transition"
                                 style={{ width: 47, height: 47, ...CHECKERBOARD_BG }}
+                                onClick={() => handleUvmapThumbClick(layer)}
+                                title="View full UV map"
                               >
                                 {layer.hasImage !== false && (
                                   <img
@@ -1283,6 +1688,15 @@ export default function RightSidebar() {
                                 </>
                               )}
                             </div>
+
+                            <button
+                              onClick={() => handleDeleteLayerClick(layer)}
+                              className="flex-shrink-0 text-gray-400 hover:text-red-600 dark:hover:text-red-400 transition"
+                              aria-label="Delete layer"
+                              title="Delete layer"
+                            >
+                              <Icon name="delete" className="text-base" />
+                            </button>
                           </div>
                         </div>
                       </div>
@@ -1522,6 +1936,13 @@ export default function RightSidebar() {
             >
               <Icon name="image" className="text-sm" />
               Reference Image
+            </button>
+            <button
+              onClick={() => { const lid = layerMenuOpenId; setLayerMenuOpenId(null); const layer = meshLayers.find((l) => l.id === lid); if (layer) handleMirrorLayer(layer); }}
+              className="w-full text-left px-3 py-1.5 text-sm text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 transition flex items-center gap-2"
+            >
+              <Icon name="flip" className="text-sm" />
+              Mirror To New Layer
             </button>
             <button
               onClick={() => { const lid = layerMenuOpenId; setLayerMenuOpenId(null); const layer = meshLayers.find((l) => l.id === lid); if (layer) handleDeleteLayerClick(layer); }}

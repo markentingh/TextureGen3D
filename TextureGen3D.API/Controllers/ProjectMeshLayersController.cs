@@ -76,6 +76,7 @@ namespace TextureGen3D.API.Controllers
             public string Name { get; set; } = "";
             public string? CameraAngle { get; set; }
             public bool Inpaint { get; set; }
+            public bool Generated { get; set; }
             public Guid? ReferenceId { get; set; }
         }
 
@@ -101,6 +102,7 @@ namespace TextureGen3D.API.Controllers
                     Index = nextIndex,
                     CameraAngle = request.CameraAngle ?? "",
                     Inpaint = request.Inpaint,
+                    Generated = request.Generated,
                     ReferenceId = request.ReferenceId,
                 };
                 var created = await _layerRepo.CreateAsync(layer);
@@ -368,6 +370,46 @@ namespace TextureGen3D.API.Controllers
                 var thumbBytes = await _imageService.GenerateThumbnailAsync(imageBytes, 100, preserveTransparency: true);
                 await _imageService.SaveProjectMeshLayerThumbAsync(projectId, request.MeshId, layerId, thumbBytes);
 
+                return Json(new ApiResponse { success = true });
+            }
+            catch (Exception ex)
+            {
+                return Json(new ApiResponse { success = false, message = ex.Message });
+            }
+        }
+
+        public class SaveLayerFileRequest
+        {
+            public Guid MeshId { get; set; }
+            public string FileName { get; set; } = "";
+            public string Base64Image { get; set; } = "";
+        }
+
+        [HttpPost("{projectId}/{layerId}/save-file")]
+        public async Task<IActionResult> SaveLayerFile(Guid projectId, Guid layerId, [FromBody] SaveLayerFileRequest request)
+        {
+            try
+            {
+                var userId = GetUserId();
+                if (userId == Guid.Empty)
+                    return Json(new ApiResponse { success = false, message = "Could not find user" });
+
+                var project = await _projectRepo.GetByIdAsync(projectId, userId);
+                if (project == null)
+                    return Json(new ApiResponse { success = false, message = "Project not found" });
+
+                // Plain file names only — no path traversal
+                var fileName = request.FileName ?? "";
+                if (fileName.Length == 0 || fileName.Length > 128 ||
+                    fileName != Path.GetFileName(fileName) ||
+                    !System.Text.RegularExpressions.Regex.IsMatch(fileName, @"^[a-zA-Z0-9_.\-]+$"))
+                    return Json(new ApiResponse { success = false, message = "Invalid file name" });
+
+                var base64 = request.Base64Image;
+                if (base64.StartsWith("data:")) base64 = base64.Substring(base64.IndexOf(',') + 1);
+                var imageBytes = Convert.FromBase64String(base64);
+
+                await _imageService.SaveProjectMeshLayerFileAsync(projectId, request.MeshId, layerId, fileName, imageBytes);
                 return Json(new ApiResponse { success = true });
             }
             catch (Exception ex)

@@ -484,7 +484,7 @@ export default function GenerateImagesPanel({ showPanel, setShowPanel }) {
           ? viewerRef.current.getCameraAngle()
           : null;
         const cameraAngleJson = cameraAngle ? JSON.stringify(cameraAngle) : '';
-        const layerRes = await layerApi.create(id, meshDbId, `Layer ${layerNum}`, cameraAngleJson, false, meshRefView.find((r) => r.active)?.id ?? null);
+        const layerRes = await layerApi.create(id, meshDbId, `Layer ${layerNum}`, cameraAngleJson, false, meshRefView.find((r) => r.active)?.id ?? null, true);
         if (!layerRes.data?.success) throw new Error('Failed to create layer');
         const layer = layerRes.data.data;
         prependMeshLayer(meshDbId, layer);
@@ -604,7 +604,7 @@ export default function GenerateImagesPanel({ showPanel, setShowPanel }) {
 
           const layerNum = meshLayers.length + i + 1;
           const cameraAngleJson = JSON.stringify(angle.rotation);
-          const layerRes = await layerApi.create(id, meshDbId, `Layer ${layerNum}`, cameraAngleJson, false, angle.projectReferenceId ?? null);
+          const layerRes = await layerApi.create(id, meshDbId, `Layer ${layerNum}`, cameraAngleJson, false, angle.projectReferenceId ?? null, true);
           if (!layerRes.data?.success)
             throw new Error(`Failed to create layer for angle ${angleNum}`);
           const layer = layerRes.data.data;

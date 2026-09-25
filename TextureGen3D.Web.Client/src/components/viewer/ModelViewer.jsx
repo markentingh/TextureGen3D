@@ -70,6 +70,7 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
   const currentMeshRef = useRef(null);
   const animationFrameRef = useRef(null);
   const ringElRef = useRef(null);
+  const stampPreviewRef = useRef(null);  // canvas inside the ring — stamp source preview
   // Brush ring state — shared between the imperative setBrushRingActive()
   // (tool changes via project context), pointer handlers, and animate().
   const ringStateRef = useRef({ visible: false, x: 0, y: 0, d: 0, appliedD: -1, dirty: false });
@@ -83,6 +84,13 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
   const maskPaintCfgRef = useRef(maskPaintConfig);
   useEffect(() => { maskPaintCfgRef.current = maskPaintConfig; }, [maskPaintConfig]);
   const paintingRef = useRef(null);        // { layerId, lastX, lastY } during a stroke
+  const stampViewRef = useRef(null);       // captured composite view { rt, canvas, w, h, viewProj, copyWorld, copyPx }
+  const stampCopyUVRef = useRef(null);     // UV-space source point picked in copy mode
+  const stampCanvasRef = useRef(new Map()); // layerId -> offscreen canvas (save scratchpad)
+  const stampRtRef = useRef(new Map());     // layerId -> { a, b, front } ping-pong color RTs
+  const stampTexRef = useRef(new Map());    // layerId -> texture currently bound in the shader
+  const stampLoadRef = useRef(new Map());   // layerId -> in-flight RT init promise
+  const emptyTexRef = useRef(null);         // 1x1 transparent dummy for url-less live slots
   const paintRttRef = useRef(null);        // lazily-built offscreen paint scene (RTT)
   const shaderLayerIdsRef = useRef([]);    // shader slot index -> layerId
   const whiteMaskTexRef = useRef(null);    // 1x1 white dummy for layers without a mask
@@ -187,6 +195,7 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
       uniforms: {
         u_base: { value: null },
         u_coverage: { value: null },
+        u_texelSize: { value: 1 / 1024 },
       },
       vertexShader: `
         varying vec2 vUv;
@@ -198,11 +207,12 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
       fragmentShader: `
         uniform sampler2D u_base;
         uniform sampler2D u_coverage;
+        uniform float u_texelSize;
         varying vec2 vUv;
         void main() {
           vec4 self = texture2D(u_base, vUv);
           if (texture2D(u_coverage, vUv).r > 0.5) { gl_FragColor = self; return; }
-          vec2 texel = vec2(1.0 / 1024.0);
+          vec2 texel = vec2(u_texelSize);
           vec4 best = self;
           float bestD = 3.0;
           for (int dy = -2; dy <= 2; dy++)
@@ -227,11 +237,111 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
     bleedQuad.frustumCulled = false;
     bleedQuad.visible = false;
 
-    scene.add(paintGroup, blitQuad, bleedQuad);
+    // Fullscreen texture copy — seeds a layer's stamp RT from its uvmap image
+    const copyMat = new THREE.ShaderMaterial({
+      uniforms: { u_tex: { value: null } },
+      vertexShader: `
+        varying vec2 vUv;
+        void main() {
+          vUv = uv;
+          gl_Position = vec4(position.xy, 0.0, 1.0);
+        }
+      `,
+      fragmentShader: `
+        uniform sampler2D u_tex;
+        varying vec2 vUv;
+        void main() { gl_FragColor = texture2D(u_tex, vUv); }
+      `,
+      depthTest: false,
+      depthWrite: false,
+      blending: THREE.NoBlending,
+    });
+    const copyQuad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), copyMat);
+    copyQuad.frustumCulled = false;
+    copyQuad.visible = false;
+
+    // Clone-stamp material — for every flattened-UV texel, project its world
+    // position through the CURRENT camera, offset by (copy − strokeStart) in
+    // screen px, and sample the captured composite view like a floating image.
+    // Sampling the projected view (not the uvmap) is what makes the stamp
+    // match what's on the mesh across UV seams/islands.
+    const stampColorMat = new THREE.ShaderMaterial({
+      uniforms: {
+        u_baseTexture: { value: null },        // layer's previous uvmap (front RT)
+        u_srcTexture: { value: null },         // captured composite view RT
+        u_modelMatrix: { value: new THREE.Matrix4() },
+        u_viewProj: { value: new THREE.Matrix4() },   // current camera VP
+        u_viewport: { value: new THREE.Vector2(1, 1) }, // capture buffer px
+        u_mouseWorldPos: { value: new THREE.Vector3() }, // dab center
+        u_copyPx: { value: new THREE.Vector2() },     // copy pt, capture px (y-up)
+        u_startPx: { value: new THREE.Vector2() },    // stroke start, current px (y-up)
+        u_brushRadius: { value: 0.1 },         // world units
+        u_innerRadius: { value: 0.0 },         // hardness core
+        u_brushStrength: { value: 1.0 },       // opacity
+        u_flip: { value: new THREE.Vector2(1, 1) },    // -1 per axis = invert
+        u_zoomRatio: { value: 1.0 },           // capture px-per-world / current px-per-world
+      },
+      vertexShader: `
+        uniform mat4 u_modelMatrix;
+        varying vec2 vUv;
+        varying vec3 vWorldPosition;
+        void main() {
+          vUv = uv;
+          vWorldPosition = (u_modelMatrix * vec4(position, 1.0)).xyz;
+          gl_Position = vec4(uv * 2.0 - 1.0, 0.0, 1.0);
+        }
+      `,
+      fragmentShader: `
+        uniform sampler2D u_baseTexture;
+        uniform sampler2D u_srcTexture;
+        uniform mat4 u_viewProj;
+        uniform vec2 u_viewport;
+        uniform vec3 u_mouseWorldPos;
+        uniform vec2 u_copyPx;
+        uniform vec2 u_startPx;
+        uniform float u_brushRadius;
+        uniform float u_innerRadius;
+        uniform float u_brushStrength;
+        uniform vec2 u_flip;
+        uniform float u_zoomRatio;
+        varying vec2 vUv;
+        varying vec3 vWorldPosition;
+        vec2 scrPx(vec3 w) {
+          vec4 c = u_viewProj * vec4(w, 1.0);
+          return (c.xy / c.w * 0.5 + 0.5) * u_viewport;
+        }
+        void main() {
+          vec4 prev = texture2D(u_baseTexture, vUv);
+          float d = distance(vWorldPosition, u_mouseWorldPos);
+          float paint = 0.0;
+          if (u_innerRadius >= u_brushRadius - 1e-6) {
+            paint = d < u_brushRadius ? 1.0 : 0.0;
+          } else {
+            paint = 1.0 - smoothstep(u_innerRadius, u_brushRadius, d);
+          }
+          paint *= u_brushStrength;
+          vec2 srcPx = u_copyPx + u_flip * (scrPx(vWorldPosition) - u_startPx) * u_zoomRatio;
+          vec4 src = texture2D(u_srcTexture, srcPx / u_viewport);
+          // Source-over composite: the brush falloff lives in ALPHA only.
+          // Mixing rgb toward prev.rgb would darken feathered edges over
+          // transparent texels (prev is black there) → visible dark border.
+          float srcA = paint * src.a; // don't stamp where the view shows no mesh
+          float outA = srcA + prev.a * (1.0 - srcA);
+          vec3 outRgb = (src.rgb * srcA + prev.rgb * prev.a * (1.0 - srcA)) / max(outA, 1e-5);
+          gl_FragColor = vec4(outRgb, outA);
+        }
+      `,
+      depthTest: false,
+      depthWrite: false,
+      blending: THREE.NoBlending,
+    });
+
+    scene.add(paintGroup, blitQuad, bleedQuad, copyQuad);
     paintRttRef.current = {
       scene, cam, mat, paintGroup, blitQuad,
       coverageMat, coverageRT, coverageMesh: null,
       bleedMat, bleedQuad,
+      copyMat, copyQuad, stampColorMat,
     };
     return paintRttRef.current;
   };
@@ -279,6 +389,165 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
         uniforms[`hasMask${slot}`].value = 1;
       }
     });
+  };
+
+  // Push a stamped uvmap texture into the live layer shader's layerN slot
+  const bindLayerTexture = (layerId, texture) => {
+    const slot = shaderLayerIdsRef.current.indexOf(layerId);
+    if (slot < 0) return;
+    currentMeshRef.current?.traverse((child) => {
+      const uniforms = child.isMesh && child.material && child.material.uniforms;
+      if (uniforms && uniforms[`layer${slot}`]) uniforms[`layer${slot}`].value = texture;
+    });
+  };
+
+  // The stamp tool paints into per-layer ping-pong color render targets in
+  // uvmap space. Lazily created and seeded with the saved uvmap.png (or the
+  // existing stamp canvas) if the layer has one; the front RT's texture is
+  // bound into the live shader slot.
+  const ensureStampEntry = (layerId, cfg) => {
+    let p = stampLoadRef.current.get(layerId);
+    if (p) return p;
+    p = (async () => {
+      const renderer = rendererRef.current;
+      const res = cfg?.textureResolution || 1024;
+      const mk = () => new THREE.WebGLRenderTarget(res, res, {
+        format: THREE.RGBAFormat,
+        type: THREE.UnsignedByteType,
+        depthBuffer: false,
+      });
+      const entry = { a: mk(), b: mk() };
+      entry.front = entry.a;
+      stampRtRef.current.set(layerId, entry);
+
+      const prevColor = renderer.getClearColor(new THREE.Color());
+      const prevAlpha = renderer.getClearAlpha();
+      try {
+        const url = await cfg?.loadStampLayerImage?.(layerId);
+        let tex = null;
+        if (url) {
+          try {
+            const img = await loadImgEl(url);
+            tex = new THREE.Texture(img);
+            tex.flipY = true;
+            tex.needsUpdate = true;
+          } catch { /* start blank */ }
+          URL.revokeObjectURL(url);
+        }
+        if (tex) {
+          const rtt = getPaintRtt();
+          rtt.paintGroup.visible = false;
+          rtt.blitQuad.visible = false;
+          rtt.copyQuad.visible = true;
+          rtt.copyMat.uniforms.u_tex.value = tex;
+          for (const rt of [entry.a, entry.b]) {
+            renderer.setRenderTarget(rt);
+            renderer.render(rtt.scene, rtt.cam);
+          }
+          rtt.copyQuad.visible = false;
+          tex.dispose();
+        } else {
+          renderer.setClearColor(0x000000, 0);
+          for (const rt of [entry.a, entry.b]) {
+            renderer.setRenderTarget(rt);
+            renderer.clear(true, true, false);
+          }
+        }
+      } finally {
+        renderer.setRenderTarget(null);
+        renderer.setClearColor(prevColor, prevAlpha);
+      }
+
+      stampTexRef.current.set(layerId, entry.front.texture);
+      bindLayerTexture(layerId, entry.front.texture);
+      return entry;
+    })();
+    stampLoadRef.current.set(layerId, p);
+    return p;
+  };
+
+  // Render the composite as the user currently sees it into a persistent RT —
+  // unlit, front-side only, transparent background (alpha=0 marks "no mesh"
+  // so the stamp shader won't copy empty space). Keeps the RT texture for the
+  // GPU stamp pass and a row-flipped canvas copy for the ring preview.
+  const captureStampView = () => {
+    const renderer = rendererRef.current;
+    const cam = cameraRef.current;
+    const mesh = currentMeshRef.current;
+    if (!renderer || !cam || !mesh) return null;
+    const w = renderer.domElement.width;
+    const h = renderer.domElement.height;
+    if (!w || !h) return null;
+
+    const mats = [];
+    mesh.traverse((c) => {
+      if (c.isMesh && c.material) {
+        (Array.isArray(c.material) ? c.material : [c.material]).forEach((m) => mats.push(m));
+      }
+    });
+    mats.forEach((m) => {
+      if (m.uniforms?.u_unlit) m.uniforms.u_unlit.value = 1;
+      if (m.uniforms?.u_hasInpaint) m.uniforms.u_hasInpaint.value = 0;
+      if (m.uniforms?.u_dimBackface) m.uniforms.u_dimBackface.value = 0;
+      if (m.userData?.uDimBackface) m.userData.uDimBackface.value = 0;
+      m.userData._stampCapSide = m.side;
+      m.side = THREE.FrontSide;
+    });
+
+    const rt = new THREE.WebGLRenderTarget(w, h, {
+      format: THREE.RGBAFormat,
+      type: THREE.UnsignedByteType,
+    });
+    // Hide non-mesh scene objects (grid etc.) so they don't get stamped
+    const grid = sceneRef.current?.getObjectByName('__grid');
+    const gridWasVisible = grid?.visible;
+    if (grid) grid.visible = false;
+    const prevColor = renderer.getClearColor(new THREE.Color());
+    const prevAlpha = renderer.getClearAlpha();
+    const buf = new Uint8Array(w * h * 4);
+    let canvas = null;
+    try {
+      renderer.setRenderTarget(rt);
+      renderer.setClearColor(0x000000, 0);
+      renderer.clear(true, true, false);
+      renderer.render(sceneRef.current, cam);
+      renderer.readRenderTargetPixels(rt, 0, 0, w, h, buf);
+      canvas = document.createElement('canvas');
+      canvas.width = w;
+      canvas.height = h;
+      const ctx = canvas.getContext('2d');
+      const img = ctx.createImageData(w, h);
+      for (let y = 0; y < h; y++) {
+        img.data.set(buf.subarray((h - 1 - y) * w * 4, (h - y) * w * 4), y * w * 4);
+      }
+      ctx.putImageData(img, 0, 0);
+    } finally {
+      if (grid) grid.visible = gridWasVisible;
+      renderer.setRenderTarget(null);
+      renderer.setClearColor(prevColor, prevAlpha);
+      mats.forEach((m) => {
+        if (m.uniforms?.u_unlit) m.uniforms.u_unlit.value = unlitRef.current ? 1 : 0;
+        if (m.uniforms?.u_hasInpaint) m.uniforms.u_hasInpaint.value = inpaintActiveRef.current && inpaintVisibleRef.current ? 1 : 0;
+        if (m.uniforms?.u_dimBackface) m.uniforms.u_dimBackface.value = 1;
+        if (m.userData?.uDimBackface) m.userData.uDimBackface.value = 1;
+        if (m.userData._stampCapSide !== undefined) {
+          m.side = m.userData._stampCapSide;
+          delete m.userData._stampCapSide;
+        }
+      });
+    }
+    const viewProj = new THREE.Matrix4().multiplyMatrices(cam.projectionMatrix, cam.matrixWorldInverse);
+    // Screen-px-per-world-unit at capture time — lets the stamp shader rescale
+    // the screen-space delta when the user zooms between copy and draw. The
+    // probe offsets along the camera's RIGHT vector (screen-aligned), so mesh
+    // rotation doesn't foreshorten the measurement — only zoom/depth changes it.
+    cam.updateMatrixWorld();
+    const right = new THREE.Vector3().setFromMatrixColumn(cam.matrixWorld, 0).normalize();
+    const center = new THREE.Box3().setFromObject(mesh).getCenter(new THREE.Vector3());
+    const p0 = center.clone().applyMatrix4(viewProj);
+    const p1 = center.clone().addScaledVector(right, 0.01).applyMatrix4(viewProj);
+    const ndcPerWorld = Math.hypot(p1.x - p0.x, p1.y - p0.y) / 0.01;
+    return { rt, canvas, w, h, viewProj, ndcPerWorld, centerWorld: center };
   };
 
   // ── CPU layer compositing ──
@@ -1199,6 +1468,95 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
       ringState.visible = true;
       ringState.dirty = true;
       el.style.cursor = 'none';
+      // Stamp preview — show the captured region inside the ring in draw mode
+      if (cfg.tool === 'stamp' && cfg.stampMode === 'draw' && stampViewRef.current) {
+        updateStampPreview(e);
+      } else {
+        hideStampPreview();
+      }
+    };
+
+    const hideStampPreview = () => {
+      const pv = stampPreviewRef.current;
+      if (pv && pv.style.display !== 'none') pv.style.display = 'none';
+    };
+
+    // Renders the captured-view region that would land at the cursor into a
+    // canvas inside the brush ring. Screen-space clone: the crop center is
+    // copyPx + flip*(mouse − strokeStart), matching the stamp shader exactly.
+    // Invert flips the crop, opacity applies, and the hardness falloff
+    // (alpha = 1 - smoothstep(innerFrac, 1, r)) shows the soft edge.
+    const updateStampPreview = (e) => {
+      const pv = stampPreviewRef.current;
+      const cfg = maskPaintCfgRef.current?.current;
+      const view = stampViewRef.current;
+      if (!pv || !view?.canvas || !view.copyPx) {
+        hideStampPreview();
+        return;
+      }
+      pv.style.display = 'block';
+      const px = Math.max(8, Math.round(cfg.size || 50));
+      if (pv.width !== px) { pv.width = px; pv.height = px; }
+      const ctx = pv.getContext('2d');
+      ctx.clearRect(0, 0, px, px);
+
+      const rect = getCanvasRect();
+      const scale = view.w / (rect.width || 1); // capture px per CSS px
+      const mx = (e.clientX - rect.left) * scale;
+      const my = (e.clientY - rect.top) * scale;
+      const startPx = paintingRef.current?.stampStartPx || { x: mx, y: my };
+      const fx = cfg.stampInvertX ? -1 : 1;
+      const fy = cfg.stampInvertY ? -1 : 1;
+      // Zoom compensation — the shader samples a zoom-ratio-scaled region of
+      // the captured image, so the preview crop does the same.
+      let zoomRatio = 1;
+      const cam = cameraRef.current;
+      if (cam && view.ndcPerWorld && view.centerWorld) {
+        cam.updateMatrixWorld();
+        const vp = new THREE.Matrix4().multiplyMatrices(cam.projectionMatrix, cam.matrixWorldInverse);
+        const right = new THREE.Vector3().setFromMatrixColumn(cam.matrixWorld, 0).normalize();
+        const a = view.centerWorld.clone().applyMatrix4(vp);
+        const b = view.centerWorld.clone().addScaledVector(right, 0.01).applyMatrix4(vp);
+        const curNdc = Math.hypot(b.x - a.x, b.y - a.y) / 0.01;
+        if (curNdc > 1e-8) zoomRatio = view.ndcPerWorld / curNdc;
+      }
+      const sx = view.copyPx.x + fx * (mx - startPx.x) * zoomRatio;
+      const sy = view.copyPx.y + fy * (my - startPx.y) * zoomRatio;
+      const rSrc = Math.max(1, (cfg.size || 50) / 2 * scale * zoomRatio); // ring radius in capture px
+
+      ctx.save();
+      ctx.beginPath();
+      ctx.arc(px / 2, px / 2, px / 2, 0, Math.PI * 2);
+      ctx.clip();
+      ctx.globalAlpha = Math.min(1, Math.max(0.01, (cfg.opacity ?? 100) / 100)) * 0.85;
+      if (cfg.stampInvertX || cfg.stampInvertY) {
+        ctx.translate(px / 2, px / 2);
+        ctx.scale(cfg.stampInvertX ? -1 : 1, cfg.stampInvertY ? -1 : 1);
+        ctx.drawImage(view.canvas, sx - rSrc, sy - rSrc, rSrc * 2, rSrc * 2, -px / 2, -px / 2, px, px);
+      } else {
+        ctx.drawImage(view.canvas, sx - rSrc, sy - rSrc, rSrc * 2, rSrc * 2, 0, 0, px, px);
+      }
+      ctx.restore();
+
+      const h = cfg.hardness ?? 50;
+      const innerFrac = Math.max(0, 1 - h / 100);
+      if (innerFrac < 1) {
+        const grad = ctx.createRadialGradient(px / 2, px / 2, 0, px / 2, px / 2, px / 2);
+        const stops = 16;
+        for (let i = 0; i <= stops; i++) {
+          const t = i / stops;
+          let a = 1;
+          if (t > innerFrac) {
+            const x = (t - innerFrac) / (1 - innerFrac);
+            a = 1 - x * x * (3 - 2 * x); // 1 - smoothstep, same as shader
+          }
+          grad.addColorStop(t, `rgba(0,0,0,${a})`);
+        }
+        ctx.globalCompositeOperation = 'destination-in';
+        ctx.fillStyle = grad;
+        ctx.fillRect(0, 0, px, px);
+        ctx.globalCompositeOperation = 'source-over';
+      }
     };
 
     const raycastHitAt = (clientX, clientY) => {
@@ -1254,7 +1612,7 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
       return null;
     };
 
-    const stampMaskAtHit = (layerIds, hit) => {
+    const stampMaskAtHit = (layerIds, hit, signOverride = null) => {
       const cfg = maskPaintCfgRef.current?.current;
       const renderer = rendererRef.current;
       if (!cfg || !renderer || !layerIds?.length) return;
@@ -1276,7 +1634,7 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
       u.u_innerRadius.value = R * Math.max(0, 1 - h / 100);
       u.u_brushStrength.value = Math.min(1, Math.max(0.01, (cfg.opacity ?? 100) / 100));
       u.u_paintSign.value =
-        cfg.tool === 'eraser' || (cfg.tool === 'inpaint' && cfg.sign === 'subtract') ? -1.0 : 1.0;
+        signOverride ?? (cfg.tool === 'eraser' || (cfg.tool === 'inpaint' && cfg.sign === 'subtract') ? -1.0 : 1.0);
       u.u_isDrawing.value = 1.0;
 
       // Populate the paint group with every submesh's geometry so all UV
@@ -1343,6 +1701,7 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
         // doesn't produce seam lines where a stroke crosses a UV boundary.
         bu.u_base.value = back.texture;
         bu.u_coverage.value = rtt.coverageRT.texture;
+        bu.u_texelSize.value = 1 / 1024;
         rtt.paintGroup.visible = false;
         rtt.bleedQuad.visible = true;
         renderer.setRenderTarget(entry.front);
@@ -1363,11 +1722,201 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
       renderer.setClearColor(prevClear, prevClearAlpha);
     };
 
+    // Clone-stamp dab — screen-space clone: every destination texel projects
+    // its world position through the capture-time camera and samples the
+    // captured composite view at copy + flip*(texel − strokeStart). Writing
+    // through the flattened-UV rasterization makes the stamp seam-safe — each
+    // texel is found via the mesh's own UV mapping, so it doesn't matter how
+    // the destination island is oriented or whether the stroke crosses seams.
+    const stampUvmapAtHit = (layerIds, hit) => {
+      const cfg = maskPaintCfgRef.current?.current;
+      const renderer = rendererRef.current;
+      const view = stampViewRef.current;
+      if (!cfg || !renderer || !hit || !view) return;
+      // Generated/inpainted layers are never stamp targets
+      layerIds = layerIds.filter((lid) => cfg.isStampableLayer?.(lid) ?? true);
+      if (!layerIds.length) return;
+
+      // Populate the paint group with every submesh's geometry so all UV
+      // islands are rasterized each stamp (same as the mask pass — skipping
+      // islands would revert their paint on the next stamp).
+      const rtt = getPaintRtt();
+      const geos = [];
+      currentMeshRef.current?.traverse((child) => {
+        if (child.isMesh && child.geometry?.attributes?.uv && child.geometry?.attributes?.position) {
+          geos.push(child.geometry);
+        }
+      });
+      const pg = rtt.paintGroup;
+      while (pg.children.length < geos.length) {
+        const m = new THREE.Mesh(new THREE.BufferGeometry(), rtt.mat);
+        m.frustumCulled = false;
+        pg.add(m);
+      }
+      pg.children.forEach((c, i) => {
+        c.visible = i < geos.length;
+        if (c.visible) c.geometry = geos[i];
+      });
+      pg.visible = true;
+      rtt.blitQuad.visible = false;
+
+      // Capture per-dab values — the async init callback may run after later
+      // dabs have overwritten the shared uniforms.
+      const R = brushWorldRadius(hit);
+      const h = cfg.hardness ?? 50;
+      const dabWorld = hit.point.clone();
+      const modelMat = hit.object.matrixWorld.clone();
+      const startWorld = paintingRef.current?.stampStartWorld || hit.point;
+      const opacity = Math.min(1, Math.max(0.01, (cfg.opacity ?? 100) / 100));
+      const flipX = cfg.stampInvertX ? -1 : 1;
+      const flipY = cfg.stampInvertY ? -1 : 1;
+      const su = rtt.stampColorMat.uniforms;
+
+      // Project the stroke start through the CURRENT camera so the stamp tracks
+      // the cursor even if the user orbited after copying. Only the copy anchor
+      // stays in capture-space pixels — the captured image behaves like a
+      // floating screenshot (same semantics as the ring preview).
+      const cam = cameraRef.current;
+      if (!cam) return;
+      cam.updateMatrixWorld();
+      const curVP = new THREE.Matrix4().multiplyMatrices(cam.projectionMatrix, cam.matrixWorldInverse);
+      const startNdc = startWorld.clone().applyMatrix4(curVP);
+      const startPx = new THREE.Vector2(
+        (startNdc.x * 0.5 + 0.5) * view.w,
+        (startNdc.y * 0.5 + 0.5) * view.h
+      );
+      // Current px-per-world — probed along the camera's RIGHT vector so
+      // rotation doesn't affect the measurement, only zoom/depth does.
+      const curRight = new THREE.Vector3().setFromMatrixColumn(cam.matrixWorld, 0).normalize();
+      const probeNdc = startWorld.clone().addScaledVector(curRight, 0.01).applyMatrix4(curVP);
+      const curNdcPerWorld = Math.hypot(probeNdc.x - startNdc.x, probeNdc.y - startNdc.y) / 0.01;
+      const zoomRatio = curNdcPerWorld > 1e-8 ? (view.ndcPerWorld || curNdcPerWorld) / curNdcPerWorld : 1;
+      // copyPx is stored y-down (canvas coords); the shader works in y-up px
+      const copyPx = new THREE.Vector2(view.copyPx.x, view.h - view.copyPx.y);
+      const res = cfg.textureResolution || 1024;
+
+      for (const layerId of layerIds) {
+        ensureStampEntry(layerId, cfg).then((entry) => {
+          if (!entry) return;
+          // Rebuild island coverage when the mesh changes (needed by bleed)
+          if (rtt.coverageMesh !== currentMeshRef.current) {
+            pg.children.forEach((c) => { c.material = rtt.coverageMat; });
+            const cc = stampTmpColor;
+            renderer.getClearColor(cc);
+            const ca = renderer.getClearAlpha();
+            renderer.setClearColor(0x000000, 0);
+            renderer.setRenderTarget(rtt.coverageRT);
+            renderer.clear(true, false, false);
+            renderer.render(rtt.scene, rtt.cam);
+            renderer.setRenderTarget(null);
+            renderer.setClearColor(cc, ca);
+            pg.children.forEach((c) => { c.material = rtt.mat; });
+            rtt.coverageMesh = currentMeshRef.current;
+          }
+          su.u_baseTexture.value = entry.front.texture;
+          su.u_srcTexture.value = view.rt.texture;
+          su.u_modelMatrix.value.copy(modelMat);
+          su.u_viewProj.value.copy(curVP);
+          su.u_viewport.value.set(view.w, view.h);
+          su.u_mouseWorldPos.value.copy(dabWorld);
+          su.u_copyPx.value.copy(copyPx);
+          su.u_startPx.value.copy(startPx);
+          su.u_brushRadius.value = R;
+          su.u_innerRadius.value = R * Math.max(0, 1 - h / 100);
+          su.u_brushStrength.value = opacity;
+          su.u_flip.value.set(flipX, flipY);
+          su.u_zoomRatio.value = zoomRatio;
+          pg.children.forEach((c) => { c.material = rtt.stampColorMat; });
+          const back = entry.front === entry.a ? entry.b : entry.a;
+          // Clear to transparent so off-island texels stay invisible before bleed
+          const pc = stampTmpColor;
+          renderer.getClearColor(pc);
+          const pa = renderer.getClearAlpha();
+          renderer.setClearColor(0x000000, 0);
+          renderer.setRenderTarget(back);
+          renderer.render(rtt.scene, rtt.cam);
+          // Bleed stamped color ~2px beyond UV-island edges to hide seams
+          const bs = rtt.bleedMat.uniforms;
+          bs.u_base.value = back.texture;
+          bs.u_coverage.value = rtt.coverageRT.texture;
+          bs.u_texelSize.value = 1 / res;
+          pg.visible = false;
+          rtt.bleedQuad.material = rtt.bleedMat;
+          rtt.bleedQuad.visible = true;
+          renderer.setRenderTarget(entry.front);
+          renderer.render(rtt.scene, rtt.cam);
+          renderer.setRenderTarget(null);
+          renderer.setClearColor(pc, pa);
+          rtt.bleedQuad.visible = false;
+          pg.visible = true;
+          pg.children.forEach((c) => { c.material = rtt.mat; });
+          stampTexRef.current.set(layerId, entry.front.texture);
+          bindLayerTexture(layerId, entry.front.texture);
+        });
+      }
+      // Reveal the stamped pixels through the layer mask
+      stampMaskAtHit(layerIds, hit, 1);
+    };
+
     const handlePointerDown = (e) => {
       // Gizmo press takes priority over paint tools — check it first
       const hit = pickGizmo(e);
       // Mask brush takes over left-click — but only off the gizmos
       const paintCfg = maskPaintCfgRef.current?.current;
+      // Stamp tool — copy mode picks the source UV, draw mode stamps
+      if (!hit && paintCfg?.tool === 'stamp' && e.button === 0 && currentMeshRef.current) {
+        if (paintCfg.stampMode === 'copy') {
+          const copyHit = raycastHitAt(e.clientX, e.clientY);
+          if (copyHit?.uv) {
+            stampCopyUVRef.current = copyHit.uv.clone();
+            const view = captureStampView();
+            if (view) {
+              stampViewRef.current?.rt.dispose();
+              view.copyWorld = copyHit.point.clone();
+              const rect = getCanvasRect();
+              const el = rendererRef.current.domElement;
+              const sx = el.width / (rect.width || 1);
+              const sy = el.height / (rect.height || 1);
+              // Canvas-space px (y-down) — used by the ring preview
+              view.copyPx = new THREE.Vector2(
+                (e.clientX - rect.left) * sx,
+                (e.clientY - rect.top) * sy
+              );
+              stampViewRef.current = view;
+            }
+            paintCfg.onStampCopy?.();
+            e.stopPropagation();
+            e.preventDefault();
+          }
+          return;
+        }
+        const layerIds = (paintCfg.getSelectedLayerIds?.() || [])
+          .filter((lid) => paintCfg.isStampableLayer?.(lid) ?? true);
+        const stampHit = raycastHitAt(e.clientX, e.clientY) || raycastRingHitAt(e.clientX, e.clientY);
+        if (layerIds.length && stampHit?.uv && stampViewRef.current) {
+          e.stopPropagation();
+          e.preventDefault();
+          paintCfg.onStrokeStart?.();
+          const rect = getCanvasRect();
+          const el = rendererRef.current.domElement;
+          const sx = el.width / (rect.width || 1);
+          const sy = el.height / (rect.height || 1);
+          paintingRef.current = {
+            layerIds,
+            lastX: e.clientX,
+            lastY: e.clientY,
+            stamp: true,
+            stampStartUV: stampHit.uv.clone(),
+            stampStartWorld: stampHit.point.clone(),
+            stampStartPx: new THREE.Vector2(
+              (e.clientX - rect.left) * sx,
+              (e.clientY - rect.top) * sy
+            ),
+          };
+          stampUvmapAtHit(layerIds, stampHit);
+        }
+        return;
+      }
       if (!hit && paintCfg && (paintCfg.tool === 'brush' || paintCfg.tool === 'eraser' || paintCfg.tool === 'inpaint') && e.button === 0 && currentMeshRef.current) {
         const layerIds = paintCfg.tool === 'inpaint'
           ? ['inpaint']
@@ -1455,9 +2004,12 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
       if (painting) {
         const cfg = maskPaintCfgRef.current?.current;
         const spread = cfg?.spread ?? 0;
+        const dab = painting.stamp
+          ? (h) => stampUvmapAtHit(painting.layerIds, h)
+          : (h) => stampMaskAtHit(painting.layerIds, h);
         if (spread <= 0) {
           const hit = raycastHitAt(e.clientX, e.clientY) || raycastRingHitAt(e.clientX, e.clientY);
-          if (hit) stampMaskAtHit(painting.layerIds, hit);
+          if (hit) dab(hit);
           painting.lastX = e.clientX;
           painting.lastY = e.clientY;
         } else {
@@ -1467,7 +2019,7 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
             painting.lastX += (e.clientX - painting.lastX) * t;
             painting.lastY += (e.clientY - painting.lastY) * t;
             const hit = raycastHitAt(painting.lastX, painting.lastY) || raycastRingHitAt(painting.lastX, painting.lastY);
-            if (hit) stampMaskAtHit(painting.layerIds, hit);
+            if (hit) dab(hit);
             dist = Math.hypot(e.clientX - painting.lastX, e.clientY - painting.lastY);
           }
         }
@@ -1570,7 +2122,7 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
         // Hover detection
         const hit = pickGizmo(e);
         const cfg = maskPaintCfgRef.current?.current;
-        const paintTool = cfg && (cfg.tool === 'brush' || cfg.tool === 'eraser' || cfg.tool === 'inpaint');
+        const paintTool = cfg && (cfg.tool === 'brush' || cfg.tool === 'eraser' || cfg.tool === 'inpaint' || cfg.tool === 'stamp');
         if (hit && (hit.userData.type === 'axis' || hit.userData.type === 'light')) {
           applyHover(hit);
           hideBrushRing();
@@ -1594,8 +2146,11 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
 
     const handlePointerUp = (e) => {
       if (paintingRef.current) {
+        const wasStamp = paintingRef.current.stamp;
+        const stampLayerIds = paintingRef.current.layerIds;
         paintingRef.current = null;
         maskPaintCfgRef.current?.current?.onStrokeEnd?.();
+        if (wasStamp) maskPaintCfgRef.current?.current?.onStampStrokeEnd?.(stampLayerIds);
         return;
       }
       if (gizmoInteractionRef.current) {
@@ -1703,7 +2258,7 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
   // shader samples mask render-target textures (inpaint RT, per-layer mask
   // RTs) that are bound to its WebGL context. A separate hidden renderer
   // would sample them as black, discarding every fragment.
-  const captureMeshViewImage = (size, { rotation = null, clearColor = 0x000000, materialFor = null } = {}) => {
+  const captureMeshViewImage = (size, { rotation = null, clearColor = 0x000000, clearAlpha = 1, materialFor = null } = {}) => {
     const renderer = rendererRef.current;
     const mainCamera = cameraRef.current;
     const mesh = currentMeshRef.current;
@@ -1770,7 +2325,7 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
     const buf = new Uint8Array(size * size * 4);
     try {
       renderer.setRenderTarget(rt);
-      renderer.setClearColor(clearColor, 1);
+      renderer.setClearColor(clearColor, clearAlpha);
       renderer.clear();
       renderer.render(captureScene, viewCamera);
       renderer.readRenderTargetPixels(rt, 0, 0, size, size, buf);
@@ -2087,11 +2642,12 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
 
     /**
      * Render the mesh with its composite layer materials — unlit, white
-     * background, no inpaint overlay — from the current camera view.
+     * background, no inpaint overlay — from the current camera view, or from
+     * an arbitrary camera angle when `rotation` ({x,y,z} degrees) is given.
      * Uniforms are shared with the live materials: toggle, render
      * synchronously, restore — no frame ever shows the change.
      */
-    captureCompositeImage(size = 1024) {
+    captureCompositeImage(size = 1024, rotation = null) {
       const mats = [];
       currentMeshRef.current?.traverse((c) => {
         if (c.isMesh && c.material) {
@@ -2108,7 +2664,7 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
         m.userData._captureSide = m.side;
         m.side = THREE.FrontSide;
       });
-      const dataUrl = captureMeshViewImage(size, { clearColor: 0xffffff });
+      const dataUrl = captureMeshViewImage(size, { clearColor: 0xffffff, rotation });
       mats.forEach((m) => {
         if (m.uniforms?.u_unlit) m.uniforms.u_unlit.value = unlitRef.current ? 1 : 0;
         if (m.uniforms?.u_hasInpaint) m.uniforms.u_hasInpaint.value = inpaintActiveRef.current && inpaintVisibleRef.current ? 1 : 0;
@@ -2150,6 +2706,66 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
           `,
           side: THREE.FrontSide, // backface culling — mask only on camera-facing faces
         }),
+      });
+    },
+
+    /**
+     * Render an arbitrary mask image on the mesh — white where painted, black
+     * elsewhere, black background — from the given camera angle. Used by the
+     * mirror flow to get the source layer's mask in screen space before it's
+     * flipped and re-projected. Returns a PNG data URL (null on failure).
+     */
+    captureMaskViewImage(maskDataUrl, rotation = null, size = 1024) {
+      return new Promise((resolve) => {
+        const img = new Image();
+        img.onload = () => {
+          // Default flipY=true matches the mask render-target convention —
+          // the PNG's top row is the RT's top (v=1).
+          const tex = new THREE.Texture(img);
+          tex.needsUpdate = true;
+          const dataUrl = captureMeshViewImage(size, {
+            rotation,
+            clearColor: 0x000000,
+            materialFor: () => new THREE.ShaderMaterial({
+              uniforms: { u_mask: { value: tex } },
+              vertexShader: `
+                varying vec2 vUv;
+                void main() {
+                  vUv = uv;
+                  gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+                }
+              `,
+              fragmentShader: `
+                uniform sampler2D u_mask;
+                varying vec2 vUv;
+                void main() {
+                  float m = texture2D(u_mask, vUv).r;
+                  gl_FragColor = vec4(vec3(m), 1.0);
+                }
+              `,
+              side: THREE.FrontSide, // backface culling — same as the inpaint mask capture
+            }),
+          });
+          tex.dispose();
+          resolve(dataUrl);
+        };
+        img.onerror = () => resolve(null);
+        img.src = maskDataUrl;
+      });
+    },
+
+    /**
+     * Render the mesh silhouette — opaque white where the mesh is visible,
+     * fully transparent background — from the given camera angle. Used by the
+     * mirror flow to align a flipped layer image to the mesh's on-screen
+     * shape before projection. Returns a PNG data URL (null on failure).
+     */
+    captureSilhouetteImage(rotation = null, size = 1024) {
+      return captureMeshViewImage(size, {
+        rotation,
+        clearColor: 0x000000,
+        clearAlpha: 0,
+        materialFor: () => new THREE.MeshBasicMaterial({ color: 0xffffff, side: THREE.FrontSide }),
       });
     },
 
@@ -2494,14 +3110,19 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
       if (active && container && !ringElRef.current) {
         const el = document.createElement('div');
         el.className = 'absolute rounded-full border border-white pointer-events-none';
-        el.style.cssText = 'display:none;left:0;top:0;transform:translate(-50%,-50%);z-index:10;';
+        el.style.cssText = 'display:none;left:0;top:0;transform:translate(-50%,-50%);z-index:10;overflow:hidden;';
+        const pv = document.createElement('canvas');
+        pv.style.cssText = 'display:none;position:absolute;inset:0;width:100%;height:100%;border-radius:50%;';
+        el.appendChild(pv);
         container.appendChild(el);
         ringElRef.current = el;
+        stampPreviewRef.current = pv;
         ringState.appliedD = -1;
         ringState.dirty = true;
       } else if (!active && ringElRef.current) {
         ringElRef.current.remove();
         ringElRef.current = null;
+        stampPreviewRef.current = null;
         ringState.visible = false;
       }
     },
@@ -2533,9 +3154,12 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
       const buildId = ++layerBuildIdRef.current;
       const paintLayerIds = opts.paintLayerIds ?? null;
 
+      // Paint-target layers stay in the list even without a uvmap — the stamp
+      // tool needs a live slot for empty layers so stamped pixels render.
+      const paintTargetSet = new Set(opts.paintLayerIds || []);
       const items = (entries || [])
         .map((e) => (typeof e === 'string' ? { url: e } : e))
-        .filter((e) => e.url);
+        .filter((e) => e.url || paintTargetSet.has(e.layerId));
 
       // Shared white dummy texture for unbound samplers
       if (!whiteMaskTexRef.current) {
@@ -2544,6 +3168,13 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
         whiteMaskTexRef.current.needsUpdate = true;
       }
       const white = whiteMaskTexRef.current;
+      // 1x1 transparent dummy — live slot for layers with no uvmap yet
+      // (stamp targets); near-black rgb is treated as empty by the shader.
+      if (!emptyTexRef.current) {
+        const data = new Uint8Array([0, 0, 0, 0]);
+        emptyTexRef.current = new THREE.DataTexture(data, 1, 1, THREE.RGBAFormat);
+        emptyTexRef.current.needsUpdate = true;
+      }
 
       // Checkerboard underlay — tiled beneath every layer stack so
       // transparent regions (e.g. background-removed images) read as
@@ -2556,7 +3187,10 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
       }
 
       const freeGpu = () => {
-        for (const t of layerGpuRef.current.textures) t.dispose();
+        // Stamp canvases + the transparent dummy are shared/persistent —
+        // disposing them would break the stamp tool's live bindings.
+        const keep = new Set([emptyTexRef.current, ...stampTexRef.current.values()]);
+        for (const t of layerGpuRef.current.textures) if (!keep.has(t)) t.dispose();
         for (const u of layerGpuRef.current.blobUrls) URL.revokeObjectURL(u);
         layerGpuRef.current = { textures: [], blobUrls: [] };
       };
@@ -2695,9 +3329,15 @@ ${shaderTail}`;
                 const c = await compositeLayerImages(op.items);
                 op.tex = c ? await canvasToLayerTexture(c) : null; // { tex, url }
               } else {
-                const t = await new THREE.TextureLoader().loadAsync(op.item.url);
-                t.flipY = true;
-                op.tex = t;
+                if (op.item.url) {
+                  const t = await new THREE.TextureLoader().loadAsync(op.item.url);
+                  t.flipY = true;
+                  op.tex = t;
+                } else {
+                  // Empty paint target — reuse the stamp canvas texture if it
+                  // exists, otherwise a transparent dummy until the first dab.
+                  op.tex = stampTexRef.current.get(op.item.layerId) || emptyTexRef.current;
+                }
               }
             }));
             if (buildId !== layerBuildIdRef.current) { bail(); return; }
@@ -2730,7 +3370,9 @@ ${shaderTail}`;
               } else {
                 const s = liveN++;
                 decls.push(`uniform sampler2D layer${s}; uniform sampler2D mask${s}; uniform float hasMask${s};`);
-                body.push(`{ vec4 lc${s} = texture2D(layer${s}, vUv); float cm${s} = step(0.01, length(lc${s}.rgb)); float pm${s} = mix(1.0, texture2D(mask${s}, vUv).r, hasMask${s}); float a${s} = mix(0.0, lc${s}.a, pm${s}); color.rgb = mix(color.rgb, lc${s}.rgb, cm${s} * a${s}); color.a = max(color.a, a${s} * cm${s}); }`);
+                // With a mask bound, mask defines visibility — the near-black
+                // "empty" heuristic would wrongly cull stamped dark content.
+                body.push(`{ vec4 lc${s} = texture2D(layer${s}, vUv); float cm${s} = mix(step(0.01, length(lc${s}.rgb)), 1.0, hasMask${s}); float pm${s} = mix(1.0, texture2D(mask${s}, vUv).r, hasMask${s}); float a${s} = mix(0.0, lc${s}.a, pm${s}); color.rgb = mix(color.rgb, lc${s}.rgb, cm${s} * a${s}); color.a = max(color.a, a${s} * cm${s}); }`);
                 uniforms[`layer${s}`] = { value: op.tex };
                 uniforms[`mask${s}`] = { value: op.item.maskTexture || white };
                 uniforms[`hasMask${s}`] = { value: op.item.maskTexture ? 1 : 0 };
@@ -2807,6 +3449,50 @@ ${shaderTail}`;
      * Called when a mask is created mid-session (first brush stroke) so the
      * shader picks it up without rebuilding the material.
      */
+    /**
+     * The stamp tool's per-layer uvmap content as a PNG data URL — reads the
+     * layer's stamp render target back into a canvas (row-flipped to PNG
+     * top-down) so it can persist via saveUvMap when a stroke ends.
+     */
+    getStampCanvasDataUrl(layerId) {
+      const entry = stampRtRef.current.get(layerId);
+      const renderer = rendererRef.current;
+      if (!entry || !renderer) return null;
+      const res = entry.front.width;
+      const buf = new Uint8Array(res * res * 4);
+      renderer.readRenderTargetPixels(entry.front, 0, 0, res, res, buf);
+      let canvas = stampCanvasRef.current.get(layerId);
+      if (!canvas || canvas.width !== res) {
+        canvas = document.createElement('canvas');
+        canvas.width = canvas.height = res;
+        stampCanvasRef.current.set(layerId, canvas);
+      }
+      const ctx = canvas.getContext('2d');
+      const img = ctx.createImageData(res, res);
+      for (let y = 0; y < res; y++) {
+        img.data.set(buf.subarray((res - 1 - y) * res * 4, (res - y) * res * 4), y * res * 4);
+      }
+      ctx.putImageData(img, 0, 0);
+      return canvas.toDataURL('image/png');
+    },
+
+    /**
+     * Drop a layer's stamp render targets/texture — call when its uvmap is
+     * replaced externally (regenerate, inpaint, reproject) so the next stamp
+     * re-seeds from the current uvmap.png instead of a stale buffer.
+     */
+    invalidateStampCanvas(layerId) {
+      stampCanvasRef.current.delete(layerId);
+      stampLoadRef.current.delete(layerId);
+      stampTexRef.current.delete(layerId);
+      const entry = stampRtRef.current.get(layerId);
+      if (entry) {
+        stampRtRef.current.delete(layerId);
+        entry.a.dispose();
+        entry.b.dispose();
+      }
+    },
+
     bindLayerMask(layerId, texture) {
       const slot = shaderLayerIdsRef.current.indexOf(layerId);
       if (slot < 0) return;
@@ -3085,6 +3771,16 @@ ${shaderTail}`;
         for (const u of layerGpuRef.current.blobUrls) URL.revokeObjectURL(u);
         layerGpuRef.current = { textures: [], blobUrls: [] };
         disposeInpaintEntry();
+        for (const entry of stampRtRef.current.values()) {
+          entry.a.dispose();
+          entry.b.dispose();
+        }
+        stampRtRef.current.clear();
+        stampTexRef.current.clear();
+        stampCanvasRef.current.clear();
+        stampLoadRef.current.clear();
+        stampViewRef.current?.rt.dispose();
+        stampViewRef.current = null;
       }
       const grid = sceneRef.current.getObjectByName('__grid');
       if (grid) grid.visible = true;

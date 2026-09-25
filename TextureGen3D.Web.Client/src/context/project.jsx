@@ -89,7 +89,10 @@ export function ProjectProvider({ children }) {
   useEffect(() => { allMeshLayersRef.current = allMeshLayers; }, [allMeshLayers]);
 
   // ── Mask brush ──
-  const [maskTool, setMaskTool] = useState('pointer'); // 'pointer' | 'brush' | 'eraser' | 'inpaint'
+  const [maskTool, setMaskTool] = useState('pointer'); // 'pointer' | 'brush' | 'eraser' | 'inpaint' | 'stamp'
+  const [stampMode, setStampMode] = useState('copy');  // 'copy' (pick source) | 'draw' (stamp)
+  const [stampInvertX, setStampInvertX] = useState(false); // mirror stamped content horizontally
+  const [stampInvertY, setStampInvertY] = useState(false); // mirror stamped content vertically
   const [inpaintPrompt, setInpaintPrompt] = useState('');
   const [inpaintMaskVisible, setInpaintMaskVisible] = useState(true);
   const [inpaintSign, setInpaintSign] = useState('add'); // 'add' (white) | 'subtract' (black)
@@ -118,6 +121,8 @@ export function ProjectProvider({ children }) {
   useEffect(() => { selectedLayerIdRef.current = selectedLayerId; }, [selectedLayerId]);
   const selectedLayerIdsRef = useRef([]);
   useEffect(() => { selectedLayerIdsRef.current = selectedLayerIds; }, [selectedLayerIds]);
+  const meshLayersRef = useRef([]);
+  useEffect(() => { meshLayersRef.current = meshLayers; }, [meshLayers]);
 
   // Single-select — keeps the multi-select array in sync (just this layer).
   const setSelectedLayerId = useCallback((layerId) => {
@@ -404,6 +409,45 @@ export function ProjectProvider({ children }) {
     };
   }, []);
 
+  // ── Stamp tool plumbing ──
+  // The clone source is captured GPU-side in the viewer (captureStampView) —
+  // screen-space, so seams/orientation match what's projected on the mesh.
+  // Fetch a layer's current uvmap.png as an object URL — used to initialize
+  // the stamp target canvas (the viewer can't send auth headers to loaders).
+  const loadStampLayerImage = useCallback(async (layerId) => {
+    const meshDbId = selectedMeshRef.current ? meshDbIdsRef.current[selectedMeshRef.current.key] : null;
+    if (!meshDbId) return null;
+    try {
+      const res = await fetch(layerApi.uvmapUrl(id, meshDbId, layerId), {
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      });
+      if (!res.ok) return null;
+      const blob = await res.blob();
+      return blob.size ? URL.createObjectURL(blob) : null;
+    } catch {
+      return null;
+    }
+  }, [id, layerApi, token]);
+
+  // Persist stamped uvmap canvases after a stroke completes (masks persist
+  // through the existing scheduleMaskSave path).
+  const saveStampedUvmaps = useCallback(async (layerIds) => {
+    const meshDbId = selectedMeshRef.current ? meshDbIdsRef.current[selectedMeshRef.current.key] : null;
+    if (!meshDbId) return;
+    let bumped = false;
+    for (const layerId of layerIds || []) {
+      const dataUrl = viewerRef.current?.getStampCanvasDataUrl?.(layerId);
+      if (!dataUrl) continue;
+      try {
+        await layerApi.saveUvMap(id, layerId, meshDbId, dataUrl);
+        bumped = true;
+      } catch (err) {
+        console.error('Failed to save stamped uvmap:', err);
+      }
+    }
+    if (bumped) setLayerThumbVersion((v) => v + 1);
+  }, [id, layerApi]);
+
   // Keep the paint config current — ModelViewer reads this ref in its
   // pointer handlers so brush changes never re-create the Three.js scene.
   useEffect(() => {
@@ -415,14 +459,27 @@ export function ProjectProvider({ children }) {
       hardness: brushHardness,
       spread: brushSpread,
       opacity: brushOpacity,
+      stampMode,
+      stampInvertX,
+      stampInvertY,
+      textureResolution: project?.textureResolution ?? 1024,
       getSelectedLayerId: () => selectedLayerIdRef.current,
       getSelectedLayerIds: () => selectedLayerIdsRef.current,
+      // Stamp targets: generated/inpainted layers are off-limits — stamping
+      // clones the composite onto plain (non-projected) layers only.
+      isStampableLayer: (lid) => {
+        const l = meshLayersRef.current.find((x) => x.id === lid);
+        return !!l && !l.inpaint && !l.generated;
+      },
       getOrCreateLayerMask,
       markMaskModified,
       onStrokeStart: cancelMaskSaveTimer,
       onStrokeEnd: scheduleMaskSave,
+      onStampCopy: () => setStampMode('draw'),
+      loadStampLayerImage,
+      onStampStrokeEnd: saveStampedUvmaps,
     };
-  }, [maskTool, inpaintSign, ctrlHeld, brushSize, brushHardness, brushSpread, brushOpacity, getOrCreateLayerMask, markMaskModified, cancelMaskSaveTimer, scheduleMaskSave]);
+  }, [maskTool, inpaintSign, ctrlHeld, brushSize, brushHardness, brushSpread, brushOpacity, stampMode, stampInvertX, stampInvertY, project?.textureResolution, getOrCreateLayerMask, markMaskModified, cancelMaskSaveTimer, scheduleMaskSave, loadStampLayerImage, saveStampedUvmaps]);
 
   // Inpainting mode — activate the mesh-wide overlay when the tool is selected,
   // tear it down whenever another tool takes over (Cancel, pointer, etc.)
@@ -438,14 +495,20 @@ export function ProjectProvider({ children }) {
   useEffect(() => {
     refreshLayerTextures();
     viewerRef.current?.setBrushRingActive?.(
-      maskTool === 'brush' || maskTool === 'eraser' || maskTool === 'inpaint'
+      maskTool === 'brush' || maskTool === 'eraser' || maskTool === 'inpaint' || maskTool === 'stamp'
     );
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [maskTool]);
   useEffect(() => {
-    if (maskTool === 'brush' || maskTool === 'eraser') refreshLayerTextures();
+    if (maskTool === 'brush' || maskTool === 'eraser' || maskTool === 'stamp') refreshLayerTextures();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedLayerId, selectedLayerIds]);
+
+  // Selecting the stamp tool always starts in copy mode — the user picks a
+  // source point before drawing (mirrors how inpaint resets to 'add').
+  useEffect(() => {
+    if (maskTool === 'stamp') setStampMode('copy');
+  }, [maskTool]);
 
   const cancelInpainting = useCallback(() => setMaskTool('pointer'), []);
 
@@ -462,6 +525,9 @@ export function ProjectProvider({ children }) {
       if (typeof saved.hardness === 'number') setBrushHardness(Math.min(100, Math.max(0, saved.hardness)));
       if (typeof saved.spread === 'number') setBrushSpread(Math.min(100, Math.max(0, saved.spread)));
       if (typeof saved.opacity === 'number') setBrushOpacity(Math.min(100, Math.max(1, saved.opacity)));
+      if (typeof saved.stampInvert === 'boolean') setStampInvertX(saved.stampInvert); // legacy key → X
+      if (typeof saved.stampInvertX === 'boolean') setStampInvertX(saved.stampInvertX);
+      if (typeof saved.stampInvertY === 'boolean') setStampInvertY(saved.stampInvertY);
     } catch {
       /* corrupt entry — ignore */
     }
@@ -478,11 +544,13 @@ export function ProjectProvider({ children }) {
         hardness: brushHardness,
         spread: brushSpread,
         opacity: brushOpacity,
+        stampInvertX,
+        stampInvertY,
       }));
     } catch {
       /* storage full/blocked — non-fatal */
     }
-  }, [id, brushSize, brushHardness, brushSpread, brushOpacity]);
+  }, [id, brushSize, brushHardness, brushSpread, brushOpacity, stampInvertX, stampInvertY]);
 
   // Selecting the inpaint tool always starts in add (+) mode with the
   // inpaint mask overlay visible
@@ -594,10 +662,12 @@ export function ProjectProvider({ children }) {
       }
       const hasAny = entries.some((e) => e.url !== null);
       const paintLayerIds =
-        (maskToolRef.current === 'brush' || maskToolRef.current === 'eraser')
+        (maskToolRef.current === 'brush' || maskToolRef.current === 'eraser' || maskToolRef.current === 'stamp')
           ? selectedLayerIdsRef.current
           : null;
-      viewerRef.current.updateLayerTextures(hasAny ? entries : [], { paintLayerIds });
+      // Stamp targets can be empty layers (no uvmap yet) — still give them a
+      // live shader slot so stamped pixels render in real time.
+      viewerRef.current.updateLayerTextures(hasAny || paintLayerIds?.length ? entries : [], { paintLayerIds });
     },
     [id, layerApi, meshDbIds, meshLayers, selectedMesh, token, getOrCreateLayerMask]
   );
@@ -1198,6 +1268,12 @@ export function ProjectProvider({ children }) {
     maskTool,
     inpaintPrompt,
     setInpaintPrompt,
+    stampMode,
+    setStampMode,
+    stampInvertX,
+    setStampInvertX,
+    stampInvertY,
+    setStampInvertY,
     inpaintMaskVisible,
     setInpaintMaskVisible,
     inpaintSign,

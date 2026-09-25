@@ -151,7 +151,7 @@ export default function InpaintPanel({ showPanel, setShowPanel }) {
       setComfyProgress(60);
       setComfyMessage('Projecting onto new layer...');
       const layerNum = meshLayers.length + 1;
-      const layerRes = await layerApi.create(id, meshDbId, `Layer ${layerNum}`, cameraAngleJson, true, referenceIds[0] ?? null);
+      const layerRes = await layerApi.create(id, meshDbId, `Layer ${layerNum}`, cameraAngleJson, true, referenceIds[0] ?? null, true);
       if (!layerRes.data?.success) throw new Error('Failed to create layer');
       const layer = layerRes.data.data;
       prependMeshLayer(meshDbId, layer);

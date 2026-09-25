@@ -4,26 +4,30 @@ import time
 from PIL import Image
 from diffusers import Flux2KleinPipeline
 
-#BASE_MODEL = "black-forest-labs/FLUX.2-klein-base-4B"
-# Distilled 4-step klein — much faster than the base model (which needs ~20
-# steps). Trade-off vs the base model the LoRA card's workflow uses: the
-# distilled variant can't apply real CFG guidance (runs at guidance 1.0), so
-# the LoRA conditioning may be slightly weaker.
-BASE_MODEL = "black-forest-labs/FLUX.2-klein-4B"
+# Distilled 4-step klein — ~5x faster than the base model, but the LoRA was
+# trained on the base model's denoising trajectory: at 4 steps with no real
+# CFG the output drifts toward the model's bright render prior instead of
+# preserving the reference's tone.
+#BASE_MODEL = "black-forest-labs/FLUX.2-klein-4B"
+#TRANSFORMER_FP8 = "https://huggingface.co/black-forest-labs/FLUX.2-klein-4b-fp8/resolve/main/flux-2-klein-4b-fp8.safetensors"
+BASE_MODEL = "black-forest-labs/FLUX.2-klein-base-4B"
 # FP8 transformer checkpoint — 4GB instead of ~8GB bf16. Loaded as a
 # pipeline component when supported.
-TRANSFORMER_FP8 = "https://huggingface.co/black-forest-labs/FLUX.2-klein-4b-fp8/resolve/main/flux-2-klein-4b-fp8.safetensors"
+TRANSFORMER_FP8 = "https://huggingface.co/black-forest-labs/FLUX.2-klein-base-4b-fp8/resolve/main/flux-2-klein-base-4b-fp8.safetensors"
 LORA_MODEL = "thedeoxen/refcontrol-FLUX.2-klein-4B-reference-depth-lora"
 
-# Distilled klein settings: 4 steps, guidance 1.0 — the model is
-# step-distilled, so more steps over-denoise and real CFG doesn't apply.
-NUM_STEPS = 4
-GUIDANCE_SCALE = 1.0
-# RefControl LoRA weight — at full strength (1.0) the depth LoRA can
-# over-saturate dark boundaries; 0.8 keeps natural lighting. Passed through
-# attention_kwargs -> joint_attention_kwargs on the transformer.
-LORA_SCALE = 0.8
+# Base model settings: 20 steps, guidance 5.0 — matches the refcontrol LoRA's
+# training distribution (real CFG holds the reference's tone).
+NUM_STEPS = 20
+GUIDANCE_SCALE = 5.0
+# RefControl LoRA weight — the card recommends 0.8–1.0. Higher scale =
+# stronger identity/style preservation from the reference; lower values let
+# the model drift toward its photoreal prior.
+LORA_SCALE = 1.0
 TRIGGER_WORD = "refcontrol"
+# Anchors tone/style — without this the model fills an empty prompt with its
+# photoreal prior and repaints the reference.
+STYLE_PROMPT = "reproduce the reference image exactly, identical colors and art style, remapped to the depth map"
 
 _pipe = None
 _debug_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "debug")
@@ -139,8 +143,9 @@ def depth_to_image(depth_map_image, reference_image, prompt="", seed=-1, resolut
     pipe = get_pipeline()
 
     # The RefControl LoRA requires its trigger word — without it the LoRA
-    # barely engages and the depth map gets ignored.
-    full_prompt = f"{prompt} {TRIGGER_WORD}".strip()
+    # barely engages and the depth map gets ignored. STYLE_PROMPT keeps the
+    # output faithful to the reference's colors/style.
+    full_prompt = f"{prompt} {STYLE_PROMPT} {TRIGGER_WORD}".strip()
 
     # Convert both images to RGB — the pipeline expects 3-channel images.
     # Depth maps may arrive as "L" (grayscale) or "RGBA" depending on the upload path.

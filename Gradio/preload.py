@@ -16,12 +16,12 @@ from huggingface_hub.constants import HF_HUB_CACHE
 # All models/LoRAs used by the modules
 MODELS = [
     {
-        "repo_id": "black-forest-labs/FLUX.2-klein-4B",
-        "description": "Distilled 4-step FLUX.2 Klein 4B model (text encoder + VAE + tokenizers)",
+        "repo_id": "black-forest-labs/FLUX.2-klein-base-4B",
+        "description": "FLUX.2 Klein 4B base model (text encoder + VAE + tokenizers)",
     },
     {
-        "repo_id": "black-forest-labs/FLUX.2-klein-4b-fp8",
-        "description": "FP8 transformer checkpoint (4GB, flux-2-klein-4b-fp8.safetensors)",
+        "repo_id": "black-forest-labs/FLUX.2-klein-base-4b-fp8",
+        "description": "FP8 transformer checkpoint (4GB, flux-2-klein-base-4b-fp8.safetensors)",
     },
     {
         "repo_id": "thedeoxen/refcontrol-FLUX.2-klein-4B-reference-depth-lora",

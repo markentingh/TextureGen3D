@@ -32,6 +32,7 @@ namespace TextureGen3D.API.Services
         Task DeleteProjectReferenceThumbAsync(Guid projectId, Guid referenceId, string extension);
         // Project mesh layer images
         Task SaveProjectMeshLayerImageAsync(Guid projectId, Guid meshId, Guid layerId, byte[] fileData);
+        Task SaveProjectMeshLayerFileAsync(Guid projectId, Guid meshId, Guid layerId, string fileName, byte[] fileData);
         Task<byte[]> GetProjectMeshLayerImageAsync(Guid projectId, Guid meshId, Guid layerId);
         Task DeleteProjectMeshLayerImageAsync(Guid projectId, Guid meshId, Guid layerId);
         Task SaveProjectMeshLayerThumbAsync(Guid projectId, Guid meshId, Guid layerId, byte[] imageData);
@@ -336,6 +337,15 @@ namespace TextureGen3D.API.Services
         public async Task SaveProjectMeshLayerImageAsync(Guid projectId, Guid meshId, Guid layerId, byte[] fileData)
         {
             var relativePath = Path.Combine("projects", projectId.ToString(), "meshes", meshId.ToString(), layerId.ToString(), "image.png");
+            if (_activeStorage == "azure") { await SaveToAzureBlobAsync(relativePath, fileData); return; }
+            await SaveToFileSystemAsync(relativePath, fileData);
+        }
+
+        // Generic layer-folder file write (debug artifacts e.g. original.png).
+        // fileName must be a plain file name — callers validate before this.
+        public async Task SaveProjectMeshLayerFileAsync(Guid projectId, Guid meshId, Guid layerId, string fileName, byte[] fileData)
+        {
+            var relativePath = Path.Combine("projects", projectId.ToString(), "meshes", meshId.ToString(), layerId.ToString(), fileName);
             if (_activeStorage == "azure") { await SaveToAzureBlobAsync(relativePath, fileData); return; }
             await SaveToFileSystemAsync(relativePath, fileData);
         }
