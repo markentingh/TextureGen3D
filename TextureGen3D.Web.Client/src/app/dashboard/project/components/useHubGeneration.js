@@ -149,5 +149,133 @@ export function useHubGeneration() {
     [allImageModels, generateViaHub, layerApi, id, textureResolution, setComfyMessage]
   );
 
-  return { generateViaHub, removeBackground, activeHubConnectionRef };
+  // Clean pass — runs an image through the first active Clean Image (type-6)
+  // model (FBCNN artifact removal). Same pass-through pattern as
+  // removeBackground: returns the image unchanged when no type-6 model is
+  // configured, so the pipeline degrades gracefully.
+  const cleanImage = useCallback(
+    async ({ generatedImage, layer, meshDbId, cameraAngleJson }) => {
+      const cleanModel = (allImageModels || []).find((m) => m.type === 6 && m.active !== false);
+      if (!cleanModel || !generatedImage) return generatedImage;
+
+      setComfyMessage('Cleaning image...');
+      const vendor = (cleanModel.model || '').toLowerCase();
+      if (vendor === 'gradio' || vendor === 'comfyui') {
+        return await generateViaHub({
+          hubUrl: vendor === 'comfyui' ? '/hubs/comfyui' : '/hubs/gradio',
+          hubName: vendor === 'comfyui' ? 'ComfyUI' : 'Gradio',
+          layer,
+          meshDbId,
+          fullPrompt: '',
+          inputImage: generatedImage,
+          imageModelId: cleanModel.id,
+        });
+      }
+
+      const res = await layerApi.generate(
+        id,
+        layer.id,
+        meshDbId,
+        cleanModel.id,
+        '',
+        null,
+        cameraAngleJson || null,
+        null,
+        generatedImage,
+        textureResolution
+      );
+      if (!res.data?.success) throw new Error(res.data?.message || 'Clean Image failed');
+      return res.data.data?.image;
+    },
+    [allImageModels, generateViaHub, layerApi, id, textureResolution, setComfyMessage]
+  );
+
+  // First pipeline pass — plain image generation through the first active
+  // Image Generation (type-0) model: prompt + references only, no depth
+  // map. Its output is what the clean/depth steps operate on.
+  const generateBaseImage = useCallback(
+    async ({ layer, meshDbId, fullPrompt, angleId, angleNum, totalAngles, cameraAngleJson }) => {
+      const genModel = (allImageModels || []).find((m) => m.type === 0 && m.active !== false);
+      if (!genModel) throw new Error('No active Image Generation (type 0) model configured');
+      setComfyMessage(angleNum && totalAngles ? `Image ${angleNum}/${totalAngles}: Generating image...` : 'Generating image...');
+      const vendor = (genModel.model || '').toLowerCase();
+      if (vendor === 'gradio' || vendor === 'comfyui') {
+        return await generateViaHub({
+          hubUrl: vendor === 'comfyui' ? '/hubs/comfyui' : '/hubs/gradio',
+          hubName: vendor === 'comfyui' ? 'ComfyUI' : 'Gradio',
+          layer,
+          meshDbId,
+          fullPrompt,
+          angleId,
+          angleNum,
+          totalAngles,
+          imageModelId: genModel.id,
+        });
+      }
+      const res = await layerApi.generate(
+        id,
+        layer.id,
+        meshDbId,
+        genModel.id,
+        fullPrompt,
+        null,
+        cameraAngleJson || null,
+        angleId || null,
+        null,
+        textureResolution
+      );
+      if (!res.data?.success) throw new Error(res.data?.message || 'Image generation failed');
+      return res.data.data?.image;
+    },
+    [allImageModels, generateViaHub, layerApi, id, textureResolution, setComfyMessage]
+  );
+
+  // Depth-to-image pass — sends the (cleaned) generated image plus the
+  // captured depth map through the selected Depth to Image (type-1)
+  // "Projection Image Model". For hub vendors the depth map is saved to
+  // the layer first so the hub can load it into inputImages[0]; the REST
+  // path sends it in the request (which also saves it server-side).
+  const depthToImage = useCallback(
+    async ({ generatedImage, depthMap, layer, meshDbId, fullPrompt, angleId, angleNum, totalAngles, cameraAngleJson }) => {
+      // A type-1 call without a depth map would put the image in the
+      // Depth Map role — skip the pass entirely.
+      if (!generatedImage || !depthMap) return generatedImage;
+      const depthModel = (allImageModels || []).find((m) => String(m.id) === String(selectedModelId));
+      if (!depthModel) throw new Error('No Depth to Image (projection) model selected');
+      setComfyMessage(angleNum && totalAngles ? `Image ${angleNum}/${totalAngles}: Applying depth map...` : 'Applying depth map...');
+      const vendor = (depthModel.model || '').toLowerCase();
+      if (vendor === 'gradio' || vendor === 'comfyui') {
+        await layerApi.saveDepthMap(id, layer.id, meshDbId, depthMap);
+        return await generateViaHub({
+          hubUrl: vendor === 'comfyui' ? '/hubs/comfyui' : '/hubs/gradio',
+          hubName: vendor === 'comfyui' ? 'ComfyUI' : 'Gradio',
+          layer,
+          meshDbId,
+          fullPrompt,
+          angleId,
+          angleNum,
+          totalAngles,
+          inputImage: generatedImage,
+          imageModelId: depthModel.id,
+        });
+      }
+      const res = await layerApi.generate(
+        id,
+        layer.id,
+        meshDbId,
+        depthModel.id,
+        fullPrompt,
+        depthMap,
+        cameraAngleJson || null,
+        angleId || null,
+        generatedImage,
+        textureResolution
+      );
+      if (!res.data?.success) throw new Error(res.data?.message || 'Depth to Image generation failed');
+      return res.data.data?.image;
+    },
+    [allImageModels, selectedModelId, generateViaHub, layerApi, id, textureResolution, setComfyMessage]
+  );
+
+  return { generateViaHub, generateBaseImage, depthToImage, removeBackground, cleanImage, activeHubConnectionRef };
 }

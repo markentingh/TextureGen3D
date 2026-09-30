@@ -22,6 +22,9 @@ _rembg = importlib.util.module_from_spec(_spec_rembg)
 _spec_rembg.loader.exec_module(_rembg)
 remove_background = _rembg.remove_background
 
+from modules.upscale import upscale
+from modules.fbcnn_clean import clean_image
+
 
 def refcontrol_tab():
     gr.Markdown("## Depth Map + Reference Image")
@@ -32,8 +35,8 @@ def refcontrol_tab():
 
     with gr.Row():
         with gr.Column():
-            depth_map_input = gr.Image(label="Depth Map", type="pil")
-            reference_input = gr.Image(label="Reference Image", type="pil")
+            depth_map_input = gr.Image(label="Depth Map", type="pil", format="png")
+            reference_input = gr.Image(label="Reference Image", type="pil", format="png")
             prompt_input = gr.Textbox(
                 label="Prompt",
                 value="",
@@ -54,7 +57,7 @@ def refcontrol_tab():
             generate_btn = gr.Button("Generate", variant="primary")
 
         with gr.Column():
-            output_image = gr.Image(label="Output Image", type="pil")
+            output_image = gr.Image(label="Output Image", type="pil", format="png")
 
     generate_btn.click(
         fn=depth_to_image,
@@ -73,7 +76,7 @@ def qwen21_i2i_tab():
 
     with gr.Row():
         with gr.Column():
-            image_input = gr.Image(label="Input Image", type="pil")
+            image_input = gr.Image(label="Input Image", type="pil", format="png")
             prompt_input = gr.Textbox(
                 label="Prompt",
                 value="",
@@ -94,7 +97,7 @@ def qwen21_i2i_tab():
             generate_btn = gr.Button("Generate", variant="primary")
 
         with gr.Column():
-            output_image = gr.Image(label="Output Image", type="pil")
+            output_image = gr.Image(label="Output Image", type="pil", format="png")
 
     generate_btn.click(
         fn=qwen_image_to_image,
@@ -113,15 +116,70 @@ def remove_background_tab():
 
     with gr.Row():
         with gr.Column():
-            image_input = gr.Image(label="Input Image", type="pil")
+            image_input = gr.Image(label="Input Image", type="pil", format="png")
             remove_btn = gr.Button("Remove Background", variant="primary")
 
         with gr.Column():
-            output_image = gr.Image(label="Output Image", type="pil")
+            output_image = gr.Image(label="Output Image", type="pil", format="png")
 
     remove_btn.click(
         fn=remove_background,
         inputs=[image_input],
+        outputs=output_image,
+    )
+
+
+def upscale_tab():
+    gr.Markdown("## Upscale — AuraSR")
+    gr.Markdown(
+        "Upscales an image 4x using "
+        "[AuraSR-v2](https://huggingface.co/fal-ai/AuraSR-v2) "
+        "(GAN super-resolution). RGBA inputs keep their alpha channel."
+    )
+
+    with gr.Row():
+        with gr.Column():
+            image_input = gr.Image(label="Input Image", type="pil", format="png")
+            upscale_btn = gr.Button("Upscale", variant="primary")
+
+        with gr.Column():
+            output_image = gr.Image(label="Output Image", type="pil", format="png")
+
+    upscale_btn.click(
+        fn=upscale,
+        inputs=[image_input],
+        outputs=output_image,
+    )
+
+
+def clean_image_tab():
+    gr.Markdown("## Clean Image — FBCNN")
+    gr.Markdown(
+        "Removes JPEG/compression artifacts and light noise from an image using "
+        "[FBCNN](https://github.com/jiaxi-jiang/FBCNN) "
+        "(flexible blind artifact removal, ICCV 2021). Output is the same size as the input; "
+        "RGBA inputs keep their alpha channel."
+    )
+
+    with gr.Row():
+        with gr.Column():
+            image_input = gr.Image(label="Input Image", type="pil", format="png")
+            quality_factor_input = gr.Slider(
+                label="Quality Factor",
+                minimum=5,
+                maximum=100,
+                step=5,
+                value=10,
+                info="Assumed JPEG quality of the input — lower = more aggressive cleaning",
+            )
+            clean_btn = gr.Button("Clean Image", variant="primary")
+
+        with gr.Column():
+            output_image = gr.Image(label="Output Image", type="pil", format="png")
+
+    clean_btn.click(
+        fn=clean_image,
+        inputs=[image_input, quality_factor_input],
         outputs=output_image,
     )
 
@@ -137,6 +195,12 @@ with gr.Blocks(title="TextureGen3D Gradio", delete_cache=(60, 60)) as app:
 
     with gr.Tab("Remove Background"):
         remove_background_tab()
+
+    with gr.Tab("Upscale"):
+        upscale_tab()
+
+    with gr.Tab("Clean Image"):
+        clean_image_tab()
 
 
 if __name__ == "__main__":

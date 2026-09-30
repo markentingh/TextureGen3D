@@ -31,6 +31,10 @@ MODELS = [
         "repo_id": "Qwen/Qwen-Image-2.1",
         "description": "Qwen-Image-2.1 unified T2I + image editing model (7B visual DiT)",
     },
+    {
+        "repo_id": "fal/AuraSR-v2",
+        "description": "AuraSR-v2 — 4x GAN super-resolution upscaler (upscale module)",
+    },
 ]
 
 
@@ -105,7 +109,7 @@ def main():
 
     # U2NET (rembg) — not a HF repo; the onnx weights download to ~/.u2net
     # on first session creation. Warm it up here so first use isn't a surprise.
-    print(f"[{len(MODELS) + 1}/{len(MODELS) + 1}] u2net (rembg background removal)")
+    print(f"[{len(MODELS) + 1}/{len(MODELS) + 2}] u2net (rembg background removal)")
     if check_only:
         u2net_dir = Path.home() / ".u2net"
         cached = u2net_dir.exists() and any(u2net_dir.iterdir())
@@ -117,6 +121,33 @@ def main():
             from rembg import new_session
             new_session("u2net")
             print("  Cached (session created successfully).")
+        except Exception as e:
+            print(f"  ERROR: {e}")
+            return 1
+    print()
+
+    # FBCNN (clean_image) — not a HF repo either; the color weights are a GitHub
+    # release asset that the module stores under ./model_zoo.
+    print(f"[{len(MODELS) + 2}/{len(MODELS) + 2}] fbcnn_color.pth (FBCNN artifact removal)")
+    fbcnn_path = Path(__file__).parent / "model_zoo" / "fbcnn_color.pth"
+    if check_only:
+        cached = fbcnn_path.exists()
+        print(f"  Status: {'cached at ' + str(fbcnn_path) if cached else 'NOT CACHED'}")
+        if not cached:
+            all_cached = False
+    else:
+        try:
+            if fbcnn_path.exists():
+                print(f"  Already cached at: {fbcnn_path}")
+            else:
+                import urllib.request
+                fbcnn_path.parent.mkdir(parents=True, exist_ok=True)
+                print("  Downloading (~281MB)...")
+                urllib.request.urlretrieve(
+                    "https://github.com/jiaxi-jiang/FBCNN/releases/download/v1.0/fbcnn_color.pth",
+                    fbcnn_path,
+                )
+                print(f"  Cached at: {fbcnn_path}")
         except Exception as e:
             print(f"  ERROR: {e}")
             return 1

@@ -18,7 +18,9 @@ const MODEL_TYPES = [
     { value: 1, label: 'Depth To Image' },
     { value: 2, label: 'Inpainting' },
     { value: 3, label: '6-Angle Image Model' },
-    { value: 4, label: 'Background Removal' }
+    { value: 4, label: 'Background Removal' },
+    { value: 5, label: 'Upscale' },
+    { value: 6, label: 'Clean Image' }
 ];
 
 // Gradio API-parameter role options, keyed by model Type. The dropdown for
@@ -28,7 +30,9 @@ const GRADIO_PARAM_OPTIONS = {
     1: ['Depth Map', 'Reference Image', 'Prompt', 'Seed', 'Resolution'],
     2: ['Reference Image', 'Mask Image', 'Prompt', 'Seed', 'Resolution'],
     3: ['Front Image', 'Left Image', 'Right Image', 'Back Image', 'Top Image', 'Bottom Image', 'Prompt', 'Seed', 'Resolution'],
-    4: ['Reference Image']
+    4: ['Reference Image'],
+    5: ['Reference Image'],
+    6: ['Reference Image']
 };
 const RESOLUTIONS = [
     { value: '1024x1024', label: '1024 x 1024' },
@@ -605,7 +609,7 @@ export default function ImageGenerationModal({ model, onClose, onSave }) {
                                                         name={`gradio-param-${param}`}
                                                         options={[
                                                             { value: '', label: '-- Select --' },
-                                                            ...(GRADIO_PARAM_OPTIONS[form.type] || GRADIO_PARAM_OPTIONS[0]).map((role) => ({
+                                                            ...(GRADIO_PARAM_OPTIONS[parseInt(form.type, 10)] || GRADIO_PARAM_OPTIONS[0]).map((role) => ({
                                                                 value: role,
                                                                 label: role
                                                             }))

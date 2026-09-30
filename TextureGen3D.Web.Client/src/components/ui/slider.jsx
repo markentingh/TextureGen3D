@@ -1,13 +1,15 @@
 import React from 'react';
 
-export default function Slider({ label, value, onChange, min = 0, max = 1, step = 0.01, className = '' }) {
+export default function Slider({ label, value, onChange, min = 0, max = 1, step = 0.01, className = '', small = false }) {
   const isInteger = step >= 1;
+  const labelCls = small ? 'text-[11px] font-medium text-gray-600 dark:text-gray-300' : 'text-sm font-medium text-gray-600 dark:text-gray-300';
+  const valueCls = small ? 'text-[11px] text-gray-500 dark:text-gray-400' : 'text-sm text-gray-500 dark:text-gray-400';
   return (
     <div className={className}>
       {label && (
         <div className="flex items-center justify-between mb-1">
-          <label className="text-sm font-medium text-gray-600 dark:text-gray-300">{label}</label>
-          <span className="text-sm text-gray-500 dark:text-gray-400">{isInteger ? Math.round(value) : Number(value).toFixed(2)}</span>
+          <label className={labelCls}>{label}</label>
+          <span className={valueCls}>{isInteger ? Math.round(value) : Number(value).toFixed(2)}</span>
         </div>
       )}
       <input

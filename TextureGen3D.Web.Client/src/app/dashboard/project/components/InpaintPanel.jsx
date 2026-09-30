@@ -74,6 +74,7 @@ export default function InpaintPanel({ showPanel, setShowPanel }) {
     prependMeshLayer,
     loadMeshLayers,
     refreshLayerTextures,
+    invalidateLayerAssets,
     generating,
     setGenerating,
     comfyProgress,
@@ -84,7 +85,7 @@ export default function InpaintPanel({ showPanel, setShowPanel }) {
     setMaskThumbVersions,
     setLayerAssetsGenerating,
   } = useProject();
-  const { generateViaHub, removeBackground } = useHubGeneration();
+  const { generateViaHub, removeBackground, cleanImage } = useHubGeneration();
   const [useDepthStep, setUseDepthStep] = useState(
     () => localStorage.getItem('inpaintUseDepthStep') !== '0'
   );
@@ -143,7 +144,7 @@ export default function InpaintPanel({ showPanel, setShowPanel }) {
         textureResolution
       );
       if (!inpRes.data?.success) throw new Error(inpRes.data?.message || 'Inpaint failed');
-      const inpaintedImage = inpRes.data.data?.image;
+      let inpaintedImage = inpRes.data.data?.image;
       if (!inpaintedImage) throw new Error('No image returned from inpaint');
 
       // 5 — same projection pipeline as the Generate Images panel: new layer,
@@ -151,7 +152,7 @@ export default function InpaintPanel({ showPanel, setShowPanel }) {
       setComfyProgress(60);
       setComfyMessage('Projecting onto new layer...');
       const layerNum = meshLayers.length + 1;
-      const layerRes = await layerApi.create(id, meshDbId, `Layer ${layerNum}`, cameraAngleJson, true, referenceIds[0] ?? null, true);
+      const layerRes = await layerApi.create(id, meshDbId, `Layer ${layerNum}`, cameraAngleJson, 2, referenceIds[0] ?? null);
       if (!layerRes.data?.success) throw new Error('Failed to create layer');
       const layer = layerRes.data.data;
       prependMeshLayer(meshDbId, layer);
@@ -171,6 +172,11 @@ export default function InpaintPanel({ showPanel, setShowPanel }) {
           console.warn('Failed to save layer angle thumbnail:', err);
         }
       }
+
+      // Clean pass — the inpaint result feeds the Depth to Image projection
+      // model next (or becomes the projection source directly when the depth
+      // step is off), so run it through the Clean Image (type-6) model first.
+      inpaintedImage = await cleanImage({ generatedImage: inpaintedImage, layer, meshDbId, cameraAngleJson });
 
       setComfyProgress(75);
       let generatedImage;
@@ -248,6 +254,7 @@ export default function InpaintPanel({ showPanel, setShowPanel }) {
         if (inpaintMaskDataUrl) {
           await layerApi.saveMasks(id, meshDbId, [{ layerId: layer.id, base64Mask: inpaintMaskDataUrl }]);
         }
+        invalidateLayerAssets(layer.id); // uvmap/mask were rewritten
 
         const updatedLayers = await loadMeshLayers(meshDbId);
         await refreshLayerTextures(updatedLayers);

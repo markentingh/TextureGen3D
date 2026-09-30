@@ -2,6 +2,8 @@ import React from 'react';
 import { useProject } from '@/context/project';
 import Icon from '@/components/ui/icon';
 import Slider from '@/components/ui/slider';
+import ColorPicker from '@/components/ui/ColorPicker';
+import CleanImageReview from './CleanImageReview';
 
 /**
  * MaskToolbar — tool toggle (pointer / mask brush) floating at the right edge
@@ -16,6 +18,7 @@ export default function MaskToolbar() {
     inpaintSign,
     setInpaintSign,
     ctrlHeld,
+    altHeld,
     brushSize,
     setBrushSize,
     brushHardness,
@@ -24,6 +27,14 @@ export default function MaskToolbar() {
     setBrushSpread,
     brushOpacity,
     setBrushOpacity,
+    blurStrength,
+    setBlurStrength,
+    brushColor,
+    setBrushColor,
+    brushPicker,
+    setBrushPicker,
+    maskMode,
+    setMaskMode,
     stampMode,
     setStampMode,
     stampInvertX,
@@ -38,7 +49,7 @@ export default function MaskToolbar() {
   // layers carry projected model output and are never valid stamp targets.
   const stampDisabled = selectedLayerIds.some((lid) => {
     const l = meshLayers.find((x) => x.id === lid);
-    return l && (l.inpaint || l.generated);
+    return l && (l.type === 1 || l.type === 2); // Generated / Inpainted
   });
 
   // If stamp is active when a generated/inpainted layer gets selected,
@@ -57,6 +68,18 @@ export default function MaskToolbar() {
   // Ctrl temporarily inverts which sign is active (and which button looks selected)
   const effectiveInpaintSign = ctrlHeld ? (inpaintSign === 'add' ? 'subtract' : 'add') : inpaintSign;
 
+  // Alt held while draw is selected acts as copy mode — buttons reflect it
+  const effectiveStampMode = altHeld && stampMode === 'draw' ? 'copy' : stampMode;
+
+  // Ctrl temporarily flips the mask tool's brush↔eraser (and which button
+  // looks selected) — same convention as the inpaint sign.
+  const effectiveMaskMode = ctrlHeld ? (maskMode === 'brush' ? 'eraser' : 'brush') : maskMode;
+
+  // Brush tool color picker — picker edits a local value until OK so Cancel
+  // doesn't leave a half-picked color in the brush.
+  const [showColorPicker, setShowColorPicker] = React.useState(false);
+  const [pickerColor, setPickerColor] = React.useState(brushColor);
+
   const inpaintToggleClass = (active) =>
     `w-5 h-5 rounded-full border-2 flex items-center justify-center transition ${
       active
@@ -66,8 +89,99 @@ export default function MaskToolbar() {
 
   return (
     <div className="absolute bottom-4 left-80 z-20 flex flex-col items-start gap-2 pl-3">
-      {(maskTool === 'brush' || maskTool === 'eraser' || maskTool === 'inpaint' || maskTool === 'stamp') && (
+      <CleanImageReview />
+      {(maskTool === 'brush' || maskTool === 'eraser' || maskTool === 'mask' || maskTool === 'inpaint' || maskTool === 'stamp' || maskTool === 'blur') && (
         <div className="w-56 rounded-xl bg-charcoal-700/85 backdrop-blur-sm border-2 border-gray-300/60 shadow-lg px-3 py-2 space-y-2">
+          <div className="flex items-center justify-between">
+            <div className="text-xs font-semibold text-gray-300 uppercase tracking-wide">
+              {maskTool.charAt(0).toUpperCase() + maskTool.slice(1)}
+            </div>
+            {/* Tool-specific controls sit at the right of the title row —
+                same toggles/circle that previously rendered in the button row */}
+            {maskTool === 'stamp' && (
+              <div className="flex gap-1 items-center">
+                <button
+                  onClick={() => setStampMode('copy')}
+                  className={inpaintToggleClass(effectiveStampMode === 'copy')}
+                  aria-label="Copy region"
+                  title="Copy region — click the mesh to set the stamp source point (hold Alt while drawing)"
+                >
+                  <Icon name="screenshot_region" className="!text-[14px] !leading-[14px]" />
+                </button>
+                <button
+                  onClick={() => setStampMode('draw')}
+                  className={inpaintToggleClass(effectiveStampMode === 'draw')}
+                  aria-label="Draw region"
+                  title="Draw region — stamp the copied region onto the selected layer"
+                >
+                  <Icon name="blur_medium" className="!text-[14px] !leading-[14px]" />
+                </button>
+              </div>
+            )}
+            {maskTool === 'inpaint' && (
+              <div className="flex gap-1 items-center">
+                <button
+                  onClick={() => setInpaintSign('add')}
+                  className={inpaintToggleClass(effectiveInpaintSign === 'add')}
+                  aria-label="Add to inpaint mask"
+                  title="Draw the inpaint mask"
+                >
+                  <Icon name="add" className="!text-[14px] !leading-[14px]" />
+                </button>
+                <button
+                  onClick={() => setInpaintSign('subtract')}
+                  className={inpaintToggleClass(effectiveInpaintSign === 'subtract')}
+                  aria-label="Remove from inpaint mask"
+                  title="Erase Inpaint mask"
+                >
+                  <Icon name="remove" className="!text-[14px] !leading-[14px]" />
+                </button>
+              </div>
+            )}
+            {maskTool === 'mask' && (
+              <div className="flex gap-1 items-center">
+                <button
+                  onClick={() => setMaskMode('brush')}
+                  className={inpaintToggleClass(effectiveMaskMode === 'brush')}
+                  aria-label="Mask brush"
+                  title="Mask brush — paint white onto the mask to reveal the layer (hold Ctrl to erase)"
+                >
+                  <Icon name="brush" className="!text-[14px] !leading-[14px]" />
+                </button>
+                <button
+                  onClick={() => setMaskMode('eraser')}
+                  className={inpaintToggleClass(effectiveMaskMode === 'eraser')}
+                  aria-label="Mask eraser"
+                  title="Mask eraser — paint black onto the mask to hide the layer (hold Ctrl to paint)"
+                >
+                  <Icon name="ink_eraser" className="!text-[14px] !leading-[14px]" />
+                </button>
+              </div>
+            )}
+            {maskTool === 'brush' && (
+              <div className="flex gap-1 items-center">
+                <button
+                  onClick={() => setBrushPicker(!brushPicker)}
+                  className={inpaintToggleClass(brushPicker || altHeld)}
+                  aria-label="Pick color from mesh"
+                  title="Pick color — hover the mesh to preview the uvmap color under the cursor, click to use it as the brush color (hold Alt for temporary use)"
+                >
+                  <Icon name="colorize" className="!text-[14px] !leading-[14px]" />
+                </button>
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setPickerColor(brushColor);
+                    setShowColorPicker(true);
+                  }}
+                  className="w-4 h-4 rounded-full border border-white/40 shrink-0"
+                  style={{ backgroundColor: brushColor }}
+                  aria-label="Brush color"
+                  title="Brush color"
+                />
+              </div>
+            )}
+          </div>
           <Slider
             label="Size"
             min={1}
@@ -75,6 +189,7 @@ export default function MaskToolbar() {
             step={1}
             value={brushSize}
             onChange={setBrushSize}
+            small
           />
           <Slider
             label="Hardness"
@@ -83,6 +198,7 @@ export default function MaskToolbar() {
             step={1}
             value={brushHardness}
             onChange={setBrushHardness}
+            small
           />
           <Slider
             label="Spread"
@@ -91,17 +207,31 @@ export default function MaskToolbar() {
             step={1}
             value={brushSpread}
             onChange={setBrushSpread}
+            small
           />
-          <Slider
-            label="Opacity"
-            min={1}
-            max={100}
-            step={1}
-            value={brushOpacity}
-            onChange={setBrushOpacity}
-          />
+          {maskTool === 'blur' ? (
+            <Slider
+              label="Strength"
+              min={1}
+              max={100}
+              step={1}
+              value={blurStrength}
+              onChange={setBlurStrength}
+              small
+            />
+          ) : (
+            <Slider
+              label="Opacity"
+              min={1}
+              max={100}
+              step={1}
+              value={brushOpacity}
+              onChange={setBrushOpacity}
+              small
+            />
+          )}
           {maskTool === 'stamp' && (
-            <>
+            <div className="flex items-center gap-3">
               <label className="flex items-center gap-2 text-xs text-gray-300">
                 <input
                   type="checkbox"
@@ -120,7 +250,7 @@ export default function MaskToolbar() {
                 />
                 Invert Y
               </label>
-            </>
+            </div>
           )}
         </div>
       )}
@@ -136,18 +266,34 @@ export default function MaskToolbar() {
         <button
           onClick={() => setMaskTool('brush')}
           className={buttonClass(maskTool === 'brush')}
-          aria-label="Mask brush tool"
-          title="Mask brush — paint white onto the selected layer's mask to reveal parts of it"
+          aria-label="Brush tool"
+          title="Brush — paint color onto the selected layer's texture"
         >
           <Icon name="brush" className="text-base" />
         </button>
         <button
           onClick={() => setMaskTool('eraser')}
           className={buttonClass(maskTool === 'eraser')}
-          aria-label="Mask eraser tool"
-          title="Mask eraser — paint black onto the selected layer's mask to hide parts of it"
+          aria-label="Eraser tool"
+          title="Eraser — erase texture pixels from the selected layer"
         >
           <Icon name="ink_eraser" className="text-base" />
+        </button>
+        <button
+          onClick={() => setMaskTool('mask')}
+          className={buttonClass(maskTool === 'mask')}
+          aria-label="Mask tool"
+          title="Mask — paint the selected layer's visibility mask (brush reveals, eraser hides)"
+        >
+          <Icon name="masked_transitions" className="text-base" />
+        </button>
+        <button
+          onClick={() => setMaskTool('blur')}
+          className={buttonClass(maskTool === 'blur')}
+          aria-label="Blur tool"
+          title="Blur — soften the selected layer's texture under the brush"
+        >
+          <Icon name="blur_on" className="text-base" />
         </button>
         <button
           onClick={() => setMaskTool('inpaint')}
@@ -168,47 +314,15 @@ export default function MaskToolbar() {
         >
           <Icon name="approval" className="text-base" />
         </button>
-        {maskTool === 'stamp' && (
-          <div className="flex gap-1 items-center">
-            <button
-              onClick={() => setStampMode('copy')}
-              className={inpaintToggleClass(stampMode === 'copy')}
-              aria-label="Copy region"
-              title="Copy region — click the mesh to set the stamp source point"
-            >
-              <Icon name="screenshot_region" className="!text-[14px] !leading-[14px]" />
-            </button>
-            <button
-              onClick={() => setStampMode('draw')}
-              className={inpaintToggleClass(stampMode === 'draw')}
-              aria-label="Draw region"
-              title="Draw region — stamp the copied region onto the selected layer"
-            >
-              <Icon name="blur_medium" className="!text-[14px] !leading-[14px]" />
-            </button>
-          </div>
-        )}
-        {maskTool === 'inpaint' && (
-          <div className="flex gap-1 items-center">
-            <button
-              onClick={() => setInpaintSign('add')}
-              className={inpaintToggleClass(effectiveInpaintSign === 'add')}
-              aria-label="Add to inpaint mask"
-              title="Draw the inpaint mask"
-            >
-              <Icon name="add" className="!text-[14px] !leading-[14px]" />
-            </button>
-            <button
-              onClick={() => setInpaintSign('subtract')}
-              className={inpaintToggleClass(effectiveInpaintSign === 'subtract')}
-              aria-label="Remove from inpaint mask"
-              title="Erase Inpaint mask"
-            >
-              <Icon name="remove" className="!text-[14px] !leading-[14px]" />
-            </button>
-          </div>
-        )}
       </div>
+      {showColorPicker && (
+        <ColorPicker
+          color={pickerColor}
+          onChange={(c) => setPickerColor(c.hex)}
+          onOk={(c) => setBrushColor(c.hex)}
+          onClose={() => setShowColorPicker(false)}
+        />
+      )}
     </div>
   );
 }

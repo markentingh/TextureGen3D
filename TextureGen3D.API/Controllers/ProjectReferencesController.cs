@@ -130,6 +130,7 @@ namespace TextureGen3D.API.Controllers
                     if (width > 1024)
                     {
                         fileBytes = await _imageService.ResizeImageAsync(fileBytes, 1024);
+                        extension = "png"; // ResizeImageAsync now outputs PNG
                         var resizedDims = await _imageService.GetImageDimensionsAsync(fileBytes);
                         if (resizedDims.HasValue)
                         {

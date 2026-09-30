@@ -77,8 +77,12 @@ namespace TextureGen3D.API.Hubs
                 // Build input images: depth map first, then active mesh references
                 var inputImages = new List<byte[]>();
 
-                // Read the depth map from storage (uploaded via API before connecting to hub)
-                var depthMapBytes = await _imageService.GetProjectMeshLayerDepthMapAsync(projectId, meshId, layerId);
+                // Read the depth map from storage (uploaded via API before connecting to hub).
+                // Type 0 (Image Generation) / Type 4 (Background Removal) /
+                // Type 6 (Clean Image) models take no depth map.
+                var depthMapBytes = imageModel.Type == 0 || imageModel.Type == 4 || imageModel.Type == 6
+                    ? null
+                    : await _imageService.GetProjectMeshLayerDepthMapAsync(projectId, meshId, layerId);
                 if (depthMapBytes != null && depthMapBytes.Length > 0)
                     inputImages.Add(depthMapBytes);
 

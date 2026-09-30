@@ -108,9 +108,10 @@ namespace TextureGen3D.API.Services
 
             Console.WriteLine($"[Gradio] Parameter mapping: DepthMapPath='{imageModel.DepthMapPath}', InputImagesPath='{imageModel.InputImagesPath}', PromptPath='{imageModel.PromptPath}'");
 
-            if (imageModel.Type == 4 || imageModel.Type == 2)
+            if (imageModel.Type == 0 || imageModel.Type == 4 || imageModel.Type == 2 || imageModel.Type == 5 || imageModel.Type == 6)
             {
-                // Background Removal (4) / Inpainting (2) — the first input
+                // Image Generation (0) / Background Removal (4) / Inpainting (2) /
+                // Upscale (5) / Clean Image (6) — the first input
                 // image (inputImages[0], uploaded above into depthMapPath)
                 // maps to the 'Reference Image' role param; inpainting also
                 // maps the alpha-masked composite to the 'Mask Image' role

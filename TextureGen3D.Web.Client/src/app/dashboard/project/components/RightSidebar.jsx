@@ -208,6 +208,7 @@ export default function RightSidebar() {
     meshDbIds,
     setMeshDbIds,
     meshLayers,
+    meshLayersRef,
     setMeshLayers,
     allMeshLayers,
     setAllMeshLayers,
@@ -253,10 +254,19 @@ export default function RightSidebar() {
     loadMeshLayers,
     removeMeshLayer,
     refreshLayerTextures,
+    invalidateLayerAssets,
     formatTriangleCount,
     maskTool,
     setMaskTool,
+    settingsCollapsed,
+    setSettingsCollapsed,
     setInpaintMaskVisible,
+    getOrCreateLayerMask,
+    markMaskModified,
+    scheduleMaskSave,
+    saveModifiedMasks,
+    cancelMaskSaveTimer,
+    setCleanImageReview,
   } = useProject();
   const { showModal, hideModal } = useModal();
   const { generateViaHub, removeBackground } = useHubGeneration();
@@ -277,12 +287,16 @@ export default function RightSidebar() {
   const reuploadModelIdRef = useRef(null);
   const [projectionMode, setProjectionMode] = useState('orthographic');
   const [downloadingUvmap, setDownloadingUvmap] = useState(false);
+  const [flattening, setFlattening] = useState(false);
   const [addingLayer, setAddingLayer] = useState(false);
   const [layersMenuOpen, setLayersMenuOpen] = useState(false);
   const [layersMenuPos, setLayersMenuPos] = useState({ top: 0, right: 0 });
   const [reprojectingAll, setReprojectingAll] = useState(false);
   const [removingBgLayerId, setRemovingBgLayerId] = useState(null);
+  const [cleaningLayerId, setCleaningLayerId] = useState(null);
   const [mirroringLayerId, setMirroringLayerId] = useState(null);
+  // Project Settings accordion collapse state lives in context — persisted
+  // to ui:{projectId} localStorage (settingsCollapsed key).
 
   // ── formatFileSize ──
   const formatFileSize = (bytes) => {
@@ -629,7 +643,7 @@ export default function RightSidebar() {
         meshDbId,
         `Layer ${meshLayers.length + 1}`,
         JSON.stringify(viewerRef.current?.getCameraAngle?.() || {}),
-        false,
+        0,
         null
       );
       if (!res.data?.success) throw new Error('Failed to create layer');
@@ -647,24 +661,21 @@ export default function RightSidebar() {
     }
   };
 
-  // Download the combined uvmap.png — every visible layer's uvmap with its
-  // mask applied to the alpha channel, flattened via the same compositor the
-  // shader path uses.
-  const handleDownloadUvmap = async () => {
-    if (!selectedMesh || downloadingUvmap || !viewerRef.current) return;
+  // Fetch uvmap + mask data for every visible layer, ordered top→bottom.
+  // The mask comes from the live render target first (covers unsaved
+  // strokes), falling back to the saved mask.png. Callers must revoke each
+  // item.url when done.
+  const gatherVisibleLayerItems = async () => {
     const meshDbId = meshDbIds[selectedMesh.key];
-    if (!meshDbId) return;
-    setDownloadingUvmap(true);
+    const headers = token ? { Authorization: `Bearer ${token}` } : {};
     const items = [];
-    try {
-      const headers = token ? { Authorization: `Bearer ${token}` } : {};
-      for (const layer of meshLayers.filter((l) => l.visible !== false)) {
+    for (const layer of meshLayers.filter((l) => l.visible !== false)) {
+      try {
         const res = await fetch(layerApi.uvmapUrl(id, meshDbId, layer.id), { headers });
         if (!res.ok) continue;
         const blob = await res.blob();
         if (!blob.size) continue;
 
-        // Live mask RT first (covers unsaved strokes), else saved mask.png
         let maskDataUrl = null;
         const entry = layerMasksRef.current?.get(layer.id);
         if (entry?.initialized) {
@@ -693,8 +704,24 @@ export default function RightSidebar() {
           }
         }
         items.push({ url: URL.createObjectURL(blob), maskDataUrl });
+      } catch {
+        /* skip layers whose uvmap fails to load */
       }
+    }
+    return items;
+  };
 
+  // Download the combined uvmap.png — every visible layer's uvmap with its
+  // mask applied to the alpha channel, flattened via the same compositor the
+  // shader path uses.
+  const handleDownloadUvmap = async () => {
+    if (!selectedMesh || downloadingUvmap || !viewerRef.current) return;
+    const meshDbId = meshDbIds[selectedMesh.key];
+    if (!meshDbId) return;
+    setDownloadingUvmap(true);
+    const items = [];
+    try {
+      items.push(...await gatherVisibleLayerItems());
       const canvas = await viewerRef.current.compositeLayersToCanvas?.(items);
       if (!canvas) return;
       const pngBlob = await new Promise((res) => canvas.toBlob(res, 'image/png'));
@@ -710,6 +737,51 @@ export default function RightSidebar() {
     } finally {
       items.forEach((it) => URL.revokeObjectURL(it.url));
       setDownloadingUvmap(false);
+    }
+  };
+
+  // Flatten every visible layer (masks applied) into a new "Combined Layers"
+  // layer at the top of the stack. Uses the same CPU compositor as the
+  // download path so the result matches the on-mesh render exactly.
+  const handleFlattenLayers = async () => {
+    if (!selectedMesh || flattening || !viewerRef.current) return;
+    const meshDbId = meshDbIds[selectedMesh.key];
+    if (!meshDbId) return;
+    setFlattening(true);
+    const items = [];
+    try {
+      items.push(...await gatherVisibleLayerItems());
+      const canvas = await viewerRef.current.compositeLayersToCanvas?.(items);
+      if (!canvas) return;
+      const dataUrl = canvas.toDataURL('image/png');
+
+      // No camera angle, no reference — the flattened uvmap is authoritative.
+      const res = await layerApi.create(id, meshDbId, 'Combined Layers', null, 3, null);
+      if (!res.data?.success) throw new Error(res.data?.message || 'Failed to create flattened layer');
+      const newLayer = res.data.data;
+      await layerApi.saveUvMap(id, newLayer.id, meshDbId, dataUrl);
+
+      // Solid white mask — hasMask disables the near-black cull, which is
+      // what we want: the flattened composite defines visibility on its own.
+      const mc = document.createElement('canvas');
+      mc.width = textureResolution;
+      mc.height = textureResolution;
+      const mctx = mc.getContext('2d');
+      mctx.fillStyle = '#fff';
+      mctx.fillRect(0, 0, mc.width, mc.height);
+      await layerApi.saveMasks(id, meshDbId, [{ layerId: newLayer.id, base64Mask: mc.toDataURL('image/png') }]);
+
+      const newList = [newLayer, ...meshLayers];
+      setMeshLayers(newList);
+      syncAllMeshLayers(newList);
+      await layerApi.reorder(id, meshDbId, newList.map((l) => l.id));
+      setSelectedLayerId(newLayer.id);
+      await refreshLayerTextures(newList);
+    } catch (err) {
+      console.error('Failed to flatten layers:', err);
+    } finally {
+      items.forEach((it) => URL.revokeObjectURL(it.url));
+      setFlattening(false);
     }
   };
 
@@ -752,12 +824,20 @@ export default function RightSidebar() {
     syncAllMeshLayers(updatedLayers);
     try {
       await refreshLayerTextures(updatedLayers);
-      await layerApi.toggleVisible(id, layer.id, newVisible);
     } catch (err) {
-      console.error('Failed to toggle layer visibility:', err);
-      setMeshLayers(meshLayers);
-      syncAllMeshLayers(meshLayers);
+      console.error('Failed to refresh layer textures:', err);
     }
+    // Fire-and-forget — the toggle is already reflected in state and the
+    // shader has been rebuilt; only revert this layer if the call fails.
+    layerApi.toggleVisible(id, layer.id, newVisible).catch(async (err) => {
+      console.error('Failed to toggle layer visibility:', err);
+      const reverted = meshLayersRef.current.map((l) =>
+        l.id === layer.id ? { ...l, visible: layer.visible } : l
+      );
+      setMeshLayers(reverted);
+      syncAllMeshLayers(reverted);
+      await refreshLayerTextures(reverted);
+    });
   };
 
   const handleDeleteLayer = async (layer) => {
@@ -772,6 +852,79 @@ export default function RightSidebar() {
     } catch (err) {
       console.error('Failed to delete layer:', err);
       await loadMeshLayers(meshDbId);
+    }
+  };
+
+  // Duplicate a layer — copies uvmap.png and mask.png into a new record
+  // inserted directly above the source. Reads the live paint/mask render
+  // targets when loaded so in-flight (not yet debounce-saved) strokes are
+  // included; falls back to the saved files otherwise.
+  const handleDuplicateLayer = async (layer) => {
+    if (!layer || !selectedMesh) return;
+    const meshDbId = meshDbIds[selectedMesh.key];
+    if (!meshDbId) return;
+    try {
+      // Source uvmap — the live stamp/paint RT is authoritative when it
+      // exists (carries unsaved brush/stamp/blur edits); else the file.
+      let uvmapDataUrl = viewerRef.current?.getStampCanvasDataUrl?.(layer.id);
+      if (!uvmapDataUrl) {
+        const uvmapRes = await fetch(layerApi.uvmapUrl(id, meshDbId, layer.id), {
+          headers: token ? { Authorization: `Bearer ${token}` } : {},
+        });
+        if (uvmapRes.ok) uvmapDataUrl = await blobToDataUrl(await uvmapRes.blob());
+      }
+
+      // Source mask — live RT readback when the mask is loaded, else the
+      // saved mask.png. No mask → the duplicate stays fully visible.
+      let maskDataUrl = null;
+      const maskEntry = layerMasksRef.current.get(layer.id);
+      if (maskEntry) {
+        try { maskDataUrl = viewerRef.current?.maskToDataURL?.(maskEntry) || null; }
+        catch { /* fall through to the saved file */ }
+      }
+      if (!maskDataUrl) {
+        const maskRes = await fetch(layerApi.maskUrl(id, meshDbId, layer.id), {
+          headers: token ? { Authorization: `Bearer ${token}` } : {},
+        });
+        if (maskRes.ok) maskDataUrl = await blobToDataUrl(await maskRes.blob());
+      }
+
+      const createRes = await layerApi.create(
+        id, meshDbId, `${layer.name} Copy`, layer.cameraAngle ?? null, layer.type ?? 0, layer.referenceId ?? null
+      );
+      if (!createRes.data?.success) throw new Error(createRes.data?.message || 'Failed to create layer');
+      const newLayer = createRes.data.data;
+
+      // Best-effort copies of the optional per-layer files — image.png keeps
+      // Reproject/Reference Image working on the copy; the angle thumb is
+      // identical since the camera angle is shared.
+      try {
+        const imgRes = await fetch(layerApi.imageUrl(id, meshDbId, layer.id), {
+          headers: token ? { Authorization: `Bearer ${token}` } : {},
+        });
+        if (imgRes.ok) await layerApi.saveImage(id, newLayer.id, meshDbId, await blobToDataUrl(await imgRes.blob()));
+      } catch { /* source has no image.png */ }
+      try {
+        const thumbRes = await fetch(layerApi.angleThumbUrl(id, meshDbId, layer.id), {
+          headers: token ? { Authorization: `Bearer ${token}` } : {},
+        });
+        if (thumbRes.ok) await layerApi.saveAngleThumb(id, newLayer.id, meshDbId, await blobToDataUrl(await thumbRes.blob()));
+      } catch { /* source has no angle thumb */ }
+
+      if (uvmapDataUrl) await layerApi.saveUvMap(id, newLayer.id, meshDbId, uvmapDataUrl);
+      if (maskDataUrl) await layerApi.saveMasks(id, meshDbId, [{ layerId: newLayer.id, base64Mask: maskDataUrl }]);
+
+      const insertAt = Math.max(0, meshLayers.findIndex((l) => l.id === layer.id));
+      const newList = [...meshLayers.slice(0, insertAt), newLayer, ...meshLayers.slice(insertAt)];
+      setMeshLayers(newList);
+      syncAllMeshLayers(newList);
+      await layerApi.reorder(id, meshDbId, newList.map((l) => l.id));
+      setSelectedLayerId(newLayer.id);
+      setLayerThumbVersion((v) => v + 1);
+      setMaskThumbVersions((prev) => ({ ...prev, [newLayer.id]: (prev[newLayer.id] || 0) + 1 }));
+      await refreshLayerTextures(newList);
+    } catch (err) {
+      console.error('Failed to duplicate layer:', err);
     }
   };
 
@@ -809,9 +962,10 @@ export default function RightSidebar() {
     if (!projected?.uvMap) throw new Error('Failed to generate UV map');
 
     await layerApi.saveUvMap(id, layer.id, meshDbId, projected.uvMap);
+    invalidateLayerAssets(layer.id); // server rewrote uvmap.png (+ mask below)
     // Reprojection changes the coverage footprint — refresh the mask, but
     // never overwrite an inpaint layer's painted mask.
-    if (projected.mask && !layer.inpaint) {
+    if (projected.mask && layer.type !== 2) {
       await layerApi.saveMasks(id, meshDbId, [{ layerId: layer.id, base64Mask: projected.mask }]);
       setMaskThumbVersions((prev) => ({ ...prev, [layer.id]: (prev[layer.id] || 0) + 1 }));
     }
@@ -886,6 +1040,69 @@ export default function RightSidebar() {
     }
   };
 
+  // Wipe the layer's mask back to pure white (fully visible). No-op for
+  // layers that never had a mask — creating+whiting one would flip the
+  // shader's hasMask flag and disable the near-black cull it relies on.
+  const handleEraseMask = async (layer) => {
+    if (!layer) return;
+    const entry = layerMasksRef.current.get(layer.id);
+    if (!entry) return;
+    viewerRef.current?.clearLayerMask?.(entry);
+    markMaskModified(layer.id);
+    // Post immediately rather than waiting for the 5s debounce — cancel any
+    // pending timer first so it doesn't fire a redundant save.
+    cancelMaskSaveTimer();
+    await saveModifiedMasks();
+    await refreshLayerTextures();
+  };
+
+  // Inpaint mode only — wipe the layer's mask and copy the current inpaint
+  // selection into it (white = painted region stays visible).
+  const handleMaskFromSelection = async (layer) => {
+    if (!layer) return;
+    const dataUrl = viewerRef.current?.inpaintMaskToDataURL?.();
+    if (!dataUrl) return;
+    try {
+      const blob = await (await fetch(dataUrl)).blob();
+      // maskToDataURL returns PNG orientation — flipY puts it back in UV space
+      const bitmap = await createImageBitmap(blob, { imageOrientation: 'flipY' });
+      const entry = getOrCreateLayerMask(layer.id);
+      viewerRef.current?.uploadMaskImage?.(entry, bitmap);
+      bitmap.close();
+      markMaskModified(layer.id);
+      scheduleMaskSave();
+      await refreshLayerTextures();
+    } catch (err) {
+      console.error('Failed to apply inpaint mask to layer:', err);
+    }
+  };
+
+  // Run the layer's uvmap.png through the configured Clean Image (type-6)
+  // model — the server runs FBCNN artifact removal and overwrites uvmap.png
+  // at the same resolution. The stamp render target is dropped so the next
+  // dab re-seeds from the cleaned image.
+  const handleCleanImage = async (layer) => {
+    if (!layer || !selectedMesh || cleaningLayerId) return;
+    const meshDbId = meshDbIds[selectedMesh.key];
+    if (!meshDbId) return;
+    setCleaningLayerId(layer.id);
+    try {
+      const res = await layerApi.cleanImage(id, layer.id, meshDbId);
+      if (!res.data?.success) throw new Error(res.data?.message || 'Clean image failed');
+      viewerRef.current?.invalidateStampCanvas?.(layer.id);
+      invalidateLayerAssets(layer.id); // server overwrote uvmap.png
+      setLayerThumbVersion((v) => v + 1); // reload uvmap-thumb <img>
+      await refreshLayerTextures();
+      // Show the Accept/Revert review card above the tools — the server kept
+      // the pre-clean uvmap as uvmap_old.png so Revert can restore it.
+      setCleanImageReview({ layerId: layer.id, meshDbId });
+    } catch (err) {
+      console.error('Clean image failed:', err);
+    } finally {
+      setCleaningLayerId(null);
+    }
+  };
+
   // Run the layer's existing image through the active Background Removal
   // (type-4) model, save it back as the layer image, then reproject so the
   // removed background shows through to the checkerboard on the mesh.
@@ -928,7 +1145,10 @@ export default function RightSidebar() {
         rotation,
         textureResolution
       );
-      if (projected?.uvMap) await layerApi.saveUvMap(id, layer.id, meshDbId, projected.uvMap);
+      if (projected?.uvMap) {
+        await layerApi.saveUvMap(id, layer.id, meshDbId, projected.uvMap);
+        invalidateLayerAssets(layer.id);
+      }
 
       const updatedLayers = await loadMeshLayers(meshDbId);
       await refreshLayerTextures(updatedLayers);
@@ -1118,7 +1338,7 @@ export default function RightSidebar() {
       }
 
       // 3 — create "<name> Mirrored" and insert it directly above the source
-      const layerRes = await layerApi.create(id, meshDbId, `${layer.name} Mirrored`, mirroredJson, false, layer.referenceId ?? null, true);
+      const layerRes = await layerApi.create(id, meshDbId, `${layer.name} Mirrored`, mirroredJson, 1, layer.referenceId ?? null);
       if (!layerRes.data?.success) throw new Error('Failed to create layer');
       newLayer = layerRes.data.data;
       const insertAt = Math.max(0, meshLayers.findIndex((l) => l.id === layer.id));
@@ -1464,7 +1684,8 @@ export default function RightSidebar() {
                       />
                     )}
                     <li
-                      draggable
+                      data-layer-id={layer.id}
+                      draggable={editingLayerId !== layer.id}
                       onDragStart={(e) => handleLayerDragStart(e, index)}
                       onDragEnd={endLayerDrag}
                       onDragOver={(e) => handleLayerDragOver(e, index)}
@@ -1497,8 +1718,8 @@ export default function RightSidebar() {
                         <div className="min-w-0 flex-1 flex flex-col">
                           {/* Row 1: eye toggle + name + edit + 3-dots */}
                           <div className="flex items-center gap-1">
-                            {removingBgLayerId === layer.id || mirroringLayerId === layer.id ? (
-                              <span className="flex-shrink-0 translate-y-1 pr-1" title={mirroringLayerId === layer.id ? 'Generating projection...' : 'Removing background...'}>
+                            {removingBgLayerId === layer.id || mirroringLayerId === layer.id || cleaningLayerId === layer.id ? (
+                              <span className="flex-shrink-0 translate-y-1 pr-1" title={mirroringLayerId === layer.id ? 'Generating projection...' : cleaningLayerId === layer.id ? 'Cleaning image...' : 'Removing background...'}>
                                 <Spinner className="text-2xl" />
                               </span>
                             ) : (
@@ -1534,13 +1755,17 @@ export default function RightSidebar() {
                               )}
                             </div>
 
-                            {layer.inpaint ? (
+                            {layer.type === 2 ? (
                               <span className="flex-shrink-0 pr-2 text-green-600 dark:text-green-500 text-[10px] font-bold">
                                 Inpainted
                               </span>
-                            ) : layer.generated ? (
+                            ) : layer.type === 1 ? (
                               <span className="flex-shrink-0 pr-2 text-purple-600 dark:text-purple-400 text-[10px] font-bold">
                                 Generated
+                              </span>
+                            ) : layer.type === 3 ? (
+                              <span className="flex-shrink-0 pr-2 text-blue-600 dark:text-blue-400 text-[10px] font-bold">
+                                Flattened
                               </span>
                             ) : null}
 
@@ -1723,6 +1948,26 @@ export default function RightSidebar() {
 
       {/* Pinned to the bottom of the sidebar */}
       <div className="flex-shrink-0 overflow-y-auto max-h-[60%] border-t border-gray-200 dark:border-gray-700">
+        {/* Project Settings accordion title — matches the Generate Images
+            panel header; collapsing leaves just this bar at the bottom */}
+        <div className={`flex items-center justify-between p-3 ${settingsCollapsed ? '' : 'border-b border-gray-200 dark:border-gray-700'}`}>
+          <h3 className="text-sm font-semibold text-gray-800 dark:text-gray-200">Project Settings</h3>
+          <button
+            onClick={() => setSettingsCollapsed((v) => !v)}
+            className="p-1 rounded hover:bg-gray-100 dark:hover:bg-gray-700 text-gray-500 dark:text-gray-400"
+            aria-label={settingsCollapsed ? 'Expand project settings' : 'Collapse project settings'}
+          >
+            <svg
+              className={`w-4 h-4 transition-transform ${settingsCollapsed ? 'rotate-180' : ''}`}
+              fill="none" stroke="currentColor" viewBox="0 0 24 24"
+            >
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+            </svg>
+          </button>
+        </div>
+
+        {!settingsCollapsed && (
+        <>
         {/* Texture Resolution section */}
         <div className="p-3 border-b border-gray-200 dark:border-gray-700">
           <h3 className="text-sm font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-400 mb-2">Texture Resolution</h3>
@@ -1877,6 +2122,8 @@ export default function RightSidebar() {
             </div>
           )}
         </div>
+        </>
+        )}
       </div>
 
       {/* Fixed-position layers-header dropdown menu (escapes overflow containers) */}
@@ -1896,6 +2143,14 @@ export default function RightSidebar() {
             >
               <Icon name="photo_auto_merge" className="text-sm" />
               Stitch All Layers
+            </button>
+            <button
+              onClick={() => { setLayersMenuOpen(false); handleFlattenLayers(); }}
+              disabled={flattening}
+              className="w-full text-left px-3 py-1.5 text-sm text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 disabled:opacity-50 disabled:cursor-not-allowed transition flex items-center gap-2"
+            >
+              <Icon name="layers" className="text-sm" />
+              {flattening ? 'Flattening…' : 'Flatten All To New Layer'}
             </button>
             <button
               onClick={() => { setLayersMenuOpen(false); handleReprojectAllLayers(); }}
@@ -1948,6 +2203,37 @@ export default function RightSidebar() {
               <Icon name="flip" className="text-sm" />
               Mirror To New Layer
             </button>
+            <button
+              onClick={() => { const lid = layerMenuOpenId; setLayerMenuOpenId(null); const layer = meshLayers.find((l) => l.id === lid); if (layer) handleDuplicateLayer(layer); }}
+              className="w-full text-left px-3 py-1.5 text-sm text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 transition flex items-center gap-2"
+            >
+              <Icon name="content_copy" className="text-sm" />
+              Duplicate Layer
+            </button>
+            <button
+              onClick={() => { const lid = layerMenuOpenId; setLayerMenuOpenId(null); const layer = meshLayers.find((l) => l.id === lid); if (layer) handleCleanImage(layer); }}
+              disabled={cleaningLayerId === layerMenuOpenId}
+              className="w-full text-left px-3 py-1.5 text-sm text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 transition flex items-center gap-2 disabled:opacity-50"
+            >
+              <Icon name="auto_fix_high" className="text-sm" />
+              {cleaningLayerId === layerMenuOpenId ? 'Cleaning…' : 'Clean Image'}
+            </button>
+            <button
+              onClick={() => { const lid = layerMenuOpenId; setLayerMenuOpenId(null); const layer = meshLayers.find((l) => l.id === lid); if (layer) handleEraseMask(layer); }}
+              className="w-full text-left px-3 py-1.5 text-sm text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 transition flex items-center gap-2"
+            >
+              <Icon name="ink_eraser" className="text-sm" />
+              Erase Mask
+            </button>
+            {maskTool === 'inpaint' && (
+              <button
+                onClick={() => { const lid = layerMenuOpenId; setLayerMenuOpenId(null); const layer = meshLayers.find((l) => l.id === lid); if (layer) handleMaskFromSelection(layer); }}
+                className="w-full text-left px-3 py-1.5 text-sm text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 transition flex items-center gap-2"
+              >
+                <Icon name="select_all" className="text-sm" />
+                Mask From Selection
+              </button>
+            )}
             <button
               onClick={() => { const lid = layerMenuOpenId; setLayerMenuOpenId(null); const layer = meshLayers.find((l) => l.id === lid); if (layer) handleDeleteLayerClick(layer); }}
               className="w-full text-left px-3 py-1.5 text-sm text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/20 transition flex items-center gap-2"

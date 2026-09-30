@@ -54,6 +54,13 @@ if errorlevel 1 (
 ) else (
     echo   Installed: opencv-python
 )
+python -c "import aura_sr" >nul 2>&1
+if errorlevel 1 (
+    echo   Missing: aura-sr
+    set "MISSING_PKGS=!MISSING_PKGS! aura-sr"
+) else (
+    echo   Installed: aura-sr
+)
 python -c "import transformers; from packaging.version import Version; assert Version(transformers.__version__) >= Version('5.17')" >nul 2>&1
 if errorlevel 1 (
     echo   Missing/outdated: transformers^>=5.17
@@ -189,6 +196,13 @@ if errorlevel 1 (
     set "MISSING_PKGS=!MISSING_PKGS! opencv-python"
 ) else (
     echo   Installed: opencv-python
+)
+venv\Scripts\python.exe -c "import aura_sr" >nul 2>&1
+if errorlevel 1 (
+    echo   Missing: aura-sr
+    set "MISSING_PKGS=!MISSING_PKGS! aura-sr"
+) else (
+    echo   Installed: aura-sr
 )
 venv\Scripts\python.exe -c "import transformers; from packaging.version import Version; assert Version(transformers.__version__) >= Version('5.17')" >nul 2>&1
 if errorlevel 1 (

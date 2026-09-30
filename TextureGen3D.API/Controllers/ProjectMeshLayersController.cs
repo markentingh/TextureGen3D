@@ -75,8 +75,8 @@ namespace TextureGen3D.API.Controllers
             public Guid MeshId { get; set; }
             public string Name { get; set; } = "";
             public string? CameraAngle { get; set; }
-            public bool Inpaint { get; set; }
-            public bool Generated { get; set; }
+            // 0 = plain, 1 = Generated, 2 = Inpainted, 3 = Flattened
+            public int Type { get; set; }
             public Guid? ReferenceId { get; set; }
         }
 
@@ -101,8 +101,7 @@ namespace TextureGen3D.API.Controllers
                     Name = request.Name,
                     Index = nextIndex,
                     CameraAngle = request.CameraAngle ?? "",
-                    Inpaint = request.Inpaint,
-                    Generated = request.Generated,
+                    Type = request.Type,
                     ReferenceId = request.ReferenceId,
                 };
                 var created = await _layerRepo.CreateAsync(layer);
@@ -455,6 +454,116 @@ namespace TextureGen3D.API.Controllers
             }
         }
 
+        public class CleanImageRequest
+        {
+            public Guid MeshId { get; set; }
+        }
+
+        /// <summary>
+        /// "Clean" a layer's uvmap.png: run it through the active Clean Image
+        /// (Type=6) Gradio model — FBCNN artifact removal — and overwrite
+        /// uvmap.png in place. The result is an AI denoise/artifact-removal
+        /// pass at the same size.
+        /// </summary>
+        [HttpPost("{projectId}/{layerId}/clean-image")]
+        public async Task<IActionResult> CleanImage(Guid projectId, Guid layerId, [FromBody] CleanImageRequest request)
+        {
+            try
+            {
+                var userId = GetUserId();
+                if (userId == Guid.Empty)
+                    return Json(new ApiResponse { success = false, message = "Could not find user" });
+
+                var project = await _projectRepo.GetByIdAsync(projectId, userId);
+                if (project == null)
+                    return Json(new ApiResponse { success = false, message = "Project not found" });
+
+                var uvmapBytes = await _imageService.GetProjectMeshLayerUvMapAsync(projectId, request.MeshId, layerId);
+                if (uvmapBytes == null || uvmapBytes.Length == 0)
+                    return Json(new ApiResponse { success = false, message = "Layer has no uvmap to clean" });
+
+                // The configured Clean Image model (Type 6) — must be a Gradio model
+                var models = await _imageGenModelRepo.GetAllAsync();
+                var imageModel = models.FirstOrDefault(m => m.Type == 6 && m.Active);
+                if (imageModel == null)
+                    return Json(new ApiResponse { success = false, message = "No active Clean Image model configured" });
+
+                var genService = _allImageGenerations.FirstOrDefault(g => g.ModelKey == imageModel.ModelKey);
+                if (genService is not ImageGenerationForGradio gradioService)
+                    return Json(new ApiResponse { success = false, message = "The Clean Image model must be a Gradio model" });
+
+                // Keep the original size — FBCNN returns same-size output, but
+                // normalize dimensions in case the endpoint resizes.
+                var dims = await _imageService.GetImageDimensionsAsync(uvmapBytes);
+                if (!dims.HasValue)
+                    return Json(new ApiResponse { success = false, message = "Could not read uvmap dimensions" });
+
+                var result = await gradioService.GenerateWithProgressAsync(
+                    new ImageGenerationRequest
+                    {
+                        Model = imageModel.Model,
+                        Width = dims.Value.width,
+                        Height = dims.Value.height,
+                        InputImages = new List<byte[]> { uvmapBytes },
+                    },
+                    imageModel);
+                if (result.ImageBytes == null || result.ImageBytes.Length == 0)
+                    return Json(new ApiResponse { success = false, message = "Clean Image returned no image" });
+
+                // Keep the pre-clean uvmap as uvmap_old.png so the user can
+                // revert from the "cleaned image results" review prompt.
+                await _imageService.SaveProjectMeshLayerFileAsync(projectId, request.MeshId, layerId, "uvmap_old.png", uvmapBytes);
+
+                // Normalize to the original texture resolution, then
+                // overwrite uvmap.png + regenerate its thumbnail.
+                var cleanedBytes = await _imageService.ResizeImageExactAsync(
+                    result.ImageBytes, dims.Value.width, dims.Value.height);
+                await _imageService.SaveProjectMeshLayerUvMapAsync(projectId, request.MeshId, layerId, cleanedBytes);
+                var uvThumbBytes = await _imageService.GenerateThumbnailAsync(cleanedBytes, 100, preserveTransparency: true);
+                await _imageService.SaveProjectMeshLayerUvMapThumbAsync(projectId, request.MeshId, layerId, uvThumbBytes);
+
+                return Json(new ApiResponse { success = true });
+            }
+            catch (Exception ex)
+            {
+                return Json(new ApiResponse { success = false, message = ex.Message });
+            }
+        }
+
+        /// <summary>
+        /// Revert a Clean Image result: restore uvmap.png from the
+        /// uvmap_old.png backup saved by clean-image, then delete the backup.
+        /// </summary>
+        [HttpPost("{projectId}/{layerId}/revert-image")]
+        public async Task<IActionResult> RevertImage(Guid projectId, Guid layerId, [FromBody] CleanImageRequest request)
+        {
+            try
+            {
+                var userId = GetUserId();
+                if (userId == Guid.Empty)
+                    return Json(new ApiResponse { success = false, message = "Could not find user" });
+
+                var project = await _projectRepo.GetByIdAsync(projectId, userId);
+                if (project == null)
+                    return Json(new ApiResponse { success = false, message = "Project not found" });
+
+                var oldBytes = await _imageService.GetProjectMeshLayerFileAsync(projectId, request.MeshId, layerId, "uvmap_old.png");
+                if (oldBytes == null || oldBytes.Length == 0)
+                    return Json(new ApiResponse { success = false, message = "No backup image found to revert to" });
+
+                await _imageService.SaveProjectMeshLayerUvMapAsync(projectId, request.MeshId, layerId, oldBytes);
+                var uvThumbBytes = await _imageService.GenerateThumbnailAsync(oldBytes, 100, preserveTransparency: true);
+                await _imageService.SaveProjectMeshLayerUvMapThumbAsync(projectId, request.MeshId, layerId, uvThumbBytes);
+                await _imageService.DeleteProjectMeshLayerFileAsync(projectId, request.MeshId, layerId, "uvmap_old.png");
+
+                return Json(new ApiResponse { success = true });
+            }
+            catch (Exception ex)
+            {
+                return Json(new ApiResponse { success = false, message = ex.Message });
+            }
+        }
+
         public class SaveMaskItem
         {
             public Guid LayerId { get; set; }
@@ -587,8 +696,8 @@ namespace TextureGen3D.API.Controllers
                     : request.DepthMap;
                 var depthMapBytes = Convert.FromBase64String(base64);
 
-                var depthJpeg = await _imageService.ConvertToHighQualityJpegAsync(depthMapBytes);
-                await _imageService.SaveProjectMeshLayerDepthMapAsync(projectId, request.MeshId, layerId, depthJpeg);
+                var depthPng = await _imageService.ConvertToLosslessPngAsync(depthMapBytes);
+                await _imageService.SaveProjectMeshLayerDepthMapAsync(projectId, request.MeshId, layerId, depthPng);
 
                 return Json(new ApiResponse { success = true });
             }
@@ -654,11 +763,12 @@ namespace TextureGen3D.API.Controllers
                     return Json(new ApiResponse { success = false, message = "Image model not found" });
 
                 // Build input images: depth map first, then active mesh references.
-                // Type 4 (Background Removal) models take the caller-supplied image only.
+                // Type 4 (Background Removal) / Type 6 (Clean Image) models take
+                // the caller-supplied image only — no depth map.
                 var inputImages = new List<byte[]>();
                 byte[]? depthMapBytes = null;
 
-                if (imageModel.Type == 4)
+                if (imageModel.Type == 4 || imageModel.Type == 6)
                 {
                     if (!string.IsNullOrWhiteSpace(request.InputImage))
                     {
@@ -668,8 +778,9 @@ namespace TextureGen3D.API.Controllers
                 }
                 else
                 {
-                    // Add the depth map (from the canvas)
-                    if (!string.IsNullOrWhiteSpace(request.DepthMap))
+                    // Add the depth map (from the canvas) — type 0 (Image
+                    // Generation) has no depth role and gets none.
+                    if (imageModel.Type != 0 && !string.IsNullOrWhiteSpace(request.DepthMap))
                     {
                         var base64 = request.DepthMap.StartsWith("data:") ? request.DepthMap.Substring(request.DepthMap.IndexOf(',') + 1) : request.DepthMap;
                         depthMapBytes = Convert.FromBase64String(base64);
@@ -713,14 +824,15 @@ namespace TextureGen3D.API.Controllers
                     }
                 }
 
-                if (inputImages.Count == 0)
+                // Type-0 models may run prompt-only (no input images at all)
+                if (inputImages.Count == 0 && imageModel.Type != 0)
                     return Json(new ApiResponse { success = false, message = "At least one input image is required" });
 
                 var resolution = request.Resolution > 0 ? request.Resolution
                     : (project.TextureResolution > 0 ? project.TextureResolution : 1024);
                 var hasReferences = inputImages.Count > 1;
                 var albedoInstruction = " The output must be a pure albedo (diffuse color) map — flat, evenly lit surface colors with no shadows, no highlights, no ambient occlusion, no specular reflections, and no directional lighting. Treat the result as if illuminated by uniform, shadowless light from all directions so that only the intrinsic material color of each surface point is captured.";
-                var systemPrompt = imageModel.Type == 4
+                var systemPrompt = imageModel.Type == 0 || imageModel.Type == 4 || imageModel.Type == 6
                     ? (request.Prompt ?? "")
                     : hasReferences
                     ? $"You are generating a texture map for a 3D model. The first input image is a depth map rendered from a specific camera angle of the 3D model's surface — brighter pixels are closer to the camera, darker pixels are farther away. The remaining input images are reference textures that should be projected onto the 3D model's surface as seen from that camera angle. Generate a {resolution}x{resolution} texture that maps the reference imagery onto the geometry indicated by the depth map, preserving the spatial layout and surface contours. The output should look like a coherent texture applied to the 3D model's UV map from this viewpoint, not a flat composite. Respect the depth map's silhouette and surface relief when placing and distorting the reference textures." + albedoInstruction + "\n\n" + (request.Prompt ?? "")
@@ -755,11 +867,11 @@ namespace TextureGen3D.API.Controllers
                     await _layerRepo.UpdateCameraAngleAsync(layerId, projectId, request.CameraAngle);
                 }
 
-                // Save the depth map as JPEG
+                // Save the depth map — lossless PNG (flattened to RGB)
                 if (depthMapBytes != null && depthMapBytes.Length > 0)
                 {
-                    var depthJpeg = await _imageService.ConvertToHighQualityJpegAsync(depthMapBytes);
-                    await _imageService.SaveProjectMeshLayerDepthMapAsync(projectId, request.MeshId, layerId, depthJpeg);
+                    var depthPng = await _imageService.ConvertToLosslessPngAsync(depthMapBytes);
+                    await _imageService.SaveProjectMeshLayerDepthMapAsync(projectId, request.MeshId, layerId, depthPng);
                 }
 
                 // Return the generated image as base64 so the client can project it onto the UV map
@@ -904,15 +1016,15 @@ namespace TextureGen3D.API.Controllers
                 var thumbBytes = await _imageService.GenerateThumbnailAsync(imageBytes, 100, preserveTransparency: true);
                 await _imageService.SaveProjectMeshLayerThumbAsync(projectId, request.MeshId, layerId, thumbBytes);
 
-                // Save the depth map as JPEG if provided
+                // Save the depth map — lossless PNG (flattened to RGB)
                 if (!string.IsNullOrWhiteSpace(request.DepthMap))
                 {
                     var depthBase64 = request.DepthMap.StartsWith("data:")
                         ? request.DepthMap[(request.DepthMap.IndexOf(',') + 1)..]
                         : request.DepthMap;
                     var depthMapBytes = Convert.FromBase64String(depthBase64);
-                    var depthJpeg = await _imageService.ConvertToHighQualityJpegAsync(depthMapBytes);
-                    await _imageService.SaveProjectMeshLayerDepthMapAsync(projectId, request.MeshId, layerId, depthJpeg);
+                    var depthPng = await _imageService.ConvertToLosslessPngAsync(depthMapBytes);
+                    await _imageService.SaveProjectMeshLayerDepthMapAsync(projectId, request.MeshId, layerId, depthPng);
                 }
 
                 return Json(new ApiResponse { success = true, data = new

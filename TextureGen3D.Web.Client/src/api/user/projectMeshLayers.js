@@ -4,7 +4,8 @@ const ProjectMeshLayers = (args) => Api({ ...args }).endpoints(({ api }) => {
   const apiPath = '/api/project-mesh-layers';
   return {
     getByMesh: (projectId, meshId) => api.get(`${apiPath}/${projectId}/mesh/${meshId}`),
-    create: (projectId, meshId, name, cameraAngle, inpaint = false, referenceId = null, generated = false) => api.post(`${apiPath}/${projectId}`, { meshId, name, cameraAngle, inpaint, referenceId, generated }),
+    // type: 0 = plain, 1 = Generated, 2 = Inpainted, 3 = Flattened
+    create: (projectId, meshId, name, cameraAngle, type = 0, referenceId = null) => api.post(`${apiPath}/${projectId}`, { meshId, name, cameraAngle, type, referenceId }),
     updateName: (projectId, layerId, name) => api.post(`${apiPath}/${projectId}/${layerId}/update-name`, { name }),
     reorder: (projectId, meshId, orderedIds) => api.post(`${apiPath}/${projectId}/reorder`, { meshId, orderedIds }),
     delete: (projectId, layerId) => api.post(`${apiPath}/${projectId}/${layerId}/delete`),
@@ -28,6 +29,10 @@ const ProjectMeshLayers = (args) => Api({ ...args }).endpoints(({ api }) => {
       api.post(`${apiPath}/${projectId}/${layerId}/reproject`, { meshId, cameraAngle }),
     toggleVisible: (projectId, layerId, visible) =>
       api.post(`${apiPath}/${projectId}/${layerId}/toggle-visible`, { visible }),
+    cleanImage: (projectId, layerId, meshId) =>
+      api.post(`${apiPath}/${projectId}/${layerId}/clean-image`, { meshId }),
+    revertImage: (projectId, layerId, meshId) =>
+      api.post(`${apiPath}/${projectId}/${layerId}/revert-image`, { meshId }),
     stitchLayers: (projectId, meshId, imageModelId, layerIds) =>
       api.post(`${apiPath}/${projectId}/stitch-layers`, { meshId, imageModelId, layerIds }),
     getLayerReferenceImage: (projectId, meshId, layerId) =>

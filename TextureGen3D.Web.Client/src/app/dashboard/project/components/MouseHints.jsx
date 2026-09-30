@@ -30,6 +30,14 @@ const CtrlKeyIcon = (
   </svg>
 );
 
+// Keyboard-key icon showing ALT as an actual key cap
+const AltKeyIcon = (
+  <svg viewBox="0 0 32 24" className="w-8 h-6" fill="none" stroke="currentColor" strokeWidth="1.5">
+    <rect x="1" y="1" width="30" height="22" rx="4" />
+    <text x="16" y="16.5" textAnchor="middle" fontSize="10" fontFamily="sans-serif" fill="currentColor" stroke="none">ALT</text>
+  </svg>
+);
+
 const MouseHint = React.memo(function MouseHint({ icon, label, title, accent }) {
   return (
     <div
@@ -45,8 +53,8 @@ const MouseHint = React.memo(function MouseHint({ icon, label, title, accent }) 
 });
 
 export default function MouseHints() {
-  const { maskTool } = useProject();
-  const paintTool = maskTool === 'brush' || maskTool === 'eraser' || maskTool === 'inpaint';
+  const { maskTool, stampMode } = useProject();
+  const paintTool = maskTool === 'brush' || maskTool === 'eraser' || maskTool === 'mask' || maskTool === 'inpaint' || maskTool === 'stamp' || maskTool === 'blur';
 
   return (
     <div className="absolute bottom-4 z-20 flex flex-col items-end gap-2 right-80">
@@ -64,6 +72,30 @@ export default function MouseHints() {
               icon={CtrlKeyIcon}
               label="Invert Draw"
               title="Hold Ctrl to temporarily invert the +/− draw mode while painting"
+            />
+          )}
+          {maskTool === 'mask' && (
+            <MouseHint
+              accent
+              icon={CtrlKeyIcon}
+              label="Swap Brush/Eraser"
+              title="Hold Ctrl to temporarily switch between the mask brush (reveal) and mask eraser (hide)"
+            />
+          )}
+          {maskTool === 'brush' && (
+            <MouseHint
+              accent
+              icon={AltKeyIcon}
+              label="Eye Dropper"
+              title="Hold Alt and click the mesh to sample the uvmap color under the cursor into the brush color"
+            />
+          )}
+          {maskTool === 'stamp' && stampMode === 'draw' && (
+            <MouseHint
+              accent
+              icon={AltKeyIcon}
+              label="Copy Region"
+              title="Hold Alt to temporarily switch to copy region — click the mesh to set the stamp source point"
             />
           )}
         </div>

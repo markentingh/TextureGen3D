@@ -13,6 +13,7 @@ namespace TextureGen3D.API.Services
         Task<byte[]> GenerateThumbnailAsync(byte[] imageData, int size = 350, bool preserveTransparency = false);
         Task<byte[]> ConvertToJpegAsync(byte[] imageData, int quality = 85);
         Task<byte[]> ConvertToHighQualityJpegAsync(byte[] imageData);
+        Task<byte[]> ConvertToLosslessPngAsync(byte[] imageData);
         Task SaveProjectThumbAsync(Guid projectId, byte[] imageData);
         Task<byte[]> GetProjectThumbAsync(Guid projectId);
         Task<bool> HasProjectThumbAsync(Guid projectId);
@@ -24,6 +25,7 @@ namespace TextureGen3D.API.Services
         Task<(int width, int height)?> GetImageDimensionsAsync(byte[] imageBytes);
         Task<byte[]> ResizeImageAsync(byte[] imageData, int maxWidth);
         Task<byte[]> ResizeImageMaxAsync(byte[] imageData, int maxSize);
+        Task<byte[]> ResizeImageExactAsync(byte[] imageData, int width, int height);
         Task SaveProjectReferenceAsync(Guid projectId, Guid referenceId, string extension, byte[] fileData);
         Task<byte[]> GetProjectReferenceAsync(Guid projectId, Guid referenceId, string extension);
         Task DeleteProjectReferenceAsync(Guid projectId, Guid referenceId, string extension);
@@ -33,6 +35,8 @@ namespace TextureGen3D.API.Services
         // Project mesh layer images
         Task SaveProjectMeshLayerImageAsync(Guid projectId, Guid meshId, Guid layerId, byte[] fileData);
         Task SaveProjectMeshLayerFileAsync(Guid projectId, Guid meshId, Guid layerId, string fileName, byte[] fileData);
+        Task<byte[]> GetProjectMeshLayerFileAsync(Guid projectId, Guid meshId, Guid layerId, string fileName);
+        Task DeleteProjectMeshLayerFileAsync(Guid projectId, Guid meshId, Guid layerId, string fileName);
         Task<byte[]> GetProjectMeshLayerImageAsync(Guid projectId, Guid meshId, Guid layerId);
         Task DeleteProjectMeshLayerImageAsync(Guid projectId, Guid meshId, Guid layerId);
         Task SaveProjectMeshLayerThumbAsync(Guid projectId, Guid meshId, Guid layerId, byte[] imageData);
@@ -111,6 +115,18 @@ namespace TextureGen3D.API.Services
                 Quality = 100,
                 ColorType = JpegEncodingColor.Rgb,
             });
+            return ms.ToArray();
+        }
+
+        // Lossless PNG re-encode — flattens alpha onto white so model inputs
+        // (depth maps) are always 3-channel, like the JPEG path but with zero
+        // compression loss.
+        public async Task<byte[]> ConvertToLosslessPngAsync(byte[] imageData)
+        {
+            using var image = Image.Load(imageData);
+            image.Mutate(x => x.BackgroundColor(Color.White));
+            using var ms = new MemoryStream();
+            await image.SaveAsync(ms, new PngEncoder());
             return ms.ToArray();
         }
 
@@ -236,8 +252,9 @@ namespace TextureGen3D.API.Services
                 Mode = ResizeMode.Max
             }));
 
+            // PNG output — reference images feed generation, keep them lossless
             using var ms = new MemoryStream();
-            await image.SaveAsync(ms, new JpegEncoder { Quality = 90 });
+            await image.SaveAsync(ms, new PngEncoder());
             return ms.ToArray();
         }
 
@@ -252,6 +269,25 @@ namespace TextureGen3D.API.Services
             {
                 Size = new Size(maxSize, maxSize),
                 Mode = ResizeMode.Max
+            }));
+
+            using var ms = new MemoryStream();
+            await image.SaveAsync(ms, new PngEncoder());
+            return ms.ToArray();
+        }
+
+        // Exact-size resize — PNG output keeps alpha (uvmap textures rely on it)
+        public async Task<byte[]> ResizeImageExactAsync(byte[] imageData, int width, int height)
+        {
+            using var image = Image.Load(imageData);
+            if (image.Width == width && image.Height == height)
+                return imageData;
+
+            image.Mutate(x => x.Resize(new ResizeOptions
+            {
+                Size = new Size(width, height),
+                Mode = ResizeMode.Stretch,
+                Sampler = KnownResamplers.Lanczos3
             }));
 
             using var ms = new MemoryStream();
@@ -348,6 +384,20 @@ namespace TextureGen3D.API.Services
             var relativePath = Path.Combine("projects", projectId.ToString(), "meshes", meshId.ToString(), layerId.ToString(), fileName);
             if (_activeStorage == "azure") { await SaveToAzureBlobAsync(relativePath, fileData); return; }
             await SaveToFileSystemAsync(relativePath, fileData);
+        }
+
+        public async Task<byte[]> GetProjectMeshLayerFileAsync(Guid projectId, Guid meshId, Guid layerId, string fileName)
+        {
+            var relativePath = Path.Combine("projects", projectId.ToString(), "meshes", meshId.ToString(), layerId.ToString(), fileName);
+            if (_activeStorage == "azure") return await GetFromAzureBlobAsync(relativePath);
+            return await GetFromFileSystemAsync(relativePath);
+        }
+
+        public async Task DeleteProjectMeshLayerFileAsync(Guid projectId, Guid meshId, Guid layerId, string fileName)
+        {
+            var relativePath = Path.Combine("projects", projectId.ToString(), "meshes", meshId.ToString(), layerId.ToString(), fileName);
+            if (_activeStorage == "azure") { await DeleteFromAzureBlobAsync(relativePath); return; }
+            await DeleteFromFileSystemAsync(relativePath);
         }
 
         public async Task<byte[]> GetProjectMeshLayerImageAsync(Guid projectId, Guid meshId, Guid layerId)

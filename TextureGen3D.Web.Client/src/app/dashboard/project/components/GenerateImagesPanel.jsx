@@ -4,6 +4,7 @@ import { useHubGeneration } from './useHubGeneration';
 import { Projects } from '@/api/user/projects';
 import { ProjectMeshes } from '@/api/user/projectMeshes';
 import { ProjectCameraAngles } from '@/api/user/projectCameraAngles';
+import { ProjectReferences } from '@/api/user/projectReferences';
 import { OpenAI } from '@/api/admin/openai';
 import ReferenceImagesSection from './ReferenceImagesSection';
 import CameraAngleReferencesModal from './CameraAngleReferencesModal';
@@ -71,12 +72,16 @@ export default function GenerateImagesPanel({ showPanel, setShowPanel }) {
     layerApi,
     loadMeshLayers,
     refreshLayerTextures,
+    invalidateLayerAssets,
   } = useProject();
   const { showModal, hideModal } = useModal();
 
   const [currentGeneratingAngleId, setCurrentGeneratingAngleId] = useState(null);
+  // Checked: run the type-0 Image Generation model to produce the image fed
+  // into the clean/depth passes. Unchecked: use the reference image itself.
+  const [generateFromReference, setGenerateFromReference] = useState(true);
   const seedDebounceRef = useRef(null);
-  const { generateViaHub, removeBackground, activeHubConnectionRef } = useHubGeneration();
+  const { generateViaHub, generateBaseImage, depthToImage, removeBackground, cleanImage, activeHubConnectionRef } = useHubGeneration();
   const cancelRequestedRef = useRef(false);
 
   // ── Camera angle checkboxes (persisted to localStorage) ──
@@ -444,6 +449,23 @@ export default function GenerateImagesPanel({ showPanel, setShowPanel }) {
     }
   };
 
+  // Fetch a project reference image as a data URL — same format the
+  // generation passes produce (data:image/...;base64,...) so it can feed
+  // straight into cleanImage/depthToImage/removeBackground.
+  const fetchReferenceDataUrl = async (refId) => {
+    const res = await fetch(ProjectReferences({ token }).imageUrl(id, refId), {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) throw new Error('Failed to load reference image');
+    const blob = await res.blob();
+    return await new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result);
+      reader.onerror = () => reject(new Error('Failed to read reference image'));
+      reader.readAsDataURL(blob);
+    });
+  };
+
   // ── handleGenerate ──
   const handleGenerate = async () => {
     if (!selectedMesh || !selectedModelId) return;
@@ -484,7 +506,7 @@ export default function GenerateImagesPanel({ showPanel, setShowPanel }) {
           ? viewerRef.current.getCameraAngle()
           : null;
         const cameraAngleJson = cameraAngle ? JSON.stringify(cameraAngle) : '';
-        const layerRes = await layerApi.create(id, meshDbId, `Layer ${layerNum}`, cameraAngleJson, false, meshRefView.find((r) => r.active)?.id ?? null, true);
+        const layerRes = await layerApi.create(id, meshDbId, `Layer ${layerNum}`, cameraAngleJson, 1, meshRefView.find((r) => r.active)?.id ?? null);
         if (!layerRes.data?.success) throw new Error('Failed to create layer');
         const layer = layerRes.data.data;
         prependMeshLayer(meshDbId, layer);
@@ -504,46 +526,41 @@ export default function GenerateImagesPanel({ showPanel, setShowPanel }) {
           }
         }
 
-        // Use the captured camera angle — the user may rotate the mesh
-        // while generation is in flight.
-        const depthMap = viewerRef.current?.captureDepthMap(textureResolution, cameraAngle);
-        if (!depthMap) throw new Error('Failed to generate depth map');
+        // When generating from the reference is off, no prompt is used —
+        // the hidden field may still hold a stale mesh prompt.
+        const fullPrompt = generateFromReference ? meshPrompts[meshDbId] || '' : '';
 
-        const fullPrompt = meshPrompts[meshDbId] || '';
-
+        // Pass 1 — "Generate Image from Reference" checked: run the first
+        // active Image Generation (type-0) model (prompt + references, no
+        // depth map). Unchecked: the active reference image feeds the
+        // clean/depth passes directly.
         let generatedImage;
-
-        if (isComfyUI || isGradio) {
-          const hubUrl = isComfyUI ? '/hubs/comfyui' : '/hubs/gradio';
-          const hubName = isComfyUI ? 'ComfyUI' : 'Gradio';
-          await layerApi.saveDepthMap(id, layer.id, meshDbId, depthMap);
-          generatedImage = await generateViaHub({
-            hubUrl,
-            hubName,
-            layer,
-            meshDbId,
-            fullPrompt,
-          });
+        if (generateFromReference) {
+          generatedImage = await generateBaseImage({ layer, meshDbId, fullPrompt, cameraAngleJson });
         } else {
-          const genRes = await layerApi.generate(
-            id,
-            layer.id,
-            meshDbId,
-            parseInt(selectedModelId),
-            fullPrompt,
-            depthMap,
-            cameraAngleJson,
-            null,
-            null,
-            textureResolution
-          );
-          if (!genRes.data?.success)
-            throw new Error(genRes.data?.message || 'Image generation failed');
-          generatedImage = genRes.data.data?.image;
+          const activeRef = meshRefView.find((r) => r.active);
+          if (!activeRef) throw new Error('No active reference image — enable one or check "Generate Image from Reference"');
+          generatedImage = await fetchReferenceDataUrl(activeRef.id);
         }
 
-        // Second pass: strip the background via the active type-4 model —
-        // the processed image becomes the layer image + projection source.
+        // Pass 2 — clean the generated image via the active Clean Image
+        // (type-6) model — FBCNN artifact removal.
+        if (generatedImage) {
+          generatedImage = await cleanImage({ generatedImage, layer, meshDbId, cameraAngleJson });
+        }
+
+        // Pass 3 — capture the depth map at the stored camera angle (the
+        // user may rotate the mesh while generation is in flight), then run
+        // the cleaned image + depth map through the selected Depth to Image
+        // (type-1) Projection Image Model.
+        const depthMap = viewerRef.current?.captureDepthMap(textureResolution, cameraAngle);
+        if (!depthMap) throw new Error('Failed to generate depth map');
+        if (generatedImage) {
+          generatedImage = await depthToImage({ generatedImage, depthMap, layer, meshDbId, fullPrompt, cameraAngleJson });
+        }
+
+        // Pass 4 — strip the background off the depth-to-image output via
+        // the active type-4 model.
         if (generatedImage) {
           generatedImage = await removeBackground({ generatedImage, layer, meshDbId, cameraAngleJson });
         }
@@ -559,6 +576,7 @@ export default function GenerateImagesPanel({ showPanel, setShowPanel }) {
             if (projected?.uvMap) {
               await layerApi.saveUvMap(id, layer.id, meshDbId, projected.uvMap);
             }
+            invalidateLayerAssets(layer.id); // uvmap/mask may have been rewritten
             // Coverage mask — white where the projection painted the UV map
             if (projected?.mask) {
               await layerApi.saveMasks(id, meshDbId, [{ layerId: layer.id, base64Mask: projected.mask }]);
@@ -604,7 +622,7 @@ export default function GenerateImagesPanel({ showPanel, setShowPanel }) {
 
           const layerNum = meshLayers.length + i + 1;
           const cameraAngleJson = JSON.stringify(angle.rotation);
-          const layerRes = await layerApi.create(id, meshDbId, `Layer ${layerNum}`, cameraAngleJson, false, angle.projectReferenceId ?? null, true);
+          const layerRes = await layerApi.create(id, meshDbId, `Layer ${layerNum}`, cameraAngleJson, 1, angle.projectReferenceId ?? null);
           if (!layerRes.data?.success)
             throw new Error(`Failed to create layer for angle ${angleNum}`);
           const layer = layerRes.data.data;
@@ -614,52 +632,55 @@ export default function GenerateImagesPanel({ showPanel, setShowPanel }) {
           viewerRef.current?.setCameraRotation(angle.rotation);
           await new Promise((r) => setTimeout(r, 50));
 
-          const depthMap = viewerRef.current?.captureDepthMap(textureResolution, angle.rotation);
-          if (!depthMap)
-            throw new Error(`Failed to generate depth map for angle ${angleNum}`);
+          const fullPrompt = generateFromReference ? userPrompt : '';
 
-          const fullPrompt = userPrompt;
-
+          // Pass 1 — checked: generate via the first active Image
+          // Generation (type-0) model. Unchecked: the angle's reference
+          // image feeds the clean/depth passes directly.
           let generatedImage;
-
-          if (isComfyUI || isGradio) {
-            const hubUrl = isComfyUI ? '/hubs/comfyui' : '/hubs/gradio';
-            const hubName = isComfyUI ? 'ComfyUI' : 'Gradio';
-            await layerApi.saveDepthMap(id, layer.id, meshDbId, depthMap);
-            generatedImage = await generateViaHub({
-              hubUrl,
-              hubName,
+          if (generateFromReference) {
+            generatedImage = await generateBaseImage({
               layer,
               meshDbId,
               fullPrompt,
               angleId: angle.id,
               angleNum,
               totalAngles,
+              cameraAngleJson,
             });
           } else {
-            setComfyMessage(`Image ${angleNum}/${totalAngles}: Generating...`);
-            const genRes = await layerApi.generate(
-              id,
-              layer.id,
-              meshDbId,
-              parseInt(selectedModelId),
-              fullPrompt,
-              depthMap,
-              cameraAngleJson,
-              angle.id,
-              null,
-              textureResolution
-            );
-            if (!genRes.data?.success)
-              throw new Error(
-                genRes.data?.message || `Image generation failed for angle ${angleNum}`
-              );
-            generatedImage = genRes.data.data?.image;
+            if (!angle.projectReferenceId)
+              throw new Error(`No reference image for angle ${angleNum} — set one or check "Generate Image from Reference"`);
+            generatedImage = await fetchReferenceDataUrl(angle.projectReferenceId);
           }
 
           if (cancelRequestedRef.current) break;
 
-          // Second pass: strip the background via the active type-4 model
+          // Pass 2 — clean via the active Clean Image (type-6) model
+          if (generatedImage) {
+            generatedImage = await cleanImage({ generatedImage, layer, meshDbId, cameraAngleJson });
+          }
+
+          // Pass 3 — depth map at this angle's rotation, then cleaned image
+          // + depth map through the selected Depth to Image (type-1) model.
+          const depthMap = viewerRef.current?.captureDepthMap(textureResolution, angle.rotation);
+          if (!depthMap)
+            throw new Error(`Failed to generate depth map for angle ${angleNum}`);
+          if (generatedImage) {
+            generatedImage = await depthToImage({
+              generatedImage,
+              depthMap,
+              layer,
+              meshDbId,
+              fullPrompt,
+              angleId: angle.id,
+              angleNum,
+              totalAngles,
+              cameraAngleJson,
+            });
+          }
+
+          // Pass 4 — strip the background off the depth-to-image output
           if (generatedImage) {
             generatedImage = await removeBackground({ generatedImage, layer, meshDbId, cameraAngleJson });
           }
@@ -680,6 +701,7 @@ export default function GenerateImagesPanel({ showPanel, setShowPanel }) {
                   await layerApi.saveMasks(id, meshDbId, [{ layerId: layer.id, base64Mask: projected.mask }]);
                   setMaskThumbVersions((prev) => ({ ...prev, [layer.id]: (prev[layer.id] || 0) + 1 }));
                 }
+                invalidateLayerAssets(layer.id); // uvmap/mask may have been rewritten
               }
             } catch (err) {
               console.error(`[Generate] Failed to project angle ${angleNum}:`, err);
@@ -825,13 +847,26 @@ export default function GenerateImagesPanel({ showPanel, setShowPanel }) {
             ]}
           />
 
-          <label className="block text-xs font-medium text-gray-700 dark:text-gray-300 mt-2 mb-1">Prompt</label>
-          <TextArea
-            value={prompt}
-            onChange={handlePromptChange}
-            placeholder="Describe the texture..."
-            rows={4}
-          />
+          <label className="flex items-center gap-2 text-xs font-medium text-gray-700 dark:text-gray-300 mt-2 mb-1">
+            <input
+              type="checkbox"
+              checked={generateFromReference}
+              onChange={(e) => setGenerateFromReference(e.target.checked)}
+              className="accent-purple-500"
+            />
+            Generate Image from Reference
+          </label>
+          {generateFromReference && (
+            <>
+              <label className="block text-xs font-medium text-gray-700 dark:text-gray-300 mb-1">Prompt</label>
+              <TextArea
+                value={prompt}
+                onChange={handlePromptChange}
+                placeholder="Describe the texture..."
+                rows={4}
+              />
+            </>
+          )}
         </div>
 
         <ReferenceImagesSection angleMode={generationMode === 'angles'} maxRefs={generationMode === 'single' ? 1 : 0} />
@@ -880,7 +915,7 @@ export default function GenerateImagesPanel({ showPanel, setShowPanel }) {
           />
           <button
             onClick={handleGenerate}
-            disabled={generating || !selectedMesh || (generationMode === 'angles' && (cameraAngles.length === 0 || (usedAngleIds?.size ?? cameraAngles.length) === 0)) || (!prompt.trim() && (generationMode === 'angles' ? angleRefView.length === 0 : meshRefView.filter((r) => r.active).length === 0)) || !selectedModelId}
+            disabled={generating || !selectedMesh || (generationMode === 'angles' && (cameraAngles.length === 0 || (usedAngleIds?.size ?? cameraAngles.length) === 0)) || (!prompt.trim() && (generationMode === 'angles' ? angleRefView.length === 0 : meshRefView.filter((r) => r.active).length === 0)) || !selectedModelId || (!generateFromReference && (generationMode === 'angles' ? angleRefView.length === 0 : meshRefView.filter((r) => r.active).length === 0))}
             className="flex-1 px-4 py-2 border-2 border-green-600 text-green-600 dark:text-green-500 dark:border-green-500 rounded-lg hover:bg-green-600 hover:text-white dark:hover:bg-green-600 dark:hover:text-white disabled:opacity-50 disabled:cursor-not-allowed transition font-medium text-sm"
           >
             {generating ? 'Generating...' : (generationMode === 'angles' ? 'Generate Images' : 'Generate Image')}

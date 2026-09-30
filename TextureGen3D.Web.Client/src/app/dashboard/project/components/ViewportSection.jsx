@@ -3,7 +3,7 @@ import ModelViewer from '@/components/viewer/ModelViewer';
 import { useProject } from '@/context/project';
 
 export default function ViewportSection() {
-  const { selectedMesh, viewerRef, pendingLayersRef, refreshLayerTextures, maskPaintConfigRef } = useProject();
+  const { selectedMesh, viewerRef, pendingLayersRef, refreshLayerTextures, maskPaintConfigRef, setUnlit } = useProject();
   const refreshRef = useRef(refreshLayerTextures);
   useEffect(() => { refreshRef.current = refreshLayerTextures; }, [refreshLayerTextures]);
 
@@ -22,6 +22,7 @@ export default function ViewportSection() {
         selectedMesh={selectedMesh}
         maskPaintConfig={maskPaintConfigRef}
         onMeshLoaded={handleMeshLoaded}
+        onUnlitChange={setUnlit}
       />
     </div>
   );

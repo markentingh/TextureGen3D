@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useEffect } from 'react';
 import { ProjectProvider, useProject } from '@/context/project';
 import { useModal } from '@/context/modal';
 import LoadingScreen from './components/LoadingScreen';
@@ -12,9 +12,8 @@ import InpaintPanel from './components/InpaintPanel';
 import ErrorOverlay from './components/ErrorOverlay';
 
 function ProjectContent() {
-  const { id, token, loading, loadedRef, loadProject, project, viewerRef, thumbGenAttemptedRef, maskTool, textureResolution } = useProject();
+  const { id, token, loading, loadedRef, loadProject, project, viewerRef, thumbGenAttemptedRef, maskTool, textureResolution, showPanel, setShowPanel } = useProject();
   const { showModal, hideModal } = useModal();
-  const [showPanel, setShowPanel] = useState(true);
 
   // One-time project load
   useEffect(() => {
