@@ -702,6 +702,7 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
       const p = paintingRef.current;
       if (!p) return;
       paintingRef.current = null;
+      paint.endStroke(); // commit the stroke before the save callbacks read buffers
       const cfg = maskPaintCfgRef.current?.current;
       cfg?.onStrokeEnd?.();
       if (p.stamp) cfg?.onStampStrokeEnd?.(p.layerIds);
@@ -984,6 +985,7 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
         const wasStamp = paintingRef.current.stamp;
         const stampLayerIds = paintingRef.current.layerIds;
         paintingRef.current = null;
+        paint.endStroke(); // commit the stroke before the save callbacks read buffers
         maskPaintCfgRef.current?.current?.onStrokeEnd?.();
         if (wasStamp) maskPaintCfgRef.current?.current?.onStampStrokeEnd?.(stampLayerIds);
         return;

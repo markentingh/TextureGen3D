@@ -50,6 +50,19 @@ export function createPaintEngine(ctx) {
     entry.initialized = true;
   };
 
+  // Bind a texture as the inpaint overlay mask — used both for the live
+  // stroke preview (back buffer) and the committed front buffer.
+  const bindInpaintTexture = (tex) => {
+    currentMeshRef.current?.traverse((child) => {
+      const u = child.isMesh && child.material && child.material.uniforms;
+      if (u && u.u_inpaintMask) {
+        u.u_inpaintMask.value = tex;
+        u.u_inpaintTile.value = inpaintTileTexRef.current;
+        u.u_hasInpaint.value = inpaintVisibleRef.current ? 1 : 0;
+      }
+    });
+  };
+
   // Populate the paint group with every submesh's geometry so all UV islands
   // are rasterized each pass — shared by the mask dab, the stamp color pass,
   // and the coverage rebuild.
@@ -254,16 +267,7 @@ export function createPaintEngine(ctx) {
   };
 
   // Bind the inpaint mask + tile texture into the live layer shader materials
-  const bindInpaintOverlay = (entry) => {
-    currentMeshRef.current?.traverse((child) => {
-      const u = child.isMesh && child.material && child.material.uniforms;
-      if (u && u.u_inpaintMask) {
-        u.u_inpaintMask.value = entry.front.texture;
-        u.u_inpaintTile.value = inpaintTileTexRef.current;
-        u.u_hasInpaint.value = inpaintVisibleRef.current ? 1 : 0;
-      }
-    });
-  };
+  const bindInpaintOverlay = (entry) => bindInpaintTexture(entry.front.texture);
 
   // Pen pressure — pointer events carry 0..1 pressure only for stylus input;
   // mouse/touch report a fixed value, so those always paint full-strength.
@@ -357,144 +361,100 @@ export function createPaintEngine(ctx) {
     return null;
   };
 
-  const stampMaskAtHit = (layerIds, hit, signOverride = null) => {
-    const cfg = maskPaintCfgRef.current?.current;
-    const renderer = rendererRef.current;
-    if (!cfg || !renderer || !layerIds?.length) return;
-    const isInpaint = cfg.tool === 'inpaint';
-    const rtt = getPaintRtt();
+  // ── Stroke-mask pipeline ──────────────────────────────────────────────
+  // Dabs no longer write straight into a layer's render target — at opacity
+  // < 100 the overlapping discs visibly summed. Instead each dab accumulates
+  // into a shared stroke buffer: .a = max coverage (falloff × pen-pressure
+  // alpha — the opacity slider is deliberately excluded and applied once at
+  // composite time), .rgb = the dab color (brush color, or the captured-view
+  // sample for the stamp tool). Each dab then composites
+  // base ∘ effect(stroke) into the layer's back buffer for the live preview
+  // while front stays a pristine stroke-start snapshot; endStroke() re-runs
+  // the same composite followed by the bleed/alpha-fill post passes into
+  // front, making the result permanent and wiping the stroke buffer black.
 
-    const geom = hit.object.geometry;
-    const pos = geom?.attributes?.position;
-    const uvAttr = geom?.attributes?.uv;
-    if (!pos || !uvAttr) return;
+  let strokeRts = null; // { a, b, front, res } — shared coverage buffer
+  let stroke = null;    // { tool, layerIds, dirty, blurTexels }
 
-    const R = brushWorldRadius(hit);
-
-    const h = cfg.hardness ?? 50;
-    const u = rtt.mat.uniforms;
-    u.u_modelMatrix.value.copy(hit.object.matrixWorld);
-    u.u_mouseWorldPos.value.copy(hit.point);
-    // Stamp: reveal the mask a bit past the color footprint so the mask
-    // edge clears the stamped color's feather instead of cutting it.
-    const mR = cfg.tool === 'stamp' ? R * 1.08 : R;
-    u.u_brushRadius.value = mR;
-    u.u_innerRadius.value = mR * Math.max(0, 1 - h / 100);
-    u.u_brushStrength.value = Math.min(1, Math.max(0.01, ((cfg.opacity ?? 100) / 100) * pressureAlphaScale()));
-    u.u_paintSign.value =
-      signOverride ?? ((cfg.tool === 'mask' && cfg.maskSign === 'eraser') || (cfg.tool === 'inpaint' && cfg.sign === 'subtract') ? -1.0 : 1.0);
-    u.u_isDrawing.value = 1.0;
-
-    // Populate the paint group with every submesh's geometry so all UV
-    // islands are rasterized each stamp — otherwise texels belonging to
-    // submeshes we didn't hit keep the back buffer's stale values and
-    // earlier strokes silently revert.
-    populateMaskPaintGroup(rtt);
-    const pg = rtt.paintGroup;
-    pg.visible = true;
-    rtt.blitQuad.visible = false;
-
-    // Rebuild the island coverage map when the mesh changes — one rasterize
-    // pass writing solid white wherever any submesh's triangles land.
-    ensureMaskCoverage(rtt);
-
-    // Paint pass per selected layer: read front → write back. autoClear is
-    // OFF globally, so back is NOT cleared — blit the existing mask into it
-    // first so every texel (inside AND outside islands) keeps its current
-    // value, then the paint group adds the stroke on top. Purely additive.
-    const bu = rtt.bleedMat.uniforms;
-    const prevClear = tmpColor;
-    renderer.getClearColor(prevClear);
-    const prevClearAlpha = renderer.getClearAlpha();
-    for (const layerId of layerIds) {
-      const entry = isInpaint ? getInpaintEntry() : cfg.getOrCreateLayerMask?.(layerId);
-      if (!entry) continue;
-      if (!entry.initialized) clearMaskTarget(entry, isInpaint ? 0x000000 : 0xffffff);
-      // Loaded before the mesh existed → run the deferred edge dilation now
-      if (entry.needsDilate && dilateMaskEntry(rtt, entry)) entry.needsDilate = false;
-      u.u_baseTexture.value = entry.front.texture;
-
-      const back = entry.front === entry.a ? entry.b : entry.a;
-      // 1) Blit prev → back (isDrawing=0 passthrough writes every texel)
-      u.u_isDrawing.value = 0.0;
-      rtt.paintGroup.visible = false;
-      rtt.blitQuad.visible = true;
-      renderer.setRenderTarget(back);
-      renderer.render(rtt.scene, rtt.cam);
-      // 2) Paint islands on top of the blit
-      u.u_isDrawing.value = 1.0;
-      rtt.blitQuad.visible = false;
-      rtt.paintGroup.visible = true;
-      renderer.render(rtt.scene, rtt.cam);
-
-      // Bleed pass: back → front. Outside-island texels within 2px of an
-      // island edge adopt the nearest inside-island mask value, so the mask
-      // doesn't produce seam lines where a stroke crosses a UV boundary.
-      bu.u_base.value = back.texture;
-      bu.u_coverage.value = rtt.coverageRT.texture;
-      bu.u_texelSize.value = 1 / 1024;
-      rtt.paintGroup.visible = false;
-      rtt.bleedQuad.visible = true;
-      renderer.setRenderTarget(entry.front);
-      renderer.render(rtt.scene, rtt.cam);
-      rtt.bleedQuad.visible = false;
-      rtt.paintGroup.visible = true;
-
-      if (isInpaint) {
-        // front.texture is updated in place — make sure it's bound (e.g. if
-        // the entry was created by this first stroke before beginInpaint ran)
-        bindInpaintOverlay(entry);
-      } else {
-        syncMaskUniform(layerId, entry.front.texture);
-        cfg.markMaskModified?.(layerId);
-      }
+  const getStrokeRts = (res) => {
+    if (!strokeRts || strokeRts.res !== res) {
+      if (strokeRts) { strokeRts.a.dispose(); strokeRts.b.dispose(); }
+      const mk = () => new THREE.WebGLRenderTarget(res, res, {
+        format: THREE.RGBAFormat,
+        type: THREE.UnsignedByteType,
+        minFilter: THREE.LinearFilter,
+        magFilter: THREE.LinearFilter,
+        depthBuffer: false,
+      });
+      strokeRts = { a: mk(), b: mk(), res };
+      strokeRts.front = strokeRts.a;
     }
-    renderer.setRenderTarget(null);
-    renderer.setClearColor(prevClear, prevClearAlpha);
+    return strokeRts;
   };
 
-  // Clone-stamp dab — screen-space clone: every destination texel projects
-  // its world position through the capture-time camera and samples the
-  // captured composite view at copy + flip*(texel − strokeStart). Writing
-  // through the flattened-UV rasterization makes the stamp seam-safe — each
-  // texel is found via the mesh's own UV mapping, so it doesn't matter how
-  // the destination island is oriented or whether the stroke crosses seams.
-  const stampUvmapAtHit = (layerIds, hit) => {
-    const cfg = maskPaintCfgRef.current?.current;
+  // Erase the stroke buffer back to black — on stroke start and mouse-up.
+  const clearStrokeRts = () => {
     const renderer = rendererRef.current;
-    const view = stampViewRef.current;
-    if (!cfg || !renderer || !hit || !view) return;
-    // Generated/inpainted layers are never stamp targets
-    layerIds = layerIds.filter((lid) => cfg.isStampableLayer?.(lid) ?? true);
-    if (!layerIds.length) return;
+    if (!renderer || !strokeRts) return;
+    const pc = new THREE.Color();
+    renderer.getClearColor(pc);
+    const pa = renderer.getClearAlpha();
+    renderer.setClearColor(0x000000, 0);
+    for (const rt of [strokeRts.a, strokeRts.b]) {
+      renderer.setRenderTarget(rt);
+      renderer.clear(true, true, false);
+    }
+    renderer.setRenderTarget(null);
+    renderer.setClearColor(pc, pa);
+  };
 
-    // Populate the paint group with every submesh's geometry so all UV
-    // islands are rasterized each stamp (same as the mask pass — skipping
-    // islands would revert their paint on the next stamp).
-    const rtt = getPaintRtt();
-    populateMaskPaintGroup(rtt);
-    const pg = rtt.paintGroup;
-    pg.visible = true;
+  // Begin the stroke if one isn't already running for this tool — commits a
+  // stale stroke whose pointer-up never arrived as a defensive measure.
+  const ensureStroke = (tool, layerIds) => {
+    const cfg = maskPaintCfgRef.current?.current;
+    getStrokeRts(cfg?.textureResolution || 1024);
+    if (!stroke || stroke.tool !== tool) {
+      if (stroke) endStroke();
+      clearStrokeRts();
+      stroke = { tool, layerIds: layerIds.slice(), dirty: false, blurTexels: 0 };
+    }
+    return stroke;
+  };
+
+  // Hide every helper object in the paint scene — each pass then flips on
+  // exactly what it renders.
+  const hideAllRtt = (rtt) => {
+    rtt.paintGroup.visible = false;
     rtt.blitQuad.visible = false;
+    rtt.bleedQuad.visible = false;
+    rtt.copyQuad.visible = false;
+    rtt.alphaFillQuad.visible = false;
+    rtt.blurQuad.visible = false;
+    rtt.strokeCompQuad.visible = false;
+  };
 
-    // Capture per-dab values — the async init callback may run after later
-    // dabs have overwritten the shared uniforms.
-    const R = brushWorldRadius(hit);
-    const h = cfg.hardness ?? 50;
-    const dabWorld = hit.point.clone();
-    const modelMat = hit.object.matrixWorld.clone();
-    const startWorld = paintingRef.current?.stampStartWorld || hit.point;
-    const opacity = Math.min(1, Math.max(0.01, ((cfg.opacity ?? 100) / 100) * pressureAlphaScale()));
-    const flipX = cfg.stampInvertX ? -1 : 1;
-    const flipY = cfg.stampInvertY ? -1 : 1;
-    const su = rtt.stampColorMat.uniforms;
+  // Parse cfg.color into raw sRGB components — Color.set() would convert to
+  // linear working space and the RT would store ~2.2x darker bytes than the
+  // color the user picked. setRGB defaults to working-space (raw).
+  const parseBrushColor = () => {
+    const cfg = maskPaintCfgRef.current?.current;
+    const m = /^#?([0-9a-fA-F]{6})$/.exec(cfg?.color || '');
+    return tmpColor.clone().setRGB(
+      m ? parseInt(m[1].slice(0, 2), 16) / 255 : 1,
+      m ? parseInt(m[1].slice(2, 4), 16) / 255 : 0,
+      m ? parseInt(m[1].slice(4, 6), 16) / 255 : 0
+    );
+  };
 
-    // Project the stroke start through the CURRENT camera so the stamp tracks
-    // the cursor even if the user orbited after copying. Only the copy anchor
-    // stays in capture-space pixels — the captured image behaves like a
-    // floating screenshot (same semantics as the ring preview).
+  // Stamp source projection — projects the stroke start through the CURRENT
+  // camera so the stamp tracks the cursor even if the user orbited after
+  // copying. Only the copy anchor stays in capture-space pixels — the
+  // captured image behaves like a floating screenshot.
+  const stampViewUniforms = (hit) => {
+    const view = stampViewRef.current;
     const cam = cameraRef.current;
-    if (!cam) return;
+    if (!view || !cam) return null;
+    const startWorld = paintingRef.current?.stampStartWorld || hit.point;
     cam.updateMatrixWorld();
     const curVP = new THREE.Matrix4().multiplyMatrices(cam.projectionMatrix, cam.matrixWorldInverse);
     const startNdc = startWorld.clone().applyMatrix4(curVP);
@@ -510,194 +470,288 @@ export function createPaintEngine(ctx) {
     const zoomRatio = curNdcPerWorld > 1e-8 ? (view.ndcPerWorld || curNdcPerWorld) / curNdcPerWorld : 1;
     // copyPx is stored y-down (canvas coords); the shader works in y-up px
     const copyPx = new THREE.Vector2(view.copyPx.x, view.h - view.copyPx.y);
-    const res = cfg.textureResolution || 1024;
-
-    // Color-park margin in WORLD units, sized to cover ~6 UV texels at the
-    // dab — derived from the hit triangle's local uv-per-world density so
-    // it's a fixed number of texels at any zoom or UV density (a screen-px
-    // margin shrinks below a texel when zoomed out → halo returns).
-    let marginWorld = R * 0.1;
-    const face = hit.face;
-    const posAttr = hit.object.geometry?.attributes?.position;
-    const hitUvAttr = hit.object.geometry?.attributes?.uv;
-    if (face && posAttr && hitUvAttr) {
-      const uvA = new THREE.Vector2().fromBufferAttribute(hitUvAttr, face.a);
-      const uvB = new THREE.Vector2().fromBufferAttribute(hitUvAttr, face.b);
-      const pA = new THREE.Vector3().fromBufferAttribute(posAttr, face.a).applyMatrix4(modelMat);
-      const pB = new THREE.Vector3().fromBufferAttribute(posAttr, face.b).applyMatrix4(modelMat);
-      const duv = uvA.distanceTo(uvB);
-      if (duv > 1e-8) marginWorld = Math.max(marginWorld, (6 / res) * (pA.distanceTo(pB) / duv));
-    }
-
-    for (const layerId of layerIds) {
-      ensureStampEntry(layerId, cfg).then((entry) => {
-        if (!entry) return;
-        // Rebuild island coverage when the mesh changes (needed by bleed)
-        ensureMaskCoverage(rtt);
-        su.u_baseTexture.value = entry.front.texture;
-        su.u_srcTexture.value = view.rt.texture;
-        su.u_modelMatrix.value.copy(modelMat);
-        su.u_viewProj.value.copy(curVP);
-        su.u_viewport.value.set(view.w, view.h);
-        su.u_mouseWorldPos.value.copy(dabWorld);
-        su.u_copyPx.value.copy(copyPx);
-        su.u_startPx.value.copy(startPx);
-        su.u_brushRadius.value = R;
-        su.u_innerRadius.value = R * Math.max(0, 1 - h / 100);
-        su.u_brushStrength.value = opacity;
-        su.u_flip.value.set(flipX, flipY);
-        su.u_zoomRatio.value = zoomRatio;
-        su.u_marginWorld.value = marginWorld;
-        pg.children.forEach((c) => { c.material = rtt.stampColorMat; });
-        const back = entry.front === entry.a ? entry.b : entry.a;
-        // Preserve current state in the write target first — autoClear is
-        // off globally, so without this blit `back` keeps two-dabs-old
-        // content and off-island texels (parked edge colors included)
-        // alternate between stale states on each dab.
-        rtt.copyMat.uniforms.u_tex.value = entry.front.texture;
-        pg.visible = false;
-        rtt.copyQuad.visible = true;
-        renderer.setRenderTarget(back);
-        renderer.render(rtt.scene, rtt.cam);
-        rtt.copyQuad.visible = false;
-        pg.visible = true;
-        renderer.render(rtt.scene, rtt.cam);
-        // Bleed stamped color ~2px beyond UV-island edges to hide seams
-        const bs = rtt.bleedMat.uniforms;
-        bs.u_base.value = back.texture;
-        bs.u_coverage.value = rtt.coverageRT.texture;
-        bs.u_texelSize.value = 1 / res;
-        pg.visible = false;
-        rtt.bleedQuad.material = rtt.bleedMat;
-        rtt.bleedQuad.visible = true;
-        renderer.setRenderTarget(entry.front);
-        renderer.render(rtt.scene, rtt.cam);
-        // Spread rgb into alpha-0 texels near content (6px per dab) so the
-        // live-bound texture can't filter in transparent black — covers
-        // island-boundary and source-empty texels the park ring misses.
-        rtt.bleedQuad.visible = false;
-        rtt.alphaFillQuad.visible = true;
-        rtt.alphaFillMat.uniforms.u_texelSize.value = 1 / res;
-        {
-          let src = entry.front;
-          let dst = back;
-          for (let i = 0; i < 6; i++) {
-            rtt.alphaFillMat.uniforms.u_base.value = src.texture;
-            renderer.setRenderTarget(dst);
-            renderer.render(rtt.scene, rtt.cam);
-            const t = src; src = dst; dst = t;
-          }
-        }
-        renderer.setRenderTarget(null);
-        rtt.alphaFillQuad.visible = false;
-        pg.visible = true;
-        pg.children.forEach((c) => { c.material = rtt.mat; });
-        stampTexRef.current.set(layerId, entry.front.texture);
-        bindLayerTexture(layerId, entry.front.texture);
-      });
-    }
-    // Reveal the stamped pixels through the layer mask
-    stampMaskAtHit(layerIds, hit, 1);
+    return { curVP, startPx, copyPx, zoomRatio };
   };
 
-  // Color paint/erase dab — paints cfg.color into the selected layers'
-  // uvmap (stamp RT) under the brush disc, or erases uvmap alpha when the
-  // eraser tool is active. Same ping-pong sequence as the stamp dab:
-  // blit front→back, paint through the flattened-UV rasterization, then
-  // island-edge bleed + rgb alpha-fill.
+  // Rasterize one dab into the shared stroke buffer — copy prev → back for
+  // off-island texels, then draw the disc on top through the flattened-UV
+  // rasterization (max coverage; strongest dab at a texel owns the color).
+  const strokeDab = (hit, stampMode) => {
+    const cfg = maskPaintCfgRef.current?.current;
+    const renderer = rendererRef.current;
+    if (!cfg || !renderer || !stroke) return;
+    const rtt = getPaintRtt();
+    populateMaskPaintGroup(rtt);
+
+    const R = brushWorldRadius(hit);
+    const h = cfg.hardness ?? 50;
+    const u = rtt.strokeDabMat.uniforms;
+    u.u_baseTexture.value = strokeRts.front.texture;
+    u.u_modelMatrix.value.copy(hit.object.matrixWorld);
+    u.u_mouseWorldPos.value.copy(hit.point);
+    u.u_brushRadius.value = R;
+    u.u_innerRadius.value = R * Math.max(0, 1 - h / 100);
+    u.u_alphaScale.value = pressureAlphaScale();
+    u.u_stampMode.value = stampMode ? 1.0 : 0.0;
+    u.u_paintColor.value.copy(parseBrushColor());
+    if (stampMode) {
+      const sv = stampViewUniforms(hit);
+      const view = stampViewRef.current;
+      if (!sv || !view) return;
+      u.u_srcTexture.value = view.rt.texture;
+      u.u_viewProj.value.copy(sv.curVP);
+      u.u_viewport.value.set(view.w, view.h);
+      u.u_copyPx.value.copy(sv.copyPx);
+      u.u_startPx.value.copy(sv.startPx);
+      u.u_flip.value.set(cfg.stampInvertX ? -1 : 1, cfg.stampInvertY ? -1 : 1);
+      u.u_zoomRatio.value = sv.zoomRatio;
+    }
+
+    const back = strokeRts.front === strokeRts.a ? strokeRts.b : strokeRts.a;
+    hideAllRtt(rtt);
+    rtt.copyMat.uniforms.u_tex.value = strokeRts.front.texture;
+    rtt.copyQuad.visible = true;
+    renderer.setRenderTarget(back);
+    renderer.render(rtt.scene, rtt.cam);
+    rtt.copyQuad.visible = false;
+    rtt.paintGroup.children.forEach((c) => { c.material = rtt.strokeDabMat; });
+    rtt.paintGroup.visible = true;
+    renderer.render(rtt.scene, rtt.cam);
+    renderer.setRenderTarget(null);
+    rtt.paintGroup.children.forEach((c) => { c.material = rtt.mat; });
+    strokeRts.front = back;
+    stroke.dirty = true;
+  };
+
+  // Composite base ∘ effect(stroke) into `entry`'s back buffer and return
+  // its texture for live binding. `opacity` is the slider value — pen
+  // pressure is already baked into the stroke buffer's alpha.
+  const compositeStroke = (entry, mode, opacity, opts = {}) => {
+    const renderer = rendererRef.current;
+    const rtt = getPaintRtt();
+    const back = entry.front === entry.a ? entry.b : entry.a;
+    const cu = rtt.strokeCompMat.uniforms;
+    cu.u_baseTexture.value = entry.front.texture;
+    cu.u_stroke.value = strokeRts.front.texture;
+    cu.u_mode.value = mode;
+    cu.u_opacity.value = opacity;
+    if (opts.color) cu.u_paintColor.value.copy(opts.color);
+    cu.u_blurTexture.value = opts.blurTex || null;
+    hideAllRtt(rtt);
+    rtt.strokeCompQuad.visible = true;
+    renderer.setRenderTarget(back);
+    renderer.render(rtt.scene, rtt.cam);
+    renderer.setRenderTarget(null);
+    rtt.strokeCompQuad.visible = false;
+    return back.texture;
+  };
+
+  // Island-edge bleed back → front (shared by mask and uvmap commits).
+  const bleedBackToFront = (rtt, entry) => {
+    const renderer = rendererRef.current;
+    const back = entry.front === entry.a ? entry.b : entry.a;
+    const bu = rtt.bleedMat.uniforms;
+    bu.u_base.value = back.texture;
+    bu.u_coverage.value = rtt.coverageRT.texture;
+    bu.u_texelSize.value = 1 / entry.front.width;
+    hideAllRtt(rtt);
+    rtt.bleedQuad.visible = true;
+    renderer.setRenderTarget(entry.front);
+    renderer.render(rtt.scene, rtt.cam);
+    renderer.setRenderTarget(null);
+    rtt.bleedQuad.visible = false;
+  };
+
+  // RGB spread into alpha-0 texels near content — 6 ping-pong passes,
+  // ending with the result in front (same as the old per-dab post pass).
+  const alphaFillFront = (rtt, entry) => {
+    const renderer = rendererRef.current;
+    rtt.alphaFillMat.uniforms.u_texelSize.value = 1 / entry.front.width;
+    hideAllRtt(rtt);
+    rtt.alphaFillQuad.visible = true;
+    let src = entry.front;
+    let dst = entry.front === entry.a ? entry.b : entry.a;
+    for (let i = 0; i < 6; i++) {
+      rtt.alphaFillMat.uniforms.u_base.value = src.texture;
+      renderer.setRenderTarget(dst);
+      renderer.render(rtt.scene, rtt.cam);
+      const t = src; src = dst; dst = t;
+    }
+    rtt.alphaFillQuad.visible = false;
+    renderer.setRenderTarget(null);
+  };
+
+  // Commit the accumulated stroke: re-run the composite into each target's
+  // back buffer, then the usual bleed (+ alpha-fill for uvmaps) lands the
+  // result in front, which gets rebound to the live shader and is what the
+  // debounced saves read back. Then the stroke buffer is wiped to black.
+  const endStroke = () => {
+    const s = stroke;
+    if (!s) return;
+    stroke = null;
+    const cfg = maskPaintCfgRef.current?.current;
+    const renderer = rendererRef.current;
+    const rtt = paintRttRef.current;
+    const pending = [];
+    if (s.dirty && cfg && renderer && rtt && strokeRts) {
+      ensureMaskCoverage(rtt);
+      const opacity = Math.min(1, Math.max(0.01, (cfg.opacity ?? 100) / 100));
+      const strength = Math.min(1, Math.max(0.01, (cfg.blurStrength ?? 50) / 100));
+      const paintColor = parseBrushColor();
+      for (const layerId of s.layerIds) {
+        if (s.tool === 'mask' || s.tool === 'inpaint') {
+          const isInpaint = s.tool === 'inpaint';
+          const entry = isInpaint ? getInpaintEntry() : cfg.getOrCreateLayerMask?.(layerId);
+          if (!entry) continue;
+          if (!entry.initialized) clearMaskTarget(entry, isInpaint ? 0x000000 : 0xffffff);
+          if (entry.needsDilate && dilateMaskEntry(rtt, entry)) entry.needsDilate = false;
+          const subtract = isInpaint ? cfg.sign === 'subtract' : cfg.maskSign === 'eraser';
+          compositeStroke(entry, subtract ? 3 : 2, opacity);
+          bleedBackToFront(rtt, entry);
+          const tex = entry.front.texture;
+          if (isInpaint) bindInpaintTexture(tex);
+          else { syncMaskUniform(layerId, tex); cfg.markMaskModified?.(layerId); }
+        } else {
+          // Stamp entries initialize asynchronously — commit inside the
+          // promise so a stroke ending before first-init still lands.
+          pending.push(ensureStampEntry(layerId, cfg).then((entry) => {
+            if (!entry) return;
+            ensureMaskCoverage(rtt);
+            let blurTex = null;
+            const mode = s.tool === 'eraser' ? 1 : s.tool === 'stamp' ? 4 : s.tool === 'blur' ? 5 : 0;
+            if (s.tool === 'blur') blurTex = blurLayerIntoScratch(entry, s.blurTexels);
+            compositeStroke(entry, mode, s.tool === 'blur' ? strength : opacity, { color: paintColor, blurTex });
+            bleedBackToFront(rtt, entry);
+            alphaFillFront(rtt, entry);
+            stampTexRef.current.set(layerId, entry.front.texture);
+            bindLayerTexture(layerId, entry.front.texture);
+          }));
+          if (s.tool === 'brush' || s.tool === 'stamp') {
+            const maskEntry = cfg.getOrCreateLayerMask?.(layerId);
+            if (maskEntry) {
+              if (!maskEntry.initialized) clearMaskTarget(maskEntry, 0xffffff);
+              if (maskEntry.needsDilate && dilateMaskEntry(rtt, maskEntry)) maskEntry.needsDilate = false;
+              compositeStroke(maskEntry, 6, 1);
+              bleedBackToFront(rtt, maskEntry);
+              syncMaskUniform(layerId, maskEntry.front.texture);
+              cfg.markMaskModified?.(layerId);
+            }
+          }
+        }
+      }
+    }
+    if (pending.length) {
+      // Deferred commits still sample the stroke buffer — wipe once they land.
+      Promise.all(pending).then(clearStrokeRts);
+    } else {
+      clearStrokeRts();
+    }
+  };
+
+  // Mask/inpaint dab — accumulate the disc into the stroke buffer, then
+  // composite onto each layer mask's (or the inpaint overlay's) snapshot
+  // into its back buffer, which is bound to the live shader as a preview.
+  const stampMaskAtHit = (layerIds, hit, signOverride = null) => {
+    const cfg = maskPaintCfgRef.current?.current;
+    const renderer = rendererRef.current;
+    if (!cfg || !renderer || !layerIds?.length) return;
+    const isInpaint = cfg.tool === 'inpaint';
+    const rtt = getPaintRtt();
+    ensureStroke(isInpaint ? 'inpaint' : 'mask', layerIds);
+    strokeDab(hit, false);
+    const sign =
+      signOverride ?? ((cfg.tool === 'mask' && cfg.maskSign === 'eraser') || (isInpaint && cfg.sign === 'subtract') ? -1 : 1);
+    const opacity = Math.min(1, Math.max(0.01, (cfg.opacity ?? 100) / 100));
+    for (const layerId of layerIds) {
+      const entry = isInpaint ? getInpaintEntry() : cfg.getOrCreateLayerMask?.(layerId);
+      if (!entry) continue;
+      if (!entry.initialized) clearMaskTarget(entry, isInpaint ? 0x000000 : 0xffffff);
+      // Loaded before the mesh existed → run the deferred edge dilation now
+      if (entry.needsDilate && dilateMaskEntry(rtt, entry)) entry.needsDilate = false;
+      const tex = compositeStroke(entry, sign < 0 ? 3 : 2, opacity);
+      if (isInpaint) {
+        bindInpaintTexture(tex);
+      } else {
+        syncMaskUniform(layerId, tex);
+        cfg.markMaskModified?.(layerId);
+      }
+    }
+  };
+
+  // Clone-stamp dab — screen-space clone: every destination texel projects
+  // its world position through the capture-time camera and samples the
+  // captured composite view at copy + flip*(texel − strokeStart). The dab
+  // accumulates into the shared stroke buffer (coverage + sampled color),
+  // then the per-layer composite previews the stroke over the layer's
+  // stroke-start snapshot — overlapping dabs can't double-apply color or
+  // opacity the way direct stamping did.
+  const stampUvmapAtHit = (layerIds, hit) => {
+    const cfg = maskPaintCfgRef.current?.current;
+    const renderer = rendererRef.current;
+    const view = stampViewRef.current;
+    if (!cfg || !renderer || !hit || !view) return;
+    // Generated/inpainted layers are never stamp targets
+    layerIds = layerIds.filter((lid) => cfg.isStampableLayer?.(lid) ?? true);
+    if (!layerIds.length) return;
+
+    ensureStroke('stamp', layerIds);
+    strokeDab(hit, true);
+    const opacity = Math.min(1, Math.max(0.01, (cfg.opacity ?? 100) / 100));
+    const rtt = getPaintRtt();
+    for (const layerId of layerIds) {
+      ensureStampEntry(layerId, cfg).then((entry) => {
+        if (!entry || !stroke || stroke.tool !== 'stamp') return;
+        const tex = compositeStroke(entry, 4, opacity);
+        bindLayerTexture(layerId, tex);
+      });
+      // Reveal the stamped pixels through the layer mask
+      const maskEntry = cfg.getOrCreateLayerMask?.(layerId);
+      if (maskEntry) {
+        if (!maskEntry.initialized) clearMaskTarget(maskEntry, 0xffffff);
+        if (maskEntry.needsDilate && dilateMaskEntry(rtt, maskEntry)) maskEntry.needsDilate = false;
+        const mtex = compositeStroke(maskEntry, 6, 1);
+        syncMaskUniform(layerId, mtex);
+        cfg.markMaskModified?.(layerId);
+      }
+    }
+  };
+
+  // Color paint/erase dab — the disc accumulates into the shared stroke
+  // buffer (color in .rgb, coverage in .a), then each layer composites
+  // base ∘ paint/erase into its back buffer for the live preview. Because
+  // the stroke buffer is a max-accumulated mask rather than summed alpha,
+  // overlapping dabs at <100% opacity no longer show their overlap.
   const paintColorAtHit = (layerIds, hit) => {
     const cfg = maskPaintCfgRef.current?.current;
     const renderer = rendererRef.current;
     if (!cfg || !renderer || !hit || !layerIds?.length) return;
 
+    const erase = cfg.tool === 'eraser';
     const rtt = getPaintRtt();
-    populateMaskPaintGroup(rtt);
-    const pg = rtt.paintGroup;
-    pg.visible = true;
-    rtt.blitQuad.visible = false;
-
-    // Capture per-dab values — the async init callback may run after later
-    // dabs have overwritten the shared uniforms.
-    const R = brushWorldRadius(hit);
-    const h = cfg.hardness ?? 50;
-    const dabWorld = hit.point.clone();
-    const modelMat = hit.object.matrixWorld.clone();
-    const opacity = Math.min(1, Math.max(0.01, ((cfg.opacity ?? 100) / 100) * pressureAlphaScale()));
-    const erase = cfg.tool === 'eraser' ? 1.0 : 0.0;
-    // Parse the hex into raw sRGB components — Color.set() would convert to
-    // linear working space and the RT would store ~2.2x darker bytes than
-    // the color the user picked. setRGB defaults to working-space (raw).
-    const m = /^#?([0-9a-fA-F]{6})$/.exec(cfg.color || '');
-    tmpColor.setRGB(
-      m ? parseInt(m[1].slice(0, 2), 16) / 255 : 1,
-      m ? parseInt(m[1].slice(2, 4), 16) / 255 : 0,
-      m ? parseInt(m[1].slice(4, 6), 16) / 255 : 0
-    );
-    const paintColor = tmpColor.clone();
-    const res = cfg.textureResolution || 1024;
+    ensureStroke(cfg.tool, layerIds);
+    strokeDab(hit, false);
+    const opacity = Math.min(1, Math.max(0.01, (cfg.opacity ?? 100) / 100));
+    const paintColor = parseBrushColor();
 
     for (const layerId of layerIds) {
       ensureStampEntry(layerId, cfg).then((entry) => {
-        if (!entry) return;
-        ensureMaskCoverage(rtt);
-        const back = entry.front === entry.a ? entry.b : entry.a;
-
-        // Preserve current state in the write target (off-island texels)
-        pg.visible = false;
-        rtt.copyMat.uniforms.u_tex.value = entry.front.texture;
-        rtt.copyQuad.visible = true;
-        renderer.setRenderTarget(back);
-        renderer.render(rtt.scene, rtt.cam);
-        rtt.copyQuad.visible = false;
-
-        // Paint the color/erase dab through the flattened-UV rasterization
-        const cu = rtt.colorPaintMat.uniforms;
-        cu.u_baseTexture.value = entry.front.texture;
-        cu.u_paintColor.value.copy(paintColor);
-        cu.u_erase.value = erase;
-        cu.u_modelMatrix.value.copy(modelMat);
-        cu.u_mouseWorldPos.value.copy(dabWorld);
-        cu.u_brushRadius.value = R;
-        cu.u_innerRadius.value = R * Math.max(0, 1 - h / 100);
-        cu.u_brushStrength.value = opacity;
-        pg.children.forEach((c) => { c.material = rtt.colorPaintMat; });
-        pg.visible = true;
-        renderer.render(rtt.scene, rtt.cam);
-
-        // Bleed island edges then spread rgb into alpha-0 texels near
-        // content — same post passes the stamp dab runs.
-        const bs = rtt.bleedMat.uniforms;
-        bs.u_base.value = back.texture;
-        bs.u_coverage.value = rtt.coverageRT.texture;
-        bs.u_texelSize.value = 1 / res;
-        pg.visible = false;
-        rtt.bleedQuad.visible = true;
-        renderer.setRenderTarget(entry.front);
-        renderer.render(rtt.scene, rtt.cam);
-        rtt.bleedQuad.visible = false;
-        rtt.alphaFillQuad.visible = true;
-        rtt.alphaFillMat.uniforms.u_texelSize.value = 1 / res;
-        {
-          let src = entry.front;
-          let dst = back;
-          for (let i = 0; i < 6; i++) {
-            rtt.alphaFillMat.uniforms.u_base.value = src.texture;
-            renderer.setRenderTarget(dst);
-            renderer.render(rtt.scene, rtt.cam);
-            const t = src; src = dst; dst = t;
-          }
-        }
-        renderer.setRenderTarget(null);
-        rtt.alphaFillQuad.visible = false;
-        pg.visible = true;
-        pg.children.forEach((c) => { c.material = rtt.mat; });
-        stampTexRef.current.set(layerId, entry.front.texture);
-        bindLayerTexture(layerId, entry.front.texture);
+        if (!entry || !stroke || (stroke.tool !== 'brush' && stroke.tool !== 'eraser')) return;
+        const tex = compositeStroke(entry, erase ? 1 : 0, opacity, { color: paintColor });
+        bindLayerTexture(layerId, tex);
       });
+      // Painting reveals the painted pixels through the layer mask (same as
+      // the stamp tool); erasing leaves the mask untouched.
+      if (!erase) {
+        const maskEntry = cfg.getOrCreateLayerMask?.(layerId);
+        if (maskEntry) {
+          if (!maskEntry.initialized) clearMaskTarget(maskEntry, 0xffffff);
+          if (maskEntry.needsDilate && dilateMaskEntry(rtt, maskEntry)) maskEntry.needsDilate = false;
+          const mtex = compositeStroke(maskEntry, 6, 1);
+          syncMaskUniform(layerId, mtex);
+          cfg.markMaskModified?.(layerId);
+        }
+      }
     }
-    // Painting reveals the painted pixels through the layer mask (same as
-    // the stamp tool); erasing leaves the mask untouched.
-    if (!erase) stampMaskAtHit(layerIds, hit, 1);
   };
 
   // Scratch render target for the blur tool's whole-texture blur pass —
@@ -715,32 +769,47 @@ export function createPaintEngine(ctx) {
     return blurScratch;
   };
 
-  // Blur dab — softens a layer's uvmap under the brush disc. Per dab:
-  //   1) blur the layer's whole stamp RT into a scratch target
-  //   2) blit front → back (preserve off-island texels)
-  //   3) composite mix(front, blurred) into back through the flattened-UV
-  //      rasterization, masked by the brush falloff × Strength
-  //   4) island-edge bleed + rgb alpha-fill, same as the stamp pass
+  // Blur a layer's stroke-start snapshot into the shared scratch RT —
+  // 24-tap disc blur. Recomputed per composite; cheap relative to the old
+  // per-dab whole-texture blur.
+  const blurLayerIntoScratch = (entry, texels) => {
+    const renderer = rendererRef.current;
+    const rtt = getPaintRtt();
+    const res = entry.front.width;
+    const scratch = getBlurScratch(res);
+    hideAllRtt(rtt);
+    const bu = rtt.blurMat.uniforms;
+    bu.u_tex.value = entry.front.texture;
+    bu.u_texelSize.value = 1 / res;
+    bu.u_radiusPx.value = texels;
+    rtt.blurQuad.visible = true;
+    renderer.setRenderTarget(scratch);
+    renderer.render(rtt.scene, rtt.cam);
+    renderer.setRenderTarget(null);
+    rtt.blurQuad.visible = false;
+    return scratch.texture;
+  };
+
+  // Blur dab — the disc accumulates into the shared stroke buffer, then
+  // each layer previews mix(snapshot, blurred snapshot, stroke × Strength).
+  // Blurring the immutable snapshot (not the accumulating buffer) is what
+  // lets the blur tool share the stroke-mask pipeline — the effect applies
+  // once per texel no matter how many dabs overlap.
   const blurUvmapAtHit = (layerIds, hit) => {
     const cfg = maskPaintCfgRef.current?.current;
     const renderer = rendererRef.current;
     if (!cfg || !renderer || !hit || !layerIds?.length) return;
 
-    const rtt = getPaintRtt();
-    populateMaskPaintGroup(rtt);
-    const pg = rtt.paintGroup;
-    pg.visible = true;
-    rtt.blitQuad.visible = false;
+    ensureStroke('blur', layerIds);
+    strokeDab(hit, false);
 
     const R = brushWorldRadius(hit);
-    const h = cfg.hardness ?? 50;
-    const dabWorld = hit.point.clone();
-    const modelMat = hit.object.matrixWorld.clone();
-    const strength = Math.min(1, Math.max(0.01, ((cfg.blurStrength ?? 50) / 100) * pressureAlphaScale()));
+    const strength = Math.min(1, Math.max(0.01, (cfg.blurStrength ?? 50) / 100));
     const res = cfg.textureResolution || 1024;
 
     // Blur kernel radius in uvmap texels — derived from the hit triangle's
     // uv-per-world density so the blur footprint tracks the brush disc.
+    const modelMat = hit.object.matrixWorld;
     let uvPerWorld = 0;
     const posAttr = hit.object.geometry?.attributes?.position;
     const uvAttr = hit.object.geometry?.attributes?.uv;
@@ -754,80 +823,15 @@ export function createPaintEngine(ctx) {
     }
     // ~40% of the brush radius; fallback ~1.5% of the map when the face
     // offers no usable density. Clamped so degenerate faces can't explode it.
-    const blurTexels = Math.min(96, Math.max(1.5,
+    stroke.blurTexels = Math.min(96, Math.max(1.5,
       uvPerWorld > 0 ? R * uvPerWorld * res * 0.4 : res * 0.015));
-    const scratch = getBlurScratch(res);
 
     for (const layerId of layerIds) {
       ensureStampEntry(layerId, cfg).then((entry) => {
-        if (!entry) return;
-        ensureMaskCoverage(rtt);
-        const back = entry.front === entry.a ? entry.b : entry.a;
-
-        // 1) Blur the whole texture: front → scratch
-        pg.visible = false;
-        rtt.blitQuad.visible = false;
-        rtt.copyQuad.visible = false;
-        rtt.bleedQuad.visible = false;
-        rtt.alphaFillQuad.visible = false;
-        const bu = rtt.blurMat.uniforms;
-        bu.u_tex.value = entry.front.texture;
-        bu.u_texelSize.value = 1 / res;
-        bu.u_radiusPx.value = blurTexels;
-        rtt.blurQuad.visible = true;
-        renderer.setRenderTarget(scratch);
-        renderer.render(rtt.scene, rtt.cam);
-        rtt.blurQuad.visible = false;
-
-        // 2) Preserve current state in the write target (off-island texels)
-        rtt.copyMat.uniforms.u_tex.value = entry.front.texture;
-        rtt.copyQuad.visible = true;
-        renderer.setRenderTarget(back);
-        renderer.render(rtt.scene, rtt.cam);
-        rtt.copyQuad.visible = false;
-
-        // 3) Composite the blur through the brush disc into back
-        const mu = rtt.blurMixMat.uniforms;
-        mu.u_baseTexture.value = entry.front.texture;
-        mu.u_blurTexture.value = scratch.texture;
-        mu.u_modelMatrix.value.copy(modelMat);
-        mu.u_mouseWorldPos.value.copy(dabWorld);
-        mu.u_brushRadius.value = R;
-        mu.u_innerRadius.value = R * Math.max(0, 1 - h / 100);
-        mu.u_brushStrength.value = strength;
-        pg.children.forEach((c) => { c.material = rtt.blurMixMat; });
-        pg.visible = true;
-        renderer.render(rtt.scene, rtt.cam);
-
-        // 4) Bleed island edges then spread rgb into alpha-0 texels near
-        // content — same post passes the stamp dab runs.
-        const bs = rtt.bleedMat.uniforms;
-        bs.u_base.value = back.texture;
-        bs.u_coverage.value = rtt.coverageRT.texture;
-        bs.u_texelSize.value = 1 / res;
-        pg.visible = false;
-        rtt.bleedQuad.visible = true;
-        renderer.setRenderTarget(entry.front);
-        renderer.render(rtt.scene, rtt.cam);
-        rtt.bleedQuad.visible = false;
-        rtt.alphaFillQuad.visible = true;
-        rtt.alphaFillMat.uniforms.u_texelSize.value = 1 / res;
-        {
-          let src = entry.front;
-          let dst = back;
-          for (let i = 0; i < 6; i++) {
-            rtt.alphaFillMat.uniforms.u_base.value = src.texture;
-            renderer.setRenderTarget(dst);
-            renderer.render(rtt.scene, rtt.cam);
-            const t = src; src = dst; dst = t;
-          }
-        }
-        renderer.setRenderTarget(null);
-        rtt.alphaFillQuad.visible = false;
-        pg.visible = true;
-        pg.children.forEach((c) => { c.material = rtt.mat; });
-        stampTexRef.current.set(layerId, entry.front.texture);
-        bindLayerTexture(layerId, entry.front.texture);
+        if (!entry || !stroke || stroke.tool !== 'blur') return;
+        const blurTex = blurLayerIntoScratch(entry, stroke.blurTexels);
+        const tex = compositeStroke(entry, 5, strength, { blurTex });
+        bindLayerTexture(layerId, tex);
       });
     }
   };
@@ -1079,6 +1083,7 @@ export function createPaintEngine(ctx) {
     stampUvmapAtHit,
     blurUvmapAtHit,
     paintColorAtHit,
+    endStroke,
     getStampCanvasDataUrl,
     invalidateStampCanvas,
     uploadMaskImage,

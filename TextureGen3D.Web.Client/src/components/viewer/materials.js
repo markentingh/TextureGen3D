@@ -511,7 +511,165 @@ export function createPaintRtt() {
     blending: THREE.NoBlending,
   });
 
-  scene.add(paintGroup, blitQuad, bleedQuad, copyQuad, alphaFillQuad, blurQuad);
+  // Stroke-buffer dab — accumulates one brush stroke into a shared
+  // coverage/color buffer instead of writing straight into the layer.
+  // .a holds max coverage (falloff x pen-pressure alpha; the opacity
+  // slider is deliberately excluded — it's applied once at composite).
+  // .rgb holds the dab color: the brush color, or the captured view
+  // sample for the stamp tool, so overlapping stamp dabs can't
+  // double-apply their color.
+  const strokeDabMat = new THREE.ShaderMaterial({
+    uniforms: {
+      u_baseTexture: { value: null },        // stroke buffer's previous state
+      u_srcTexture: { value: null },         // stamp: captured composite view
+      u_modelMatrix: { value: new THREE.Matrix4() },
+      u_viewProj: { value: new THREE.Matrix4() },   // stamp: current camera VP
+      u_viewport: { value: new THREE.Vector2(1, 1) },
+      u_mouseWorldPos: { value: new THREE.Vector3() },
+      u_copyPx: { value: new THREE.Vector2() },     // stamp: copy pt, capture px (y-up)
+      u_startPx: { value: new THREE.Vector2() },    // stamp: stroke start, current px (y-up)
+      u_flip: { value: new THREE.Vector2(1, 1) },
+      u_zoomRatio: { value: 1.0 },
+      u_brushRadius: { value: 0.1 },         // world units
+      u_innerRadius: { value: 0.0 },         // hardness core
+      u_alphaScale: { value: 1.0 },          // pen-pressure alpha only
+      u_stampMode: { value: 0.0 },
+      u_paintColor: { value: new THREE.Color(1, 1, 1) },
+    },
+    vertexShader: `
+      uniform mat4 u_modelMatrix;
+      varying vec2 vUv;
+      varying vec3 vWorldPosition;
+      void main() {
+        vUv = uv;
+        vWorldPosition = (u_modelMatrix * vec4(position, 1.0)).xyz;
+        gl_Position = vec4(uv * 2.0 - 1.0, 0.0, 1.0);
+      }
+    `,
+    fragmentShader: `
+      uniform sampler2D u_baseTexture;
+      uniform sampler2D u_srcTexture;
+      uniform mat4 u_viewProj;
+      uniform vec2 u_viewport;
+      uniform vec3 u_mouseWorldPos;
+      uniform vec2 u_copyPx;
+      uniform vec2 u_startPx;
+      uniform vec2 u_flip;
+      uniform float u_zoomRatio;
+      uniform float u_brushRadius;
+      uniform float u_innerRadius;
+      uniform float u_alphaScale;
+      uniform float u_stampMode;
+      uniform vec3 u_paintColor;
+      varying vec2 vUv;
+      varying vec3 vWorldPosition;
+      vec2 scrPx(vec3 w) {
+        vec4 c = u_viewProj * vec4(w, 1.0);
+        return (c.xy / c.w * 0.5 + 0.5) * u_viewport;
+      }
+      void main() {
+        vec4 base = texture2D(u_baseTexture, vUv);
+        float d = distance(vWorldPosition, u_mouseWorldPos);
+        float paint;
+        if (u_innerRadius >= u_brushRadius - 1e-6) {
+          paint = d < u_brushRadius ? 1.0 : 0.0;
+        } else {
+          paint = 1.0 - smoothstep(u_innerRadius, u_brushRadius, d);
+        }
+        paint *= u_alphaScale;
+        vec3 dabColor = u_paintColor;
+        float gate = 1.0;
+        if (u_stampMode > 0.5) {
+          vec2 srcPx = u_copyPx + u_flip * (scrPx(vWorldPosition) - u_startPx) * u_zoomRatio;
+          vec4 src = texture2D(u_srcTexture, srcPx / u_viewport);
+          dabColor = src.rgb;
+          gate = src.a; // don't claim coverage where the view shows no mesh
+        }
+        float cov = paint * gate;
+        // Max-composite coverage; the strongest dab at each texel owns the
+        // color, so overlapped dabs can't sum past the dab's own value.
+        float a = max(base.a, cov);
+        vec3 rgb = cov > base.a ? dabColor : base.rgb;
+        gl_FragColor = vec4(rgb, a);
+      }
+    `,
+    depthTest: false,
+    depthWrite: false,
+    blending: THREE.NoBlending,
+  });
+
+  // Stroke composite — fullscreen pass that applies the accumulated stroke
+  // buffer to a layer's stroke-start snapshot exactly once:
+  //   0 paint  : source-over u_paintColor at stroke.a * opacity
+  //   1 erase  : base alpha reduced by stroke.a * opacity
+  //   2/3 mask : mask.r +/- stroke.a * opacity
+  //   4 stamp  : source-over stroke.rgb at stroke.a * opacity
+  //   5 blur   : mix(base, blurred base, stroke.a * strength)
+  //   6 reveal : mask.r = max(mask.r, stroke.a * 4) — unmask painted area
+  const strokeCompMat = new THREE.ShaderMaterial({
+    uniforms: {
+      u_baseTexture: { value: null },        // layer snapshot (front buffer)
+      u_stroke: { value: null },             // accumulated stroke buffer
+      u_blurTexture: { value: null },        // blurred base (mode 5)
+      u_paintColor: { value: new THREE.Color(1, 0, 0) },
+      u_opacity: { value: 1.0 },             // slider value 0..1 (no pressure)
+      u_mode: { value: 0.0 },
+    },
+    vertexShader: `
+      varying vec2 vUv;
+      void main() {
+        vUv = uv;
+        gl_Position = vec4(position.xy, 0.0, 1.0);
+      }
+    `,
+    fragmentShader: `
+      uniform sampler2D u_baseTexture;
+      uniform sampler2D u_stroke;
+      uniform sampler2D u_blurTexture;
+      uniform vec3 u_paintColor;
+      uniform float u_opacity;
+      uniform float u_mode;
+      varying vec2 vUv;
+      void main() {
+        vec4 b = texture2D(u_baseTexture, vUv);
+        vec4 s = texture2D(u_stroke, vUv);
+        int m = int(u_mode + 0.5);
+        if (m == 1) {
+          gl_FragColor = vec4(b.rgb, b.a * (1.0 - s.a * u_opacity));
+          return;
+        }
+        if (m == 2 || m == 3) {
+          float sign = m == 2 ? 1.0 : -1.0;
+          float v = clamp(b.r + sign * s.a * u_opacity, 0.0, 1.0);
+          gl_FragColor = vec4(v, v, v, 1.0);
+          return;
+        }
+        if (m == 5) {
+          vec4 blur = texture2D(u_blurTexture, vUv);
+          gl_FragColor = mix(b, blur, s.a * u_opacity);
+          return;
+        }
+        if (m == 6) {
+          float v = max(b.r, min(1.0, s.a * 4.0));
+          gl_FragColor = vec4(v, v, v, 1.0);
+          return;
+        }
+        vec3 srcC = m == 4 ? s.rgb : u_paintColor;
+        float srcA = s.a * u_opacity;
+        float outA = srcA + b.a * (1.0 - srcA);
+        vec3 outRgb = (srcC * srcA + b.rgb * b.a * (1.0 - srcA)) / max(outA, 1e-5);
+        gl_FragColor = vec4(outRgb, outA);
+      }
+    `,
+    depthTest: false,
+    depthWrite: false,
+    blending: THREE.NoBlending,
+  });
+  const strokeCompQuad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), strokeCompMat);
+  strokeCompQuad.frustumCulled = false;
+  strokeCompQuad.visible = false;
+
+  scene.add(paintGroup, blitQuad, bleedQuad, copyQuad, alphaFillQuad, blurQuad, strokeCompQuad);
   return {
     scene, cam, mat, paintGroup, blitQuad,
     coverageMat, coverageRT, coverageMesh: null,
@@ -520,6 +678,7 @@ export function createPaintRtt() {
     alphaFillMat, alphaFillQuad,
     blurMat, blurQuad, blurMixMat,
     colorPaintMat,
+    strokeDabMat, strokeCompMat, strokeCompQuad,
   };
 }
 

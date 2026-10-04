@@ -192,6 +192,7 @@ export default function RightSidebar() {
   const {
     id,
     token,
+    loading,
     project,
     setProject,
     textureResolution,
@@ -465,23 +466,40 @@ export default function RightSidebar() {
 
   // Select a mesh when mesh data becomes available — the persisted
   // selection (selectedMesh:{projectId}) wins, else the first mesh.
+  // Models download and parse one-by-one, so the saved mesh's model may
+  // not be in allMeshes yet — keep waiting for the list to grow rather
+  // than falling back to the first mesh of the first-parsed model.
   useEffect(() => {
     if (selectedMesh || allMeshes.length === 0) return;
-    let pick = allMeshes[0];
+    let savedKey = null;
     try {
-      const savedKey = localStorage.getItem(`selectedMesh:${id}`);
-      const found = savedKey && allMeshes.find((m) => m.key === savedKey);
-      if (found) pick = found;
+      savedKey = localStorage.getItem(`selectedMesh:${id}`);
     } catch { /* storage unavailable — default pick */ }
-    handleMeshSelect(pick);
+    if (savedKey) {
+      const found = allMeshes.find((m) => m.key === savedKey);
+      if (found) {
+        handleMeshSelect(found);
+        return;
+      }
+      // Still waiting on models that haven't parsed or failed yet.
+      const stillParsing =
+        loading || models.some((m) => !meshData[m.id] && !parseErrors?.[m.id]);
+      if (stillParsing) return;
+    }
+    handleMeshSelect(allMeshes[0]);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [allMeshes.length, selectedMesh]);
+  }, [allMeshes, selectedMesh, loading, models, meshData, parseErrors]);
 
   // Persist the selected mesh so a page refresh restores it (mesh.key is
   // `{modelId}-{index}` — stable across reloads). Cleared when nothing is
-  // selected (e.g. the mesh was deleted).
+  // selected (e.g. the mesh was deleted) — but only after a selection has
+  // existed this session, so the mount-time null doesn't wipe the saved
+  // key before the restore effect can read it.
+  const didSelectRef = useRef(false);
   useEffect(() => {
     if (!id) return;
+    if (selectedMesh?.key) didSelectRef.current = true;
+    if (!didSelectRef.current) return;
     try {
       if (selectedMesh?.key) localStorage.setItem(`selectedMesh:${id}`, selectedMesh.key);
       else localStorage.removeItem(`selectedMesh:${id}`);
