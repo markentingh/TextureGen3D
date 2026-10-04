@@ -94,8 +94,13 @@ function ProjectContent() {
   return (
     <div className="fixed inset-0 overflow-hidden bg-gray-900 text-gray-100">
       <ViewportSection />
-      <MaskToolbar />
-      <MouseHints />
+      {/* Bottom bar — two columns: tools pinned left (never shrinks/wraps),
+          mouse hints take the remaining column and wrap inside it, so the
+          hints can never reach into the tools' space. */}
+      <div className="absolute bottom-4 left-80 right-80 z-20 flex items-end justify-between gap-4">
+        <MaskToolbar />
+        <MouseHints />
+      </div>
       <ProjectHeader showPanel={showPanel} setShowPanel={setShowPanel} />
       <RightSidebar />
       {maskTool === 'inpaint' ? (

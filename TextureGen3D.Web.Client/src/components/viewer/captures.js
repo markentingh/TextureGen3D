@@ -679,10 +679,14 @@ export function createCaptureTools(ctx) {
       format: THREE.RGBAFormat,
       type: THREE.UnsignedByteType,
     });
-    // Hide non-mesh scene objects (grid etc.) so they don't get stamped
-    const grid = sceneRef.current?.getObjectByName('__grid');
-    const gridWasVisible = grid?.visible;
-    if (grid) grid.visible = false;
+    // Hide non-mesh scene objects (grid, aux meshes) so they don't get stamped
+    const hidden = [];
+    sceneRef.current?.traverse((obj) => {
+      if ((obj.name === '__grid' || obj.name === '__aux') && obj.visible) {
+        obj.visible = false;
+        hidden.push(obj);
+      }
+    });
     const prevColor = renderer.getClearColor(new THREE.Color());
     const prevAlpha = renderer.getClearAlpha();
     const buf = new Uint8Array(w * h * 4);
@@ -703,7 +707,7 @@ export function createCaptureTools(ctx) {
       }
       c2.putImageData(img, 0, 0);
     } finally {
-      if (grid) grid.visible = gridWasVisible;
+      for (const obj of hidden) obj.visible = true;
       renderer.setRenderTarget(null);
       renderer.setClearColor(prevColor, prevAlpha);
       mats.forEach((m) => {

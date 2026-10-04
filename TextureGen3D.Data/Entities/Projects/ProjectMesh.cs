@@ -11,6 +11,7 @@ namespace TextureGen3D.Data.Entities.Projects
         public int Triangles { get; set; }
         public int Vertices { get; set; }
         public string Prompt { get; set; } = "";
+        public string Settings { get; set; } = "";
         public DateTime Created { get; set; }
     }
 }

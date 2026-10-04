@@ -1,5 +1,6 @@
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
+using TextureGen3D.API.Helpers;
 using TextureGen3D.API.Models;
 using TextureGen3D.API.Services;
 using TextureGen3D.Data.Entities;
@@ -204,7 +205,7 @@ namespace TextureGen3D.API.Controllers
             {
                 var data = await _imageService.GetProjectMeshLayerImageAsync(projectId, meshId, layerId);
                 if (data == null) return NotFound();
-                return File(data, "image/png");
+                return this.CachedFile(data, "image/png");
             }
             catch
             {
@@ -219,7 +220,7 @@ namespace TextureGen3D.API.Controllers
             {
                 var data = await _imageService.GetProjectMeshLayerThumbAsync(projectId, meshId, layerId);
                 if (data == null) return NotFound();
-                return File(data, "image/png");
+                return this.CachedFile(data, "image/png");
             }
             catch
             {
@@ -234,7 +235,7 @@ namespace TextureGen3D.API.Controllers
             {
                 var data = await _imageService.GetProjectMeshLayerUvMapAsync(projectId, meshId, layerId);
                 if (data == null) return NotFound();
-                return File(data, "image/png");
+                return this.CachedFile(data, "image/png");
             }
             catch
             {
@@ -249,7 +250,7 @@ namespace TextureGen3D.API.Controllers
             {
                 var data = await _imageService.GetProjectMeshLayerUvMapThumbAsync(projectId, meshId, layerId);
                 if (data == null) return NotFound();
-                return File(data, "image/png");
+                return this.CachedFile(data, "image/png");
             }
             catch
             {
@@ -264,7 +265,7 @@ namespace TextureGen3D.API.Controllers
             {
                 var data = await _imageService.GetProjectMeshLayerMaskAsync(projectId, meshId, layerId);
                 if (data == null) return NotFound();
-                return File(data, "image/png");
+                return this.CachedFile(data, "image/png");
             }
             catch
             {
@@ -279,7 +280,7 @@ namespace TextureGen3D.API.Controllers
             {
                 var data = await _imageService.GetProjectMeshLayerMaskThumbAsync(projectId, meshId, layerId);
                 if (data == null) return NotFound();
-                return File(data, "image/png");
+                return this.CachedFile(data, "image/png");
             }
             catch
             {
@@ -294,7 +295,7 @@ namespace TextureGen3D.API.Controllers
             {
                 var data = await _imageService.GetProjectMeshLayerAngleThumbAsync(projectId, meshId, layerId);
                 if (data == null) return NotFound();
-                return File(data, "image/png");
+                return this.CachedFile(data, "image/png");
             }
             catch
             {

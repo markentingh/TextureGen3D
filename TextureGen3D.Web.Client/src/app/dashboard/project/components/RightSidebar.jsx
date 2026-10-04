@@ -207,6 +207,8 @@ export default function RightSidebar() {
     setParseErrors,
     meshDbIds,
     setMeshDbIds,
+    auxVisibleIds,
+    toggleAuxMesh,
     meshLayers,
     meshLayersRef,
     setMeshLayers,
@@ -255,6 +257,7 @@ export default function RightSidebar() {
     removeMeshLayer,
     refreshLayerTextures,
     invalidateLayerAssets,
+    updateLayerImageCache,
     formatTriangleCount,
     maskTool,
     setMaskTool,
@@ -460,12 +463,30 @@ export default function RightSidebar() {
 
   // ── File upload handlers ──
 
-  // Select the first mesh when mesh data becomes available
+  // Select a mesh when mesh data becomes available — the persisted
+  // selection (selectedMesh:{projectId}) wins, else the first mesh.
   useEffect(() => {
     if (selectedMesh || allMeshes.length === 0) return;
-    handleMeshSelect(allMeshes[0]);
+    let pick = allMeshes[0];
+    try {
+      const savedKey = localStorage.getItem(`selectedMesh:${id}`);
+      const found = savedKey && allMeshes.find((m) => m.key === savedKey);
+      if (found) pick = found;
+    } catch { /* storage unavailable — default pick */ }
+    handleMeshSelect(pick);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [allMeshes.length, selectedMesh]);
+
+  // Persist the selected mesh so a page refresh restores it (mesh.key is
+  // `{modelId}-{index}` — stable across reloads). Cleared when nothing is
+  // selected (e.g. the mesh was deleted).
+  useEffect(() => {
+    if (!id) return;
+    try {
+      if (selectedMesh?.key) localStorage.setItem(`selectedMesh:${id}`, selectedMesh.key);
+      else localStorage.removeItem(`selectedMesh:${id}`);
+    } catch { /* non-fatal */ }
+  }, [id, selectedMesh]);
   const handleFileUpload = async (file) => {
     if (!file) return;
     const allowedExtensions = ['fbx', 'obj', 'abc', 'usd', 'ply', 'stl'];
@@ -760,6 +781,7 @@ export default function RightSidebar() {
       if (!res.data?.success) throw new Error(res.data?.message || 'Failed to create flattened layer');
       const newLayer = res.data.data;
       await layerApi.saveUvMap(id, newLayer.id, meshDbId, dataUrl);
+      updateLayerImageCache(newLayer.id, dataUrl, 'uvmap');
 
       // Solid white mask — hasMask disables the near-black cull, which is
       // what we want: the flattened composite defines visibility on its own.
@@ -769,7 +791,9 @@ export default function RightSidebar() {
       const mctx = mc.getContext('2d');
       mctx.fillStyle = '#fff';
       mctx.fillRect(0, 0, mc.width, mc.height);
-      await layerApi.saveMasks(id, meshDbId, [{ layerId: newLayer.id, base64Mask: mc.toDataURL('image/png') }]);
+      const flatMaskDataUrl = mc.toDataURL('image/png');
+      await layerApi.saveMasks(id, meshDbId, [{ layerId: newLayer.id, base64Mask: flatMaskDataUrl }]);
+      updateLayerImageCache(newLayer.id, flatMaskDataUrl, 'mask');
 
       const newList = [newLayer, ...meshLayers];
       setMeshLayers(newList);
@@ -911,8 +935,14 @@ export default function RightSidebar() {
         if (thumbRes.ok) await layerApi.saveAngleThumb(id, newLayer.id, meshDbId, await blobToDataUrl(await thumbRes.blob()));
       } catch { /* source has no angle thumb */ }
 
-      if (uvmapDataUrl) await layerApi.saveUvMap(id, newLayer.id, meshDbId, uvmapDataUrl);
-      if (maskDataUrl) await layerApi.saveMasks(id, meshDbId, [{ layerId: newLayer.id, base64Mask: maskDataUrl }]);
+      if (uvmapDataUrl) {
+        await layerApi.saveUvMap(id, newLayer.id, meshDbId, uvmapDataUrl);
+        updateLayerImageCache(newLayer.id, uvmapDataUrl, 'uvmap');
+      }
+      if (maskDataUrl) {
+        await layerApi.saveMasks(id, meshDbId, [{ layerId: newLayer.id, base64Mask: maskDataUrl }]);
+        updateLayerImageCache(newLayer.id, maskDataUrl, 'mask');
+      }
 
       const insertAt = Math.max(0, meshLayers.findIndex((l) => l.id === layer.id));
       const newList = [...meshLayers.slice(0, insertAt), newLayer, ...meshLayers.slice(insertAt)];
@@ -962,11 +992,14 @@ export default function RightSidebar() {
     if (!projected?.uvMap) throw new Error('Failed to generate UV map');
 
     await layerApi.saveUvMap(id, layer.id, meshDbId, projected.uvMap);
-    invalidateLayerAssets(layer.id); // server rewrote uvmap.png (+ mask below)
+    // Server wrote exactly what we sent — update the shared cache in place
+    // instead of invalidating and re-downloading it (+ mask below).
+    updateLayerImageCache(layer.id, projected.uvMap, 'uvmap');
     // Reprojection changes the coverage footprint — refresh the mask, but
     // never overwrite an inpaint layer's painted mask.
     if (projected.mask && layer.type !== 2) {
       await layerApi.saveMasks(id, meshDbId, [{ layerId: layer.id, base64Mask: projected.mask }]);
+      updateLayerImageCache(layer.id, projected.mask, 'mask');
       setMaskThumbVersions((prev) => ({ ...prev, [layer.id]: (prev[layer.id] || 0) + 1 }));
     }
   };
@@ -1147,7 +1180,7 @@ export default function RightSidebar() {
       );
       if (projected?.uvMap) {
         await layerApi.saveUvMap(id, layer.id, meshDbId, projected.uvMap);
-        invalidateLayerAssets(layer.id);
+        updateLayerImageCache(layer.id, projected.uvMap, 'uvmap');
       }
 
       const updatedLayers = await loadMeshLayers(meshDbId);
@@ -1427,7 +1460,10 @@ export default function RightSidebar() {
       let mirroredMask = null;
       if (generatedImage) {
         const projected = await viewerRef.current?.projectImageToUvMap(generatedImage, mirroredRotation, textureResolution);
-        if (projected?.uvMap) await layerApi.saveUvMap(id, newLayer.id, meshDbId, projected.uvMap);
+        if (projected?.uvMap) {
+          await layerApi.saveUvMap(id, newLayer.id, meshDbId, projected.uvMap);
+          updateLayerImageCache(newLayer.id, projected.uvMap, 'uvmap');
+        }
         if (flippedMaskView) {
           try {
             const maskProjected = await viewerRef.current?.projectImageToUvMap(flippedMaskView, mirroredRotation, textureResolution);
@@ -1439,6 +1475,7 @@ export default function RightSidebar() {
         const maskToSave = mirroredMask || projected?.mask;
         if (maskToSave) {
           await layerApi.saveMasks(id, meshDbId, [{ layerId: newLayer.id, base64Mask: maskToSave }]);
+          updateLayerImageCache(newLayer.id, maskToSave, 'mask');
         }
       }
 
@@ -1567,6 +1604,7 @@ export default function RightSidebar() {
           <ul className="divide-y divide-gray-100 dark:divide-gray-700/50">
             {allMeshes.map((mesh) => {
               const isSelected = selectedMesh?.key === mesh.key;
+              const isAuxVisible = auxVisibleIds.includes(meshDbIds[mesh.key]);
               return (
                 <li
                   key={mesh.key}
@@ -1578,7 +1616,32 @@ export default function RightSidebar() {
                   }`}
                   style={isSelected ? { boxShadow: 'inset 0 0 0 2px #a855f7' } : undefined}
                 >
-                  <div className="min-w-0 flex-1 mr-3">
+                  {isSelected ? (
+                    <span
+                      className="p-1 flex-shrink-0 text-purple-600 dark:text-purple-400"
+                      title="Selected mesh"
+                      aria-label="Selected mesh"
+                    >
+                      <Icon name="deployed_code" className="text-base" />
+                    </span>
+                  ) : (
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        toggleAuxMesh(mesh);
+                      }}
+                      className={`p-1 rounded transition flex-shrink-0 ${
+                        isAuxVisible
+                          ? 'text-purple-600 dark:text-purple-400'
+                          : 'text-gray-400 hover:text-purple-600 dark:hover:text-purple-400'
+                      }`}
+                      aria-label={isAuxVisible ? 'Hide mesh in canvas' : 'Show mesh in canvas'}
+                      title={isAuxVisible ? 'Hide mesh in canvas' : 'Show mesh in canvas'}
+                    >
+                      <Icon name={isAuxVisible ? 'visibility' : 'visibility_off'} className="text-base" />
+                    </button>
+                  )}
+                  <div className="min-w-0 flex-1 ml-1 mr-3">
                     <p className={`font-bold text-sm truncate ${
                       isSelected
                         ? 'text-purple-700 dark:text-purple-300'

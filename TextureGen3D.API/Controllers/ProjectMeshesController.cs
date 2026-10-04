@@ -77,6 +77,7 @@ namespace TextureGen3D.API.Controllers
             public string UVMapData { get; set; } = "";
             public int Triangles { get; set; }
             public int Vertices { get; set; }
+            public string Settings { get; set; } = "";
         }
 
         [HttpPost("{projectId}")]
@@ -101,6 +102,7 @@ namespace TextureGen3D.API.Controllers
                     UVMapData = request.UVMapData,
                     Triangles = request.Triangles,
                     Vertices = request.Vertices,
+                    Settings = request.Settings ?? "",
                 };
                 var created = await _meshRepo.CreateAsync(mesh);
                 return Json(new ApiResponse { success = true, data = created });
@@ -136,6 +138,7 @@ namespace TextureGen3D.API.Controllers
                         UVMapData = request.UVMapData,
                         Triangles = request.Triangles,
                         Vertices = request.Vertices,
+                        Settings = request.Settings ?? "",
                     };
                     created.Add(await _meshRepo.CreateAsync(mesh));
                 }
@@ -183,11 +186,12 @@ namespace TextureGen3D.API.Controllers
                     if (existing.TryGetValue(name, out var queue) && queue.Count > 0)
                     {
                         var match = queue.Dequeue();
-                        await _meshRepo.UpdateDataAsync(match.Id, projectId, incoming.MeshData, incoming.UVMapData, incoming.Triangles, incoming.Vertices);
+                        await _meshRepo.UpdateDataAsync(match.Id, projectId, incoming.MeshData, incoming.UVMapData, incoming.Triangles, incoming.Vertices, incoming.Settings ?? "");
                         match.MeshData = incoming.MeshData;
                         match.UVMapData = incoming.UVMapData;
                         match.Triangles = incoming.Triangles;
                         match.Vertices = incoming.Vertices;
+                        match.Settings = incoming.Settings ?? "";
                         results.Add(match);
                     }
                     else
@@ -201,6 +205,7 @@ namespace TextureGen3D.API.Controllers
                             UVMapData = incoming.UVMapData,
                             Triangles = incoming.Triangles,
                             Vertices = incoming.Vertices,
+                            Settings = incoming.Settings ?? "",
                         };
                         results.Add(await _meshRepo.CreateAsync(mesh));
                     }

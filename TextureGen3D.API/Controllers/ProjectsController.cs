@@ -1,5 +1,6 @@
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
+using TextureGen3D.API.Helpers;
 using TextureGen3D.API.Models;
 using TextureGen3D.API.Models.Projects;
 using TextureGen3D.API.Services;
@@ -241,7 +242,7 @@ namespace TextureGen3D.API.Controllers
                 if (thumbBytes.Length == 0)
                     return NotFound();
 
-                return File(thumbBytes, "image/jpeg");
+                return this.CachedFile(thumbBytes, "image/jpeg");
             }
             catch (Exception ex)
             {
@@ -263,7 +264,7 @@ namespace TextureGen3D.API.Controllers
                     imageBytes = await _imageService.GenerateThumbnailAsync(imageBytes);
                 }
 
-                return File(imageBytes, "image/jpeg");
+                return this.CachedFile(imageBytes, "image/jpeg");
             }
             catch (Exception ex)
             {

@@ -24,7 +24,7 @@ export function createLayerComposer(ctx) {
     currentMeshRef, layerBuildIdRef, whiteMaskTexRef, emptyTexRef,
     checkerTexRef, layerGpuRef, stampTexRef, shaderLayerIdsRef,
     dirLight1Ref, unlitRef, inpaintActiveRef, inpaintMaskRef,
-    inpaintTileTexRef, inpaintVisibleRef,
+    inpaintTileTexRef, inpaintVisibleRef, shadowUniformsRef,
   } = ctx;
 
   const getWhiteTex = () => {
@@ -133,6 +133,13 @@ export function createLayerComposer(ctx) {
       u_unlit: { value: unlitRef.current ? 1 : 0 },
       u_hasInpaint: { value: inpaintActiveRef.current && inpaintVisibleRef.current ? 1 : 0 },
       u_dimBackface: { value: 1 },
+      // Shared entries — the viewer updates map/has once per frame and every
+      // material referencing them sees the live shadow map + matrix.
+      u_shadowMap: shadowUniformsRef.current.map,
+      u_shadowMatrix: shadowUniformsRef.current.matrix,
+      u_shadowBias: shadowUniformsRef.current.bias,
+      u_shadowRadius: shadowUniformsRef.current.radius,
+      u_hasShadow: shadowUniformsRef.current.has,
     });
 
     (async () => {

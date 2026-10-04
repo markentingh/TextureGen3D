@@ -2,7 +2,7 @@ CREATE TABLE IF NOT EXISTS public."ProjectMeshes" (
     "Id" UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     "ProjectId" UUID NOT NULL,
     "ModelId" UUID NOT NULL,
-    "Name" VARCHAR(500) NOT NULL DEFAULT '',
+    "Name" VARCHAR(64) NOT NULL DEFAULT '',
     "MeshData" TEXT NOT NULL DEFAULT '',
     "UVMapData" TEXT NOT NULL DEFAULT '',
     "Triangles" INTEGER NOT NULL DEFAULT 0,
@@ -16,3 +16,4 @@ CREATE INDEX IF NOT EXISTS "IX_ProjectMeshes_ProjectId" ON public."ProjectMeshes
 CREATE INDEX IF NOT EXISTS "IX_ProjectMeshes_ModelId" ON public."ProjectMeshes" ("ModelId");
 
 ALTER TABLE public."ProjectMeshes" ADD COLUMN IF NOT EXISTS "Prompt" TEXT NOT NULL DEFAULT '';
+ALTER TABLE public."ProjectMeshes" ADD COLUMN IF NOT EXISTS "Settings" TEXT NOT NULL DEFAULT '';

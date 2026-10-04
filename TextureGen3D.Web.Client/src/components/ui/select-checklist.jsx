@@ -12,6 +12,7 @@ export default function SelectChecklist({
   className = '',
   disabled = false,
   checkboxes = true,
+  multipleLabel = null,
 }) {
   const [open, setOpen] = useState(false);
   const buttonRef = useRef(null);
@@ -68,10 +69,10 @@ export default function SelectChecklist({
       const colorHtml = option.hexColor
         ? `<span class="flex items-center gap-1 mr-2">${option.hexColor.split(',').map((h) => h.trim() ? `<span class="w-5 h-5 rounded-full border border-gray-300 dark:border-gray-600" style="background-color: #${h.trim()}; flex-shrink: 0;"></span>` : '').join('')}</span>`
         : '';
-      return `<label class="flex items-center gap-2 px-3 py-2 ${checkboxesRef.current ? 'cursor-pointer hover:bg-gray-100 dark:hover:bg-gray-600' : ''}" data-value="${option.value}">
+      return `<label class="flex items-center gap-2 px-3 py-2 whitespace-nowrap ${checkboxesRef.current ? 'cursor-pointer hover:bg-gray-100 dark:hover:bg-gray-600' : ''}" data-value="${option.value}">
         ${cbHtml}
         ${colorHtml}
-        <span class="text-sm">${escapedLabel}</span>
+        <span class="text-sm whitespace-nowrap">${escapedLabel}</span>
         ${noteHtml}
       </label>`;
     }).join('');
@@ -82,11 +83,23 @@ export default function SelectChecklist({
     const rect = buttonRef.current.getBoundingClientRect();
     const dropdown = dropdownRef.current;
     dropdown.style.position = 'fixed';
-    dropdown.style.top = `${rect.bottom + 4}px`;
     dropdown.style.left = `${rect.left}px`;
     dropdown.style.width = `${rect.width}px`;
-    const maxH = window.innerHeight - rect.bottom - 8;
-    dropdown.style.maxHeight = `${Math.max(80, maxH)}px`;
+    // Flip above the button when the menu doesn't fit below and there's
+    // more room up top — measure natural height first so the flip
+    // decision uses the real content size.
+    dropdown.style.maxHeight = '';
+    const natural = dropdown.offsetHeight;
+    const spaceBelow = window.innerHeight - rect.bottom - 8;
+    const spaceAbove = rect.top - 8;
+    if (natural > spaceBelow && spaceAbove > spaceBelow) {
+      const h = Math.min(natural, Math.max(80, spaceAbove));
+      dropdown.style.maxHeight = `${Math.max(80, spaceAbove)}px`;
+      dropdown.style.top = `${rect.top - h - 4}px`;
+    } else {
+      dropdown.style.maxHeight = `${Math.max(80, spaceBelow)}px`;
+      dropdown.style.top = `${rect.bottom + 4}px`;
+    }
   }, []);
 
   const createDropdown = useCallback(() => {
@@ -177,7 +190,7 @@ export default function SelectChecklist({
                   <span className="text-sm whitespace-nowrap">{selectedOptions[0].label}</span>
                 </span>
               )
-              : 'Multiple Variant Colors'}
+              : (multipleLabel ?? selectedOptions.map((o) => o.label).join(', '))}
         </span>
         <Icon name="expand_more" className="text-gray-400 text-sm" />
       </button>

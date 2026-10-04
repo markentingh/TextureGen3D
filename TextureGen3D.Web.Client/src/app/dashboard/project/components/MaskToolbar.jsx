@@ -2,6 +2,7 @@ import React from 'react';
 import { useProject } from '@/context/project';
 import Icon from '@/components/ui/icon';
 import Slider from '@/components/ui/slider';
+import SelectChecklist from '@/components/ui/select-checklist';
 import ColorPicker from '@/components/ui/ColorPicker';
 import CleanImageReview from './CleanImageReview';
 
@@ -29,6 +30,10 @@ export default function MaskToolbar() {
     setBrushOpacity,
     blurStrength,
     setBlurStrength,
+    penPressure,
+    setPenPressure,
+    penPressureTargets,
+    setPenPressureTargets,
     brushColor,
     setBrushColor,
     brushPicker,
@@ -88,10 +93,10 @@ export default function MaskToolbar() {
     }`;
 
   return (
-    <div className="absolute bottom-4 left-80 z-20 flex flex-col items-start gap-2 pl-3">
+    <div className="flex flex-col items-start gap-2 pl-3 shrink-0 whitespace-nowrap">
       <CleanImageReview />
       {(maskTool === 'brush' || maskTool === 'eraser' || maskTool === 'mask' || maskTool === 'inpaint' || maskTool === 'stamp' || maskTool === 'blur') && (
-        <div className="w-56 rounded-xl bg-charcoal-700/85 backdrop-blur-sm border-2 border-gray-300/60 shadow-lg px-3 py-2 space-y-2">
+        <div className="w-[100%] rounded-xl bg-charcoal-700/85 backdrop-blur-sm border-2 border-gray-300/60 shadow-lg px-3 py-2 space-y-2">
           <div className="flex items-center justify-between">
             <div className="text-xs font-semibold text-gray-300 uppercase tracking-wide">
               {maskTool.charAt(0).toUpperCase() + maskTool.slice(1)}
@@ -230,6 +235,28 @@ export default function MaskToolbar() {
               small
             />
           )}
+          <div className="flex items-center gap-2">
+            <label className="flex items-center gap-2 text-xs text-gray-300 shrink-0">
+              <input
+                type="checkbox"
+                checked={penPressure}
+                onChange={(e) => setPenPressure(e.target.checked)}
+                className="accent-purple-500"
+              />
+              Pen Pressure
+            </label>
+            <SelectChecklist
+              options={[
+                { value: 'size', label: 'Brush Size' },
+                { value: 'opacity', label: 'Opacity' },
+              ]}
+              values={penPressureTargets}
+              onChange={setPenPressureTargets}
+              placeholder="Select..."
+              disabled={!penPressure}
+              className="flex-1 min-w-0"
+            />
+          </div>
           {maskTool === 'stamp' && (
             <div className="flex items-center gap-3">
               <label className="flex items-center gap-2 text-xs text-gray-300">

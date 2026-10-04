@@ -642,6 +642,38 @@ const LAYER_SHADER_TAIL = `
     // Shadow factor: 1.0 (no shadow) when facing the light, 0.35 (dark) when facing away
     float shadow = mix(0.35, 1.0, clamp(NdotL * 0.5 + 0.5, 0.0, 1.0));
 
+    // Real shadow map — the directional light's depth map sampled at this
+    // fragment's world position. A 5x5 tap grid, randomly rotated per
+    // fragment, spreads over u_shadowRadius texels for soft edges; the
+    // smoothstep depth window softens the binary occluded/lit transition.
+    // u_hasShadow stays 0 until the first shadow pass produces a map.
+    if (u_hasShadow > 0.5) {
+      vec4 sc4 = u_shadowMatrix * vec4(vWorldPos, 1.0);
+      vec3 sc = sc4.xyz / sc4.w;
+      if (sc.x > 0.0 && sc.x < 1.0 && sc.y > 0.0 && sc.y < 1.0 && sc.z > 0.0 && sc.z < 1.0) {
+        float rnd = fract(sin(dot(gl_FragCoord.xy, vec2(12.9898, 78.233))) * 43758.5453);
+        float ang = rnd * 6.2831853;
+        float ca = cos(ang);
+        float sa = sin(ang);
+        mat2 rot = mat2(ca, -sa, sa, ca);
+        float ts = 1.0 / 2048.0;
+        float vis = 0.0;
+        for (int x = -2; x <= 2; x++) {
+          for (int y = -2; y <= 2; y++) {
+            vec2 off = rot * vec2(float(x), float(y)) * u_shadowRadius * ts;
+            vec4 packedDepth = texture2D(u_shadowMap, sc.xy + off);
+            float d = dot(packedDepth, vec4(1.0, 1.0 / 255.0, 1.0 / 65025.0, 1.0 / 16581375.0));
+            // diff > 0 → lit (stored depth at/behind this fragment). The
+            // ramp must *end* at 0: diff = +bias on a correctly-lit surface
+            // would sit inside a ramp starting at 0 and darken everything.
+            vis += smoothstep(-0.0025, 0.0, d - sc.z + u_shadowBias);
+          }
+        }
+        vis /= 25.0;
+        shadow *= mix(0.45, 1.0, vis);
+      }
+    }
+
     vec3 shaded = mix(color.rgb * shadow, color.rgb, u_unlit);
     // Backfaces render as checkerboard dimmed 70% — a viewing aid so
     // polys facing away are unmistakable. u_dimBackface goes to 0
@@ -673,6 +705,11 @@ export const LAYER_COMBINED_FRAGMENT = `
   uniform float u_hasInpaint;
   uniform float u_unlit;
   uniform float u_dimBackface;
+  uniform sampler2D u_shadowMap;
+  uniform mat4 u_shadowMatrix;
+  uniform float u_shadowBias;
+  uniform float u_shadowRadius;
+  uniform float u_hasShadow;
   varying vec2 vUv;
   varying vec3 vNormal;
   varying vec3 vWorldPos;
@@ -717,6 +754,11 @@ export function buildLiveLayerFragment(ops) {
   uniform float u_hasInpaint;
   uniform float u_unlit;
   uniform float u_dimBackface;
+  uniform sampler2D u_shadowMap;
+  uniform mat4 u_shadowMatrix;
+  uniform float u_shadowBias;
+  uniform float u_shadowRadius;
+  uniform float u_hasShadow;
   ${decls.join('\n        ')}
   varying vec2 vUv;
   varying vec3 vNormal;

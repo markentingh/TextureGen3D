@@ -22,8 +22,8 @@ namespace TextureGen3D.Data.Repositories.Projects
                 mesh.Created = DateTime.UtcNow;
 
             const string query = @"
-                INSERT INTO public.""ProjectMeshes"" (""Id"", ""ProjectId"", ""ModelId"", ""Name"", ""MeshData"", ""UVMapData"", ""Triangles"", ""Vertices"", ""Created"")
-                VALUES (@Id, @ProjectId, @ModelId, @Name, @MeshData, @UVMapData, @Triangles, @Vertices, @Created)
+                INSERT INTO public.""ProjectMeshes"" (""Id"", ""ProjectId"", ""ModelId"", ""Name"", ""MeshData"", ""UVMapData"", ""Triangles"", ""Vertices"", ""Settings"", ""Created"")
+                VALUES (@Id, @ProjectId, @ModelId, @Name, @MeshData, @UVMapData, @Triangles, @Vertices, @Settings, @Created)
                 RETURNING *";
             return await _dbConnection.QueryFirstAsync<ProjectMesh>(query, mesh);
         }
@@ -58,10 +58,10 @@ namespace TextureGen3D.Data.Repositories.Projects
             await _dbConnection.ExecuteAsync(query, new { modelId, projectId });
         }
 
-        public async Task UpdateDataAsync(Guid id, Guid projectId, string meshData, string uvMapData, int triangles, int vertices)
+        public async Task UpdateDataAsync(Guid id, Guid projectId, string meshData, string uvMapData, int triangles, int vertices, string settings)
         {
-            const string query = @"UPDATE public.""ProjectMeshes"" SET ""MeshData"" = @meshData, ""UVMapData"" = @uvMapData, ""Triangles"" = @triangles, ""Vertices"" = @vertices WHERE ""Id"" = @id AND ""ProjectId"" = @projectId";
-            await _dbConnection.ExecuteAsync(query, new { id, projectId, meshData, uvMapData, triangles, vertices });
+            const string query = @"UPDATE public.""ProjectMeshes"" SET ""MeshData"" = @meshData, ""UVMapData"" = @uvMapData, ""Triangles"" = @triangles, ""Vertices"" = @vertices, ""Settings"" = @settings WHERE ""Id"" = @id AND ""ProjectId"" = @projectId";
+            await _dbConnection.ExecuteAsync(query, new { id, projectId, meshData, uvMapData, triangles, vertices, settings });
         }
 
         public async Task UpdatePromptAsync(Guid id, Guid projectId, string prompt)

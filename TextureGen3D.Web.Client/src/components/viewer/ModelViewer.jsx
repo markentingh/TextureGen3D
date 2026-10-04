@@ -3,7 +3,8 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import Icon from '@/components/ui/icon';
 import { SCENE_OFFSET_PX } from './viewerUtils';
-import { makeGreyMeshMaterial } from './materials';
+import { makeGreyMeshMaterial, LAYER_VERTEX_SHADER, LAYER_COMBINED_FRAGMENT } from './materials';
+import { imageDataToLayerTexture } from './layerImages';
 import { createPaintEngine } from './paintEngine';
 import { createBrushRing } from './brushRing';
 import { createGizmoSystem } from './gizmos';
@@ -29,7 +30,7 @@ import { createLayerComposer } from './layerComposer';
  *   selectedMesh — the mesh object from parseModel result (contains `.object`,
  *                  a live THREE.Mesh). When null, shows nothing.
  */
-const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded, maskPaintConfig, onUnlitChange }, ref) {
+const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded, maskPaintConfig, onUnlitChange, onLightDragEnd }, ref) {
   const containerRef = useRef(null);
   const sceneRef = useRef(null);
   const rendererRef = useRef(null);
@@ -66,6 +67,7 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
   const whiteMaskTexRef = useRef(null);    // 1x1 white dummy for layers without a mask
   const layerBuildIdRef = useRef(0);       // stale-build guard for async compositing
   const perspCameraRef = useRef(null);
+  const auxMeshesRef = useRef(new Map());   // key -> { root, textures } aux (multi-mesh) objects
 
   // Gizmo refs
   const gizmoSceneRef = useRef(null);       // axis scene (synced camera)
@@ -93,6 +95,17 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
   const dirLight1Ref = useRef(null);
   const dirLight2Ref = useRef(null);
   const lightGizmoSizeRef = useRef(70);
+  // Shared shadow-map uniform entries — every ShaderMaterial (selected mesh,
+  // aux meshes) references these same objects so one update per frame feeds
+  // them all. `map`/`has` fill in once the first shadow pass renders.
+  const shadowUniformsRef = useRef({
+    map: { value: null },
+    matrix: { value: null },
+    bias: { value: 0.0008 },
+    // PCF half-step in texels — the 5x5 grid spans ±(2·radius) texels.
+    radius: { value: 2.0 },
+    has: { value: 0 },
+  });
   const [unlit, setUnlit] = useState(false); // eye toggle on the light gizmo — flat shading
   const unlitRef = useRef(false);
 
@@ -130,6 +143,7 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
       lightGizmoSceneRef, lightGizmoCameraRef, lightGizmoRenderCamRef,
       lightGizmoRingRef, lightGizmoIconRef, lightGizmoFillRef,
       lightGizmoInteractionRef, dirLight1Ref, dirLight2Ref, lightGizmoSizeRef,
+      shadowUniformsRef,
       unlitRef, inpaintMaskRef, inpaintTileTexRef, checkerTexRef,
       inpaintActiveRef, inpaintVisibleRef, layerGpuRef,
       sceneOffsetXRef, sceneOffsetYRef, lastOrthoZoomRef,
@@ -167,10 +181,12 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
   const applyUnlit = (next) => {
     unlitRef.current = next;
     setUnlit(next);
-    currentMeshRef.current?.traverse((child) => {
+    const applyToRoot = (root) => root?.traverse((child) => {
       const u = child.isMesh && child.material && child.material.uniforms;
       if (u && u.u_unlit) u.u_unlit.value = next ? 1 : 0;
     });
+    applyToRoot(currentMeshRef.current);
+    for (const entry of auxMeshesRef.current.values()) applyToRoot(entry.root);
     if (dirLight1Ref.current) dirLight1Ref.current.intensity = next ? 0 : 1.0;
     if (dirLight2Ref.current) dirLight2Ref.current.intensity = next ? 0 : 0.5;
   };
@@ -178,6 +194,218 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
     const next = !unlitRef.current;
     applyUnlit(next);
     onUnlitChange?.(next); // context persists it under ui:{projectId}
+  };
+
+  // ── Aux meshes (multi-mesh viewing) ──────────────────────────────────
+  // Extra meshes toggled visible next to the selected one. Each gets the
+  // same baked-composite shader the selected mesh uses (u_combined built
+  // from its own layer stack by the context) or the grey material when it
+  // has no layers. Positioned at its stored world offset relative to the
+  // selected mesh, which sits at the origin.
+
+  const disposeAuxEntry = (entry) => {
+    if (!entry?.root) return;
+    sceneRef.current?.remove(entry.root);
+    entry.root.traverse((obj) => {
+      if (obj.geometry) obj.geometry.dispose();
+      if (obj.material) {
+        (Array.isArray(obj.material) ? obj.material : [obj.material]).forEach((m) => m.dispose());
+      }
+    });
+    for (const t of entry.textures || []) t.dispose();
+  };
+
+  const removeAuxMesh = (key) => {
+    const entry = auxMeshesRef.current.get(key);
+    if (!entry) return;
+    disposeAuxEntry(entry);
+    auxMeshesRef.current.delete(key);
+  };
+
+  const clearAuxMeshes = () => {
+    for (const entry of auxMeshesRef.current.values()) disposeAuxEntry(entry);
+    auxMeshesRef.current.clear();
+  };
+
+  const setAuxMesh = (key, meta) => {
+    const scene = sceneRef.current;
+    const selMesh = currentMeshRef.current;
+    if (!scene || !selMesh || !meta?.object) return false;
+    removeAuxMesh(key);
+
+    // The clone detaches from the parsed scene graph — restore the mesh's
+    // authored world transform onto its local TRS. Stored Settings matrix
+    // wins (it's the only transform record for DB-loaded meshes, whose
+    // objects carry identity); freshly parsed objects fall back to their
+    // live matrixWorld.
+    let auxWorldMat = meta.matrix;
+    if (!auxWorldMat) {
+      meta.object.updateWorldMatrix(true, false);
+      auxWorldMat = meta.object.matrixWorld;
+    }
+    const root = meta.object.clone(true);
+    auxWorldMat.decompose(root.position, root.quaternion, root.scale);
+    root.name = '__aux';
+    root.updateMatrixWorld(true);
+
+    // Bake each child's transform into cloned geometry (clone(true) shares
+    // geometry — never mutate the source), then recentre on its own bbox so
+    // the world offset lands at the mesh's visual center.
+    const box = new THREE.Box3();
+    root.traverse((child) => {
+      if (child.isMesh && child.geometry) {
+        child.geometry = child.geometry.clone();
+        child.geometry.applyMatrix4(child.matrixWorld);
+        child.position.set(0, 0, 0);
+        child.rotation.set(0, 0, 0);
+        child.scale.set(1, 1, 1);
+        child.updateMatrixWorld(true);
+        child.geometry.computeBoundingBox();
+        if (child.geometry.boundingBox) box.union(child.geometry.boundingBox);
+        if (!child.geometry.attributes.normal) child.geometry.computeVertexNormals();
+      }
+    });
+    if (box.isEmpty()) {
+      disposeAuxEntry({ root });
+      return false;
+    }
+    const center = box.getCenter(new THREE.Vector3());
+    const recenter = new THREE.Matrix4().makeTranslation(-center.x, -center.y, -center.z);
+    root.traverse((child) => {
+      if (child.isMesh && child.geometry) {
+        child.geometry.applyMatrix4(recenter);
+        child.geometry.computeBoundingBox();
+        child.geometry.computeBoundingSphere();
+      }
+    });
+
+    // Same normalization scale as the selected mesh — the offset is in the
+    // same authored units, so it scales identically.
+    const s = selMesh.scale.x || 1;
+    // Reset the decomposed world transform — the verts are already baked in
+    // authored space; only normalized scale + relative offset remain.
+    root.position.set(0, 0, 0);
+    root.quaternion.identity();
+    root.scale.setScalar(s);
+    const o = meta.offset || { x: 0, y: 0, z: 0 };
+    root.position.set(o.x * s, o.y * s, o.z * s);
+    root.updateMatrixWorld(true);
+
+    // Composite texture → the same baked-layer shader the selected mesh
+    // uses; no layers → grey fallback, matching the selected mesh.
+    const textures = [];
+    const dir1Pos = dirLight1Ref.current ? dirLight1Ref.current.position : new THREE.Vector3(10, 10, 10);
+    // The white/checker textures are lazily created by the layer composer —
+    // an aux mesh can be built before the first updateLayerTextures run.
+    if (!whiteMaskTexRef.current) {
+      whiteMaskTexRef.current = new THREE.DataTexture(new Uint8Array([255, 255, 255, 255]), 1, 1, THREE.RGBAFormat);
+      whiteMaskTexRef.current.needsUpdate = true;
+    }
+    if (!checkerTexRef.current) {
+      const t = new THREE.TextureLoader().load('/mesh-checkerboard.jpg');
+      t.wrapS = t.wrapT = THREE.RepeatWrapping;
+      t.flipY = true;
+      checkerTexRef.current = t;
+    }
+    const white = whiteMaskTexRef.current;
+    let material = null;
+    let imgData = null;
+    if (meta.canvas) {
+      imgData = meta.canvas.getContext('2d').getImageData(0, 0, meta.canvas.width, meta.canvas.height);
+      const combined = imageDataToLayerTexture(imgData);
+      textures.push(combined);
+      material = new THREE.ShaderMaterial({
+        uniforms: {
+          u_combined: { value: combined },
+          u_hasCombined: { value: 1 },
+          dir1Pos: { value: dir1Pos },
+          u_checker: { value: checkerTexRef.current || white },
+          u_inpaintMask: { value: white },
+          u_inpaintTile: { value: white },
+          u_inpaintOffset: { value: 0 },
+          u_hasInpaint: { value: 0 },
+          u_unlit: { value: unlitRef.current ? 1 : 0 },
+          u_dimBackface: { value: 1 },
+        },
+        vertexShader: LAYER_VERTEX_SHADER,
+        fragmentShader: LAYER_COMBINED_FRAGMENT,
+        side: THREE.DoubleSide,
+      });
+    }
+    root.traverse((child) => {
+      if (child.isMesh) {
+        if (child.material) {
+          (Array.isArray(child.material) ? child.material : [child.material]).forEach((m) => m.dispose());
+        }
+        child.material = material ? material.clone() : makeGreyMeshMaterial();
+        // material.clone() deep-copies uniform entries — rebind the shared
+        // entries so light-gizmo moves (dir1Pos) and the per-frame shadow
+        // map/matrix update reach the clones.
+        const cu = child.material.uniforms;
+        if (cu) {
+          if (material) cu.dir1Pos = material.uniforms.dir1Pos;
+          cu.u_shadowMap = shadowUniformsRef.current.map;
+          cu.u_shadowMatrix = shadowUniformsRef.current.matrix;
+          cu.u_shadowBias = shadowUniformsRef.current.bias;
+          cu.u_shadowRadius = shadowUniformsRef.current.radius;
+          cu.u_hasShadow = shadowUniformsRef.current.has;
+        }
+        child.castShadow = true;
+        child.receiveShadow = true;
+      }
+    });
+    material?.dispose(); // only clones are bound — dispose the template
+
+    auxMeshesRef.current.set(key, { root, textures, imgData });
+    scene.add(root);
+    return true;
+  };
+
+  // Eyedropper over the whole canvas: raycasts the selected mesh AND every
+  // aux mesh, takes the nearest surface. Aux hits sample their composited
+  // uvmap pixels directly ({aux, hex}); selected-mesh hits return the UV so
+  // the context can walk the layer stack. Backfaces are rejected like the
+  // paint raycast.
+  const pickColorAt = (clientX, clientY) => {
+    const renderer = rendererRef.current;
+    const cam = cameraRef.current;
+    if (!renderer || !cam) return null;
+    const rect = renderer.domElement.getBoundingClientRect();
+    raycasterRef.current.setFromCamera(
+      {
+        x: ((clientX - rect.left) / rect.width) * 2 - 1,
+        y: -((clientY - rect.top) / rect.height) * 2 + 1,
+      },
+      cam
+    );
+    const targets = [];
+    if (currentMeshRef.current) targets.push(currentMeshRef.current);
+    for (const e of auxMeshesRef.current.values()) targets.push(e.root);
+    const hits = raycasterRef.current.intersectObjects(targets, true);
+    const hit = hits[0];
+    if (!hit || !hit.uv || !hit.face) return null;
+    const fn = hit.face.normal.clone().transformDirection(hit.object.matrixWorld);
+    if (fn.dot(raycasterRef.current.ray.direction) > 0) return null;
+
+    let node = hit.object;
+    while (node && node.name !== '__aux' && node !== currentMeshRef.current) node = node.parent;
+    if (node && node.name === '__aux') {
+      for (const e of auxMeshesRef.current.values()) {
+        if (e.root !== node) continue;
+        if (!e.imgData) return { aux: true, hex: null };
+        const { width: w, height: h, data } = e.imgData;
+        const px = Math.min(w - 1, Math.max(0, Math.round(hit.uv.x * (w - 1))));
+        const py = Math.min(h - 1, Math.max(0, Math.round((1 - hit.uv.y) * (h - 1))));
+        const i = (py * w + px) * 4;
+        if (data[i + 3] <= 8) return { aux: true, hex: null };
+        return {
+          aux: true,
+          hex: '#' + [data[i], data[i + 1], data[i + 2]].map((c) => c.toString(16).padStart(2, '0')).join(''),
+        };
+      }
+      return null;
+    }
+    return { aux: false, u: hit.uv.x, v: hit.uv.y };
   };
 
   // Initialize scene once
@@ -242,6 +470,8 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
     renderer.toneMapping = THREE.ACESFilmicToneMapping;
     renderer.toneMappingExposure = 1.2;
     renderer.autoClear = false;
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFShadowMap;
     container.appendChild(renderer.domElement);
 
     // Lights
@@ -254,8 +484,25 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
 
     const dirLight1 = new THREE.DirectionalLight(0xffffff, 1.0);
     dirLight1.position.set(10, 10, 10);
+    // Shadow caster — meshes are normalized to ~4 units but aux meshes can
+    // spread wider; generous ortho bounds cover multi-mesh layouts.
+    dirLight1.castShadow = true;
+    dirLight1.shadow.mapSize.set(2048, 2048);
+    dirLight1.shadow.camera.left = -20;
+    dirLight1.shadow.camera.right = 20;
+    dirLight1.shadow.camera.top = 20;
+    dirLight1.shadow.camera.bottom = -20;
+    dirLight1.shadow.camera.near = 0.5;
+    dirLight1.shadow.camera.far = 150;
+    dirLight1.shadow.bias = -0.0002;
+    dirLight1.shadow.normalBias = 0.02;
     scene.add(dirLight1);
+    dirLight1.target.position.set(0, 0, 0);
+    scene.add(dirLight1.target);
     dirLight1Ref.current = dirLight1;
+    // The shared shadow uniforms bind the light's live shadow matrix — the
+    // Matrix4 object persists across frames so the binding never goes stale.
+    shadowUniformsRef.current.matrix.value = dirLight1.shadow.matrix;
 
     const dirLight2 = new THREE.DirectionalLight(0xffffff, 0.5);
     dirLight2.position.set(-10, 5, -10);
@@ -271,6 +518,10 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
       MIDDLE: THREE.MOUSE.ROTATE,
       RIGHT: THREE.MOUSE.PAN,
     };
+    // Touch: 1 finger orbits (nulled out per-frame while a paint tool is
+    // armed so a single finger draws), 2 fingers pinch-zoom + rotate.
+    controls.touches.ONE = THREE.TOUCH.ROTATE;
+    controls.touches.TWO = THREE.TOUCH.DOLLY_ROTATE;
 
     // Ctrl + middle mouse = zoom (dolly); without Ctrl = rotate
     const updateMiddleButton = (ctrlHeld) => {
@@ -350,6 +601,16 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
         applyOrthoOffset(orthoCam);
       }
 
+      // Single-finger orbit only when no paint tool is armed — with a
+      // brush selected, one finger draws (2+ fingers still camera-gesture).
+      const ctrls = controlsRef.current;
+      if (ctrls) {
+        const pTool = maskPaintCfgRef.current?.current?.tool;
+        const wantOne = (pTool === 'brush' || pTool === 'eraser' || pTool === 'mask'
+          || pTool === 'inpaint' || pTool === 'stamp' || pTool === 'blur')
+          ? null : THREE.TOUCH.ROTATE;
+        if (ctrls.touches.ONE !== wantOne) ctrls.touches.ONE = wantOne;
+      }
       controlsRef.current?.update();
 
       // Gizmo axis sync + lightbulb position (skipped when nothing moved)
@@ -366,6 +627,15 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
 
       const w = containerW;
       const h = containerH;
+
+      // Feed the light's depth map into the shared shadow uniforms once the
+      // first shadow pass has produced it.
+      const dl1 = dirLight1Ref.current;
+      if (dl1 && dl1.shadow.map) {
+        const su = shadowUniformsRef.current;
+        su.map.value = dl1.shadow.map.texture;
+        su.has.value = 1;
+      }
 
       // Clear and render main scene full screen
       renderer.setScissorTest(false);
@@ -412,7 +682,99 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
 
     // ── Pointer handlers ──
     let pendingPick = null; // {x,y} — pointer-tool click awaiting pointerup
+
+    // ── Touch gestures ──
+    // Fingers are tracked in a window-level *capture* listener — it runs
+    // before OrbitControls' canvas handlers, so 2+ finger gestures can be
+    // claimed before they reach them. OrbitControls keeps its own pointer
+    // set, so events must not be stopped for gestures it owns.
+    const touchPtrs = new Map(); // pointerId → {x,y} live touch contacts
+    let panLast = null;          // last 3-finger centroid for panning
+    const touchCentroid = () => {
+      let x = 0, y = 0;
+      touchPtrs.forEach((p) => { x += p.x; y += p.y; });
+      const n = touchPtrs.size || 1;
+      return { x: x / n, y: y / n };
+    };
+    // Second finger down ends a stroke — fire the save callbacks for dabs
+    // already laid, then refuse further input while ≥2 fingers are down.
+    const killPainting = () => {
+      const p = paintingRef.current;
+      if (!p) return;
+      paintingRef.current = null;
+      const cfg = maskPaintCfgRef.current?.current;
+      cfg?.onStrokeEnd?.();
+      if (p.stamp) cfg?.onStampStrokeEnd?.(p.layerIds);
+    };
+    // 3-finger pan — OrbitControls ignores a third touch, so pan manually
+    // using its math (screenSpacePanning convention).
+    const touchPanV = new THREE.Vector3();
+    const touchPanOff = new THREE.Vector3();
+    const panCameraBy = (dxPx, dyPx) => {
+      const cam = cameraRef.current;
+      const controls = controlsRef.current;
+      const el = rendererRef.current?.domElement;
+      if (!cam || !controls || !el) return;
+      const w = el.clientWidth || 1;
+      const h = el.clientHeight || 1;
+      touchPanOff.set(0, 0, 0);
+      if (cam.isPerspectiveCamera) {
+        const td = touchPanV.subVectors(cam.position, controls.target).length()
+          * Math.tan(THREE.MathUtils.degToRad(cam.fov / 2));
+        touchPanV.setFromMatrixColumn(cam.matrix, 0).multiplyScalar(-(2 * dxPx * td) / h);
+        touchPanOff.add(touchPanV);
+        touchPanV.setFromMatrixColumn(cam.matrix, 1).multiplyScalar((2 * dyPx * td) / h);
+        touchPanOff.add(touchPanV);
+      } else if (cam.isOrthographicCamera) {
+        touchPanV.setFromMatrixColumn(cam.matrix, 0).multiplyScalar(-(dxPx * (cam.right - cam.left)) / (cam.zoom * w));
+        touchPanOff.add(touchPanV);
+        touchPanV.setFromMatrixColumn(cam.matrix, 1).multiplyScalar((dyPx * (cam.top - cam.bottom)) / (cam.zoom * h));
+        touchPanOff.add(touchPanV);
+      }
+      cam.position.add(touchPanOff);
+      controls.target.add(touchPanOff);
+    };
+    const handleTouchGate = (e) => {
+      if (e.pointerType !== 'touch') return;
+      const el = rendererRef.current?.domElement;
+      if (!el) return;
+      if (e.type === 'pointerdown') {
+        if (e.target !== el) return; // fingers on UI don't join the gesture
+        touchPtrs.set(e.pointerId, { x: e.clientX, y: e.clientY });
+        const n = touchPtrs.size;
+        if (n >= 2) {
+          killPainting();
+          pendingPick = null;
+        }
+        if (n >= 3) {
+          // OrbitControls never sees the third finger — it stays a
+          // two-pointer gesture while we pan on the centroid delta.
+          e.stopPropagation();
+          panLast = touchCentroid();
+        }
+        return;
+      }
+      if (e.type === 'pointermove') {
+        if (!touchPtrs.has(e.pointerId)) return;
+        touchPtrs.set(e.pointerId, { x: e.clientX, y: e.clientY });
+        if (touchPtrs.size >= 3 && panLast) {
+          e.stopPropagation();
+          const c = touchCentroid();
+          panCameraBy(c.x - panLast.x, c.y - panLast.y);
+          panLast = c;
+        }
+        return;
+      }
+      if (e.type === 'pointerup' || e.type === 'pointercancel') {
+        touchPtrs.delete(e.pointerId);
+        if (touchPtrs.size < 3) panLast = null;
+      }
+    };
+
     const handlePointerDown = (e) => {
+      // 2+ fingers — camera gestures own the canvas; painting, picks and
+      // gizmo drags never engage on multi-touch.
+      if (e.pointerType === 'touch' && touchPtrs.size >= 2) return;
       // Gizmo press takes priority over paint tools — check it first
       const hit = gizmos.pick(e);
       // Mask brush takes over left-click — but only off the gizmos
@@ -465,6 +827,7 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
             layerIds,
             lastX: e.clientX,
             lastY: e.clientY,
+            pressure: e.pointerType === 'pen' ? e.pressure : 1,
             stamp: true,
             stampStartUV: stampHit.uv.clone(),
             stampStartWorld: stampHit.point.clone(),
@@ -487,7 +850,7 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
           paintCfg.onStrokeStart?.();
           // stamp: true → pointerup fires onStampStrokeEnd (persists the
           // layer's stamp RT back to uvmap.png like a stamp stroke does)
-          paintingRef.current = { layerIds, lastX: e.clientX, lastY: e.clientY, stamp: true, blur: true };
+          paintingRef.current = { layerIds, lastX: e.clientX, lastY: e.clientY, pressure: e.pointerType === 'pen' ? e.pressure : 1, stamp: true, blur: true };
           paint.blurUvmapAtHit(layerIds, blurHit);
         }
         return;
@@ -512,7 +875,7 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
             paintCfg.onStrokeStart?.();
             // stamp: true → pointerup fires onStampStrokeEnd so the painted
             // stamp RTs persist back to uvmap.png; paint: true → dab dispatch
-            paintingRef.current = { layerIds, lastX: e.clientX, lastY: e.clientY, stamp: true, paint: true };
+            paintingRef.current = { layerIds, lastX: e.clientX, lastY: e.clientY, pressure: e.pointerType === 'pen' ? e.pressure : 1, stamp: true, paint: true };
             paint.paintColorAtHit(layerIds, hit);
           }
           return;
@@ -530,7 +893,7 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
           const hit = paint.raycastHitAt(e.clientX, e.clientY) || paint.raycastRingHitAt(e.clientX, e.clientY);
           if (hit) {
             paintCfg.onStrokeStart?.();
-            paintingRef.current = { layerIds, lastX: e.clientX, lastY: e.clientY };
+            paintingRef.current = { layerIds, lastX: e.clientX, lastY: e.clientY, pressure: e.pointerType === 'pen' ? e.pressure : 1 };
             paint.stampMaskAtHit(layerIds, hit);
           }
           return;
@@ -547,6 +910,9 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
       // Active mask stroke — stamp along the drag path, spaced by `spread` px
       const painting = paintingRef.current;
       if (painting) {
+        // Pen pressure rides along the stroke — each dab reads the latest
+        // value; non-pen pointers stay at 1 (mouse reports a fixed 0.5).
+        painting.pressure = e.pointerType === 'pen' ? e.pressure : 1;
         const cfg = maskPaintCfgRef.current?.current;
         const spread = cfg?.spread ?? 0;
         const dab = painting.blur
@@ -623,7 +989,15 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
         return;
       }
       if (gizmoInteractionRef.current) {
+        // Capture the interaction before endDrag clears it — a completed
+        // light-gizmo drag reports its final position for persistence.
+        const gi = gizmoInteractionRef.current;
+        const wasLightDrag = gi.type === 'light' && gi.moved;
         gizmos.endDrag();
+        if (wasLightDrag) {
+          const p = dirLight1Ref.current?.position;
+          if (p) onLightDragEnd?.({ x: p.x, y: p.y, z: p.z });
+        }
       }
     };
 
@@ -653,6 +1027,12 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
     window.addEventListener('pointermove', handlePointerMove);
     window.addEventListener('pointerup', handlePointerUp);
     window.addEventListener('wheel', handleWheel, { capture: true, passive: false });
+    // Touch gate — capture phase so multi-touch events are claimed before
+    // OrbitControls' canvas handlers see them.
+    window.addEventListener('pointerdown', handleTouchGate, true);
+    window.addEventListener('pointermove', handleTouchGate, true);
+    window.addEventListener('pointerup', handleTouchGate, true);
+    window.addEventListener('pointercancel', handleTouchGate, true);
 
     // ── Cleanup ──
     return () => {
@@ -664,6 +1044,10 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
       window.removeEventListener('pointermove', handlePointerMove);
       window.removeEventListener('pointerup', handlePointerUp);
       window.removeEventListener('wheel', handleWheel, true);
+      window.removeEventListener('pointerdown', handleTouchGate, true);
+      window.removeEventListener('pointermove', handleTouchGate, true);
+      window.removeEventListener('pointerup', handleTouchGate, true);
+      window.removeEventListener('pointercancel', handleTouchGate, true);
       if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current);
       controlsRef.current?.dispose();
       renderer.dispose();
@@ -671,6 +1055,8 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
         container.removeChild(renderer.domElement);
       }
       ringElRef.current?.remove();
+      // Aux meshes live in the scene but own their composited textures
+      clearAuxMeshes();
       // Dispose main scene
       scene.traverse((obj) => {
         if (obj.geometry) obj.geometry.dispose();
@@ -857,6 +1243,13 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
     setUnlit(v) {
       applyUnlit(!!v);
     },
+    // Restore a persisted light direction — mutates the same Vector3 the
+    // shader uniforms bind, so materials track it immediately.
+    setLightPosition(pos) {
+      const light = dirLight1Ref.current;
+      if (!light || !pos) return;
+      light.position.set(pos.x ?? 10, pos.y ?? 10, pos.z ?? 10);
+    },
 
     compositeLayersToCanvas(items) {
       return composer.compositeLayersToCanvas(items);
@@ -928,6 +1321,26 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
     loadInpaintMask(bitmap) {
       paint.loadInpaintMask(bitmap);
     },
+
+    setAuxMesh(key, meta) {
+      setAuxMesh(key, meta);
+    },
+
+    removeAuxMesh(key) {
+      removeAuxMesh(key);
+    },
+
+    clearAuxMeshes() {
+      clearAuxMeshes();
+    },
+
+    hasAuxMesh(key) {
+      return auxMeshesRef.current.has(key);
+    },
+
+    pickColorAt(clientX, clientY) {
+      return pickColorAt(clientX, clientY);
+    },
   }), []);
 
   // Load / swap mesh when selection changes
@@ -936,6 +1349,10 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
     const camera = cameraRef.current;
     const controls = controlsRef.current;
     if (!scene || !camera || !controls) return;
+
+    // Aux meshes belong to the outgoing selected mesh's coordinate frame —
+    // the context rebuilds them from onMeshLoaded for the new selection.
+    clearAuxMeshes();
 
     // Remove and dispose previous mesh
     if (currentMeshRef.current) {
@@ -965,8 +1382,21 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
     // Hide grid once a mesh is loaded
     if (gridRef.current) gridRef.current.visible = false;
 
-    // Clone the mesh so we don't mutate the original parsed object
+    // Clone the mesh so we don't mutate the original parsed object. The
+    // clone is detached — its ancestor chain vanishes — so restore the
+    // authored world transform (ancestors included) onto its local TRS
+    // before the world-bake below. The stored Settings matrix wins —
+    // DB-loaded objects carry identity; freshly parsed objects fall back
+    // to their live matrixWorld.
+    let selWorldMat = null;
+    const sm = meshMeta.settings?.worldMatrix;
+    if (Array.isArray(sm) && sm.length === 16) selWorldMat = new THREE.Matrix4().fromArray(sm);
+    if (!selWorldMat) {
+      meshMeta.object.updateWorldMatrix(true, false);
+      selWorldMat = meshMeta.object.matrixWorld;
+    }
     const mesh = meshMeta.object.clone(true);
+    selWorldMat.decompose(mesh.position, mesh.quaternion, mesh.scale);
     currentMeshRef.current = mesh;
 
     // Apply a grey MeshStandardMaterial to all meshes and ensure geometry has normals
@@ -980,6 +1410,8 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
           }
         }
         child.material = makeGreyMeshMaterial();
+        child.castShadow = true;
+        child.receiveShadow = true;
         if (child.geometry && !child.geometry.attributes.normal) {
           child.geometry.computeVertexNormals();
         }
@@ -996,6 +1428,9 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
 
     mesh.traverse((child) => {
       if (child.isMesh && child.geometry) {
+        // clone(true) shares geometry with the source object — clone it so
+        // the world-bake doesn't corrupt meshData (or re-selects bake twice)
+        child.geometry = child.geometry.clone();
         child.geometry.applyMatrix4(child.matrixWorld);
         child.position.set(0, 0, 0);
         child.rotation.set(0, 0, 0);
@@ -1028,6 +1463,7 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
     // Mesh stays at world origin — the screen-space shift is handled by the
     // camera frustum/projection offset, not by translating the mesh.
     mesh.position.set(0, 0, 0);
+    mesh.quaternion.identity();
     scene.add(mesh);
 
     // Position camera straight in front of the mesh (forward = +Z in Three.js,
@@ -1047,6 +1483,7 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
     if (ready && selectedMesh) {
       loadMesh(selectedMesh);
     } else if (ready && !selectedMesh) {
+      clearAuxMeshes();
       if (currentMeshRef.current) {
         sceneRef.current.remove(currentMeshRef.current);
         currentMeshRef.current.traverse((obj) => {

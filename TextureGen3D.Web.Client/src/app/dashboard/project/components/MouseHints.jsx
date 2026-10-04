@@ -1,5 +1,6 @@
 import React from 'react';
 import { useProject } from '@/context/project';
+import Icon from '@/components/ui/icon';
 
 const MouseRotateIcon = (
   <svg viewBox="0 0 24 24" className="w-6 h-6" fill="none" stroke="currentColor" strokeWidth="1.5">
@@ -43,7 +44,11 @@ const MouseHint = React.memo(function MouseHint({ icon, label, title, accent }) 
     <div
       title={title}
       className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full backdrop-blur-sm border-2 text-charcoal-100 text-xs font-medium shadow-lg cursor-help ${
-        accent ? 'bg-green-700/60 border-green-400/70' : 'bg-charcoal-700/85 border-gray-300/60'
+        accent === 'blue'
+          ? 'bg-blue-700/60 border-blue-400/70'
+          : accent
+            ? 'bg-green-700/60 border-green-400/70'
+            : 'bg-charcoal-700/85 border-gray-300/60'
       }`}
     >
       <span className="text-gray-300 flex items-center gap-1">{icon}</span>
@@ -55,11 +60,37 @@ const MouseHint = React.memo(function MouseHint({ icon, label, title, accent }) 
 export default function MouseHints() {
   const { maskTool, stampMode } = useProject();
   const paintTool = maskTool === 'brush' || maskTool === 'eraser' || maskTool === 'mask' || maskTool === 'inpaint' || maskTool === 'stamp' || maskTool === 'blur';
+  // Touch-capable devices (incl. touchscreen laptops/desktops and pen
+  // displays like Samsung Second Screen) get a blue gesture-hints row in
+  // addition to the mouse hints. Passive checks catch advertised hardware;
+  // pen displays often report nothing, so the first real pen/touch pointer
+  // event flips it on too.
+  const [isTouch, setIsTouch] = React.useState(() => {
+    if (typeof window === 'undefined') return false;
+    return 'ontouchstart' in window
+      || navigator.maxTouchPoints > 0
+      || window.matchMedia?.('(any-pointer: coarse)').matches
+      || window.matchMedia?.('(any-hover: none)').matches;
+  });
+  React.useEffect(() => {
+    if (isTouch) return;
+    const onPointer = (e) => {
+      if (e.pointerType === 'pen' || e.pointerType === 'touch') setIsTouch(true);
+    };
+    window.addEventListener('pointerdown', onPointer, true);
+    window.addEventListener('pointermove', onPointer, true);
+    return () => {
+      window.removeEventListener('pointerdown', onPointer, true);
+      window.removeEventListener('pointermove', onPointer, true);
+    };
+  }, [isTouch]);
 
   return (
-    <div className="absolute bottom-4 z-20 flex flex-col items-end gap-2 right-80">
+    // flex-1 + min-w-0 takes the column left over by the tools container —
+    // rows wrap inside it and can never reach into the tools' space.
+    <div className="flex flex-col items-end gap-2 flex-1 min-w-0">
       {paintTool && (
-        <div className="flex gap-2">
+        <div className="flex w-full flex-wrap justify-end gap-2">
           <MouseHint
             accent
             icon={<>{CtrlKeyIcon}<span>+</span>{MouseZoomIcon}</>}
@@ -100,20 +131,42 @@ export default function MouseHints() {
           )}
         </div>
       )}
-      <div className="flex gap-2">
+      {isTouch && (
+        <div className="flex w-full flex-wrap justify-end gap-2">
+          <MouseHint
+            accent="blue"
+            icon={<Icon name="pinch" className="text-2xl" />}
+            label="Zoom"
+            title="Pinch two fingers together or apart to zoom in and out"
+          />
+          <MouseHint
+            accent="blue"
+            icon={<Icon name="touch_double_2" className="text-2xl" />}
+            label="Rotate"
+            title="Move two fingers together to rotate the view"
+          />
+          <MouseHint
+            accent="blue"
+            icon={<Icon name="trackpad_input_3" className="text-2xl" />}
+            label="Move"
+            title="Drag three fingers to move/pan the view"
+          />
+        </div>
+      )}
+      <div className="flex w-full flex-wrap justify-end gap-2">
         <MouseHint
           icon={MouseRotateIcon}
-          label="Press & Rotate"
+          label="Rotate"
           title="Press and hold the middle mouse button, then drag to rotate the view"
         />
         <MouseHint
           icon={MousePanIcon}
-          label="Press & Drag"
+          label="Drag"
           title="Press and hold the right mouse button (or Shift + middle mouse button), then drag to pan the view"
         />
         <MouseHint
           icon={MouseZoomIcon}
-          label="Scroll & Zoom"
+          label="Zoom"
           title="Scroll the middle mouse wheel up to zoom in, down to zoom out"
         />
       </div>

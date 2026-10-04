@@ -3,9 +3,11 @@ import ModelViewer from '@/components/viewer/ModelViewer';
 import { useProject } from '@/context/project';
 
 export default function ViewportSection() {
-  const { selectedMesh, viewerRef, pendingLayersRef, refreshLayerTextures, maskPaintConfigRef, setUnlit } = useProject();
+  const { selectedMesh, viewerRef, pendingLayersRef, refreshLayerTextures, maskPaintConfigRef, setUnlit, syncAuxMeshes, saveLightPosition } = useProject();
   const refreshRef = useRef(refreshLayerTextures);
   useEffect(() => { refreshRef.current = refreshLayerTextures; }, [refreshLayerTextures]);
+  const auxSyncRef = useRef(syncAuxMeshes);
+  useEffect(() => { auxSyncRef.current = syncAuxMeshes; }, [syncAuxMeshes]);
 
   // Stable identity — an inline arrow would defeat ModelViewer's memo() and
   // re-render the canvas on every unrelated context state change.
@@ -13,6 +15,8 @@ export default function ViewportSection() {
     if (pendingLayersRef.current) {
       refreshRef.current(pendingLayersRef.current, meshMeta?.key);
     }
+    // loadMesh cleared the aux set — rebuild it for the new selected mesh
+    auxSyncRef.current?.(true);
   }, [pendingLayersRef]);
 
   return (
@@ -23,6 +27,7 @@ export default function ViewportSection() {
         maskPaintConfig={maskPaintConfigRef}
         onMeshLoaded={handleMeshLoaded}
         onUnlitChange={setUnlit}
+        onLightDragEnd={saveLightPosition}
       />
     </div>
   );

@@ -265,6 +265,23 @@ export function createPaintEngine(ctx) {
     });
   };
 
+  // Pen pressure — pointer events carry 0..1 pressure only for stylus input;
+  // mouse/touch report a fixed value, so those always paint full-strength.
+  // cfg.penPressure maps pressure onto the dab radius ('size') or its
+  // alpha/strength ('opacity'), scaled relative to that slider's value.
+  const penPressureValue = () => {
+    const cfg = maskPaintCfgRef.current?.current;
+    if (!cfg?.penPressure) return 1;
+    const p = paintingRef.current?.pressure;
+    return p == null ? 1 : Math.min(1, Math.max(0, p));
+  };
+  // Each checked target scales independently — with both on, pressure
+  // shrinks the dab radius AND dims its strength.
+  const pressureSizeScale = () =>
+    (maskPaintCfgRef.current?.current?.penPressureTargets || []).includes('size') ? penPressureValue() : 1;
+  const pressureAlphaScale = () =>
+    (maskPaintCfgRef.current?.current?.penPressureTargets || []).includes('opacity') ? penPressureValue() : 1;
+
   // Brush radius in world units — the Size slider is screen px, converted to
   // world units at the hit's depth so the painted circle matches the cursor
   // ring exactly, at any zoom.
@@ -273,7 +290,7 @@ export function createPaintEngine(ctx) {
     const cam = cameraRef.current;
     const el = rendererRef.current?.domElement;
     if (!cfg || !cam || !el) return 0;
-    const rPx = Math.max(0.5, (cfg.size || 50) / 2);
+    const rPx = Math.max(0.5, ((cfg.size || 50) / 2) * pressureSizeScale());
     const rectH = ctx.getCanvasRect().height || 1;
     if (cam.isOrthographicCamera) {
       const worldH = (cam.top - cam.bottom) / (cam.zoom || 1);
@@ -363,7 +380,7 @@ export function createPaintEngine(ctx) {
     const mR = cfg.tool === 'stamp' ? R * 1.08 : R;
     u.u_brushRadius.value = mR;
     u.u_innerRadius.value = mR * Math.max(0, 1 - h / 100);
-    u.u_brushStrength.value = Math.min(1, Math.max(0.01, (cfg.opacity ?? 100) / 100));
+    u.u_brushStrength.value = Math.min(1, Math.max(0.01, ((cfg.opacity ?? 100) / 100) * pressureAlphaScale()));
     u.u_paintSign.value =
       signOverride ?? ((cfg.tool === 'mask' && cfg.maskSign === 'eraser') || (cfg.tool === 'inpaint' && cfg.sign === 'subtract') ? -1.0 : 1.0);
     u.u_isDrawing.value = 1.0;
@@ -467,7 +484,7 @@ export function createPaintEngine(ctx) {
     const dabWorld = hit.point.clone();
     const modelMat = hit.object.matrixWorld.clone();
     const startWorld = paintingRef.current?.stampStartWorld || hit.point;
-    const opacity = Math.min(1, Math.max(0.01, (cfg.opacity ?? 100) / 100));
+    const opacity = Math.min(1, Math.max(0.01, ((cfg.opacity ?? 100) / 100) * pressureAlphaScale()));
     const flipX = cfg.stampInvertX ? -1 : 1;
     const flipY = cfg.stampInvertY ? -1 : 1;
     const su = rtt.stampColorMat.uniforms;
@@ -605,7 +622,7 @@ export function createPaintEngine(ctx) {
     const h = cfg.hardness ?? 50;
     const dabWorld = hit.point.clone();
     const modelMat = hit.object.matrixWorld.clone();
-    const opacity = Math.min(1, Math.max(0.01, (cfg.opacity ?? 100) / 100));
+    const opacity = Math.min(1, Math.max(0.01, ((cfg.opacity ?? 100) / 100) * pressureAlphaScale()));
     const erase = cfg.tool === 'eraser' ? 1.0 : 0.0;
     // Parse the hex into raw sRGB components — Color.set() would convert to
     // linear working space and the RT would store ~2.2x darker bytes than
@@ -719,7 +736,7 @@ export function createPaintEngine(ctx) {
     const h = cfg.hardness ?? 50;
     const dabWorld = hit.point.clone();
     const modelMat = hit.object.matrixWorld.clone();
-    const strength = Math.min(1, Math.max(0.01, (cfg.blurStrength ?? 50) / 100));
+    const strength = Math.min(1, Math.max(0.01, ((cfg.blurStrength ?? 50) / 100) * pressureAlphaScale()));
     const res = cfg.textureResolution || 1024;
 
     // Blur kernel radius in uvmap texels — derived from the hit triangle's

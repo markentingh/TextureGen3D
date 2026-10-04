@@ -3,6 +3,7 @@ using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
 using SixLabors.ImageSharp;
 using SixLabors.ImageSharp.Formats.Png;
+using TextureGen3D.API.Helpers;
 using TextureGen3D.API.Models;
 using TextureGen3D.API.Services;
 using TextureGen3D.Data.Entities.Projects;
@@ -197,7 +198,7 @@ namespace TextureGen3D.API.Controllers
                     return NotFound();
 
                 var contentType = reference.Extension == "png" ? "image/png" : "image/jpeg";
-                return File(fileBytes, contentType);
+                return this.CachedFile(fileBytes, contentType);
             }
             catch (Exception ex)
             {
@@ -226,7 +227,7 @@ namespace TextureGen3D.API.Controllers
                 if (thumbBytes.Length == 0)
                     return NotFound();
 
-                return File(thumbBytes, "image/jpeg");
+                return this.CachedFile(thumbBytes, "image/jpeg");
             }
             catch (Exception ex)
             {
