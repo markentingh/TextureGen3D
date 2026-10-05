@@ -48,6 +48,7 @@ export default function MaskToolbar() {
     setStampInvertY,
     meshLayers,
     selectedLayerIds,
+    layerPaintTargets,
     id,
   } = useProject();
 
@@ -86,6 +87,17 @@ export default function MaskToolbar() {
   const [showColorPicker, setShowColorPicker] = React.useState(false);
   const [pickerColor, setPickerColor] = React.useState(brushColor);
 
+  // Which part of the layer the brush/eraser writes into — picked per
+  // layer by the paint-map carousel; 'Mixed' when the selection targets
+  // different maps.
+  const PAINT_TARGET_LABELS = { base: 'Base Color', rough: 'Roughness', metal: 'Metallic', emissive: 'Emissive' };
+  const paintTargetLabel = (() => {
+    const targets = selectedLayerIds.map((lid) => layerPaintTargets?.[lid] || 'base');
+    const uniq = new Set(targets);
+    if (uniq.size === 0) return 'Base Color';
+    return uniq.size === 1 ? PAINT_TARGET_LABELS[targets[0]] : 'Mixed';
+  })();
+
   const inpaintToggleClass = (active) =>
     `w-5 h-5 rounded-full border-2 flex items-center justify-center transition ${
       active
@@ -99,7 +111,10 @@ export default function MaskToolbar() {
       {(maskTool === 'brush' || maskTool === 'eraser' || maskTool === 'mask' || maskTool === 'inpaint' || maskTool === 'stamp' || maskTool === 'blur') && (
         <div className="w-[100%] rounded-xl bg-charcoal-700/85 backdrop-blur-sm border-2 border-gray-300/60 shadow-lg px-3 py-2 space-y-2">
           <div className="flex items-center justify-between">
-            <div className="text-xs font-semibold text-gray-300 uppercase tracking-wide">
+            <div className="text-xs font-semibold text-gray-300 uppercase tracking-wide flex items-baseline gap-1.5">
+              {(maskTool === 'brush' || maskTool === 'eraser') && (
+                <span className="text-[10px] font-normal normal-case text-blue-400">{paintTargetLabel}</span>
+              )}
               {maskTool.charAt(0).toUpperCase() + maskTool.slice(1)}
             </div>
             {/* Tool-specific controls sit at the right of the title row —

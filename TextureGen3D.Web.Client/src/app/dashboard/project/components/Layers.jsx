@@ -1,6 +1,7 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useSyncExternalStore } from 'react';
 import { useProject } from '@/context/project';
 import { ProjectMeshReferences } from '@/api/user/projectMeshReferences';
+import { subscribeLayerSaves, getLayerSaveCount } from '@/api/user/projectMeshLayers';
 import { ProjectCameraAngles } from '@/api/user/projectCameraAngles';
 import { ProjectReferences } from '@/api/user/projectReferences';
 import Icon from '@/components/ui/icon';
@@ -278,6 +279,9 @@ export default function Layers() {
   const [removingBgLayerId, setRemovingBgLayerId] = useState(null);
   const [cleaningLayerId, setCleaningLayerId] = useState(null);
   const [mirroringLayerId, setMirroringLayerId] = useState(null);
+  // In-flight uvmap/orm/mask/emissive saves — drives the spinner beside
+  // the Layers title.
+  const layerSaveCount = useSyncExternalStore(subscribeLayerSaves, getLayerSaveCount);
 
   const paintMapFor = (layerId) => layerPaintTargets?.[layerId] || 'base';
 
@@ -1339,7 +1343,12 @@ export default function Layers() {
       {selectedMesh && (
         <div className="border-t border-gray-200 dark:border-gray-700 flex flex-col">
           <div className="flex items-center justify-between p-3 border-b border-gray-200 dark:border-gray-700">
-            <h3 className="text-sm font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-400">Layers</h3>
+            <div className="flex items-center gap-1.5">
+              <h3 className="text-sm font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-400">Layers</h3>
+              {layerSaveCount > 0 && (
+                <Spinner className="text-sm text-blue-500" />
+              )}
+            </div>
             <div className="flex items-center gap-1">
               <button
                 onClick={handleAddLayer}
@@ -1554,11 +1563,14 @@ export default function Layers() {
                               // Locked while the fill picker is open — switching
                               // maps mid-preview would strand a preview on the
                               // previous map's back buffer.
-                              const arrowCls = `absolute top-1/2 -translate-y-1/2 z-10 bg-black/50 hover:bg-black/70 text-white px-px leading-none text-[10px] select-none ${fillLayer ? 'opacity-30 pointer-events-none' : ''}`;
+                              // Arrows are hidden until the thumb is hovered
+                              // (group-hover); while the fill picker is open
+                              // they hover in dimmed and stay unclickable.
+                              const arrowCls = `absolute top-1/2 -translate-y-1/2 z-10 bg-black/50 hover:bg-black/70 text-white px-px leading-none text-[10px] select-none opacity-0 transition-opacity ${fillLayer ? 'pointer-events-none group-hover:opacity-30' : 'group-hover:opacity-100'}`;
                               return (
                                 <div className="flex-shrink-0 flex flex-col items-center" style={{ width: 47 }}>
                                   <div
-                                    className="relative rounded border border-gray-200 dark:border-gray-600 overflow-hidden hover:ring-1 hover:ring-purple-500 transition"
+                                    className="group relative rounded border border-gray-200 dark:border-gray-600 overflow-hidden hover:ring-1 hover:ring-purple-500 transition"
                                     style={{ width: 47, height: 47, ...CHECKERBOARD_BG }}
                                     title={`Paint target: ${PAINT_MAPS[mapIdx].label}`}
                                   >

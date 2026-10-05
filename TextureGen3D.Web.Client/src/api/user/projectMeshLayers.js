@@ -1,5 +1,33 @@
 import { Api } from '@/api/Api';
 
+// In-flight counter for layer texture-file saves (uvmap.png / orm.png /
+// mask.png / emissive.png). Components subscribe with useSyncExternalStore
+// (subscribeLayerSaves/getLayerSaveCount) — Layers.jsx shows a spinner
+// next to its title while the count is > 0.
+const TRACKED_SAVE_FILES = new Set(['uvmap.png', 'orm.png', 'mask.png', 'emissive.png']);
+let layerSaveCount = 0;
+const layerSaveListeners = new Set();
+const emitLayerSaveCount = () => {
+  for (const fn of layerSaveListeners) fn(layerSaveCount);
+};
+const trackLayerSave = (promise) => {
+  layerSaveCount++;
+  emitLayerSaveCount();
+  const done = () => {
+    layerSaveCount--;
+    emitLayerSaveCount();
+  };
+  // then(done, done) — a .finally would leave a rejected derived promise
+  // dangling unhandled whenever the save fails.
+  promise.then(done, done);
+  return promise;
+};
+export const getLayerSaveCount = () => layerSaveCount;
+export const subscribeLayerSaves = (fn) => {
+  layerSaveListeners.add(fn);
+  return () => layerSaveListeners.delete(fn);
+};
+
 const ProjectMeshLayers = (args) => Api({ ...args }).endpoints(({ api }) => {
   const apiPath = '/api/project-mesh-layers';
   return {
@@ -10,9 +38,12 @@ const ProjectMeshLayers = (args) => Api({ ...args }).endpoints(({ api }) => {
     reorder: (projectId, meshId, orderedIds) => api.post(`${apiPath}/${projectId}/reorder`, { meshId, orderedIds }),
     delete: (projectId, layerId) => api.post(`${apiPath}/${projectId}/${layerId}/delete`),
     saveImage: (projectId, layerId, meshId, base64Image) => api.post(`${apiPath}/${projectId}/${layerId}/save-image`, { meshId, base64Image }),
-    saveUvMap: (projectId, layerId, meshId, base64UvMap) => api.post(`${apiPath}/${projectId}/${layerId}/save-uvmap`, { meshId, base64UvMap }),
-    saveFile: (projectId, layerId, meshId, fileName, base64Image) => api.post(`${apiPath}/${projectId}/${layerId}/save-file`, { meshId, fileName, base64Image }),
-    saveMasks: (projectId, meshId, masks) => api.post(`${apiPath}/${projectId}/save-masks`, { meshId, masks }),
+    saveUvMap: (projectId, layerId, meshId, base64UvMap) => trackLayerSave(api.post(`${apiPath}/${projectId}/${layerId}/save-uvmap`, { meshId, base64UvMap })),
+    saveFile: (projectId, layerId, meshId, fileName, base64Image) => {
+      const p = api.post(`${apiPath}/${projectId}/${layerId}/save-file`, { meshId, fileName, base64Image });
+      return TRACKED_SAVE_FILES.has(fileName) ? trackLayerSave(p) : p;
+    },
+    saveMasks: (projectId, meshId, masks) => trackLayerSave(api.post(`${apiPath}/${projectId}/save-masks`, { meshId, masks })),
     saveAngleThumb: (projectId, layerId, meshId, base64Image) =>
       api.post(`${apiPath}/${projectId}/${layerId}/save-angle-thumb`, { meshId, base64Image }),
     generate: (projectId, layerId, meshId, imageModelId, prompt, depthMap, cameraAngle, cameraAngleId, inputImage, resolution) =>

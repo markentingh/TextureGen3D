@@ -709,7 +709,9 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
       renderer.setScissor(0, 0, w, h);
       renderer.clear();
       const bloomVal = typeof cfgNow?.bloom === 'number' ? cfgNow.bloom : 0;
-      if (bloomVal > 0) {
+      // Unlit (eye toggle) suppresses emissive entirely — skip the whole
+      // bloom path rather than paying for a prepass that emits black.
+      if (bloomVal > 0 && !unlitRef.current) {
         // Selective bloom — emissive only. The bloom composer renders the
         // scene with u_emisOnly=1 (every layer shader emits just
         // emis×strength; non-shader materials like the grid and grey

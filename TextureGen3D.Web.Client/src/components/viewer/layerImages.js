@@ -120,12 +120,21 @@ export const compositeLayerImages = async (items) => {
         mctx.drawImage(ormImgs[i], 0, 0, w, h);
         const ormD = mctx.getImageData(0, 0, w, h).data;
         for (let p = 0; p < np; p += 4) {
-          const wt = maskW(p) * (ormD[p + 3] / 255);
-          if (wt === 0) continue;
-          ormAcc[p] += (ormD[p] - ormAcc[p]) * wt;
-          ormAcc[p + 1] += (ormD[p + 1] - ormAcc[p + 1]) * wt;
-          ormAcc[p + 2] += (ormD[p + 2] - ormAcc[p + 2]) * wt;
-          ormAcc[p + 3] += (255 - ormAcc[p + 3]) * wt; // source-over coverage
+          // Coverage is split per channel — G = roughness alpha,
+          // A = metallic alpha — so a metallic-only stroke can't claim
+          // the texel's seeded rough=255. g==0 under a>0 = pre-split
+          // file: its shared alpha covered both channels.
+          const g8 = ormD[p + 1];
+          const a8 = ormD[p + 3];
+          const wtR = maskW(p) * ((g8 === 0 ? a8 : g8) / 255);
+          const wtM = maskW(p) * (a8 / 255);
+          if (wtR > 0) ormAcc[p] += (ormD[p] - ormAcc[p]) * wtR;
+          if (wtM > 0) ormAcc[p + 2] += (ormD[p + 2] - ormAcc[p + 2]) * wtM;
+          ormAcc[p + 1] += (255 - ormAcc[p + 1]) * wtR; // rough coverage
+          // Metal-only texels (g==0, a>0) would decode downstream as a
+          // pre-split "both channels" texel — write the 16/255 marker.
+          if (wtM > 0 && ormAcc[p + 1] === 0) ormAcc[p + 1] = 16;
+          ormAcc[p + 3] += (255 - ormAcc[p + 3]) * wtM; // metal coverage
         }
       }
       if (emisAcc && emisImgs[i]) {

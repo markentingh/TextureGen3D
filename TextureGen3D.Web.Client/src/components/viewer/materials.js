@@ -617,9 +617,13 @@ export function createPaintRtt() {
       u_opacity: { value: 1.0 },             // slider value 0..1 (no pressure)
       u_mode: { value: 0.0 },
       // Per-channel write gate — (1,1,1,1) normally; mesh-map painting
-      // restricts to the target channel ((1,0,0,0) = orm roughness R,
-      // (0,0,1,0) = metallic B, (1,1,1,0) = emissive RGB).
+      // restricts to the target channels ((1,1,0,1) = orm roughness
+      // R+coverage G, (0,1,1,1) = metallic B+coverage A, (1,1,1,1) =
+      // emissive RGB).
       u_channelMask: { value: new THREE.Vector4(1, 1, 1, 1) },
+      // orm.png splits coverage per channel: G = roughness alpha,
+      // A = metallic alpha. 0 = not an orm dab, 1 = roughness, 2 = metal.
+      u_ormChannel: { value: 0 },
     },
     vertexShader: `
       varying vec2 vUv;
@@ -636,12 +640,15 @@ export function createPaintRtt() {
       uniform float u_opacity;
       uniform float u_mode;
       uniform vec4 u_channelMask;
+      uniform float u_ormChannel;
       varying vec2 vUv;
       void main() {
         vec4 b = texture2D(u_baseTexture, vUv);
         vec4 s = texture2D(u_stroke, vUv);
         int m = int(u_mode + 0.5);
         vec4 res;
+        vec3 srcC = m == 4 ? s.rgb : u_paintColor;
+        float srcA = s.a * u_opacity;
         if (m == 1) {
           res = vec4(b.rgb, b.a * (1.0 - s.a * u_opacity));
         } else if (m == 2 || m == 3) {
@@ -655,13 +662,29 @@ export function createPaintRtt() {
           float v = max(b.r, min(1.0, s.a * 4.0));
           res = vec4(v, v, v, 1.0);
         } else if (m == 7) {
-          // Layer-map erase — restore the file's generated default rgb AND
-          // clear alpha so the texel carries no map data again (lower
-          // layers' maps show through, then the global defaults). Both
-          // must be gated by the stroke: writing u_paintColor unmasked
-          // would reset rgb over the WHOLE texture on every dab.
           float t = s.a * u_opacity;
-          res = vec4(mix(b.rgb, u_paintColor, t), b.a * (1.0 - t));
+          if (u_ormChannel > 0.5 && u_ormChannel < 1.5) {
+            // Roughness erase — reset R to its rough default and clear
+            // the G coverage only; the metallic pair (B/A) survives.
+            res = vec4(mix(b.r, 1.0, t), b.g * (1.0 - t), b.b, b.a);
+            // A was just the PNG floor (no real metal data) → drop it
+            // too once the rough coverage is gone.
+            if (res.g <= 0.001 && b.a <= 9.0 / 255.0) res.a = 0.0;
+          } else if (u_ormChannel > 1.5) {
+            // Metallic erase — reset B to 0 and clear the A coverage
+            // only; the roughness pair (R/G) survives.
+            res = vec4(b.r, b.g, mix(b.b, 0.0, t), b.a * (1.0 - t));
+            // G was just the new-format marker → drop it once the metal
+            // coverage is gone.
+            if (res.a <= 0.001 && b.g <= 17.0 / 255.0) res.g = 0.0;
+          } else {
+            // Layer-map erase — restore the file's generated default rgb AND
+            // clear alpha so the texel carries no map data again (lower
+            // layers' maps show through, then the global defaults). Both
+            // must be gated by the stroke: writing u_paintColor unmasked
+            // would reset rgb over the WHOLE texture on every dab.
+            res = vec4(mix(b.rgb, u_paintColor, t), b.a * (1.0 - t));
+          }
         } else if (m == 8) {
           // Layer-map normalize — PNG round-trips lose rgb under alpha=0,
           // so a loaded file can carry garbage channels under transparent
@@ -670,11 +693,42 @@ export function createPaintRtt() {
           // the lost black → accidental glossy).
           res = vec4(b.a > 0.001 ? b.rgb : u_paintColor, b.a);
         } else {
-          vec3 srcC = m == 4 ? s.rgb : u_paintColor;
-          float srcA = s.a * u_opacity;
           float outA = srcA + b.a * (1.0 - srcA);
           vec3 outRgb = (srcC * srcA + b.rgb * b.a * (1.0 - srcA)) / max(outA, 1e-5);
           res = vec4(outRgb, outA);
+        }
+        // Per-channel coverage (modes 0/4 = paint/stamp dabs): orm.png
+        // splits alpha per channel — G = roughness coverage, A = metallic
+        // coverage. Roughness dabs floor A at 8/255 because canvas PNG
+        // writes are premultiplied — a=0 would destroy R and G on save
+        // (a ~3% metal weight is invisible). Metal dabs floor G at
+        // 16/255 as a format marker: g==0 under a>0 means a pre-split
+        // file whose shared alpha covered both channels, so the metal
+        // marker keeps metal-only texels from being misread as legacy.
+        // Base coverage drops stale rgb under a=0 texels (floods copy
+        // neighbor rgb — coverage included — into empty texels).
+        if (u_ormChannel > 0.5 && (m == 0 || m == 4 || m == 5)) {
+          if (m == 5) {
+            // Blur — coverage came through the blurred texture; only the
+            // floors need maintaining so blurred strokes can't produce
+            // a=0/g>0 (PNG-dead) or g=0/a>0 (legacy-looking) texels.
+            if (u_ormChannel < 1.5) {
+              res.a = max(res.a, step(0.001, res.g) * 8.0 / 255.0);
+            } else {
+              res.g = max(res.g, step(0.001, res.a) * 16.0 / 255.0);
+            }
+          } else {
+            float t = step(0.02, srcA);
+            float baseG = b.a > 0.001 ? (b.g < 0.001 ? b.a : b.g) : 0.0;
+            if (u_ormChannel < 1.5) {
+              float outG = srcA + baseG * (1.0 - srcA);
+              res.r = mix(b.r, (srcC.r * srcA + b.r * baseG * (1.0 - srcA)) / max(outG, 1e-5), t);
+              res.g = mix(b.g, outG, t);
+              res.a = mix(b.a, max(b.a, 8.0 / 255.0), t);
+            } else {
+              res.g = mix(b.g, max(baseG, 16.0 / 255.0), t);
+            }
+          }
         }
         gl_FragColor = mix(b, res, u_channelMask);
       }
@@ -694,6 +748,7 @@ export function createPaintRtt() {
       u_baseTexture: { value: null },
       u_fill: { value: new THREE.Vector4(1, 0, 0, 1) },
       u_channelMask: { value: new THREE.Vector4(1, 1, 1, 1) },
+      u_ormChannel: { value: 0 },
     },
     vertexShader: `
       varying vec2 vUv;
@@ -706,10 +761,26 @@ export function createPaintRtt() {
       uniform sampler2D u_baseTexture;
       uniform vec4 u_fill;
       uniform vec4 u_channelMask;
+      uniform float u_ormChannel;
       varying vec2 vUv;
       void main() {
         vec4 b = texture2D(u_baseTexture, vUv);
-        gl_FragColor = mix(b, u_fill, u_channelMask);
+        vec4 res = mix(b, u_fill, u_channelMask);
+        // Same split coverage as the dab shader — fill coverage is
+        // u_fill.a; roughness fills floor A so rgb survives the
+        // premultiplied PNG save, metallic fills floor G so the texel
+        // stays distinguishable from a pre-split (shared-alpha) file.
+        if (u_ormChannel > 0.5) {
+          float baseG = b.a > 0.001 ? (b.g < 0.001 ? b.a : b.g) : 0.0;
+          if (u_ormChannel < 1.5) {
+            res.g = max(baseG, u_fill.a);
+            res.a = max(b.a, 8.0 / 255.0);
+          } else {
+            res.a = max(b.a, u_fill.a);
+            res.g = max(baseG, 16.0 / 255.0);
+          }
+        }
+        gl_FragColor = res;
       }
     `,
     depthTest: false,
@@ -927,13 +998,18 @@ const LAYER_SHADER_TAIL = `
     vec3 envCol = mix(vec3(0.15), vec3(0.9, 0.95, 1.0), normal.y * 0.5 + 0.5);
     vec3 lit = diffuse * shadow * (1.0 - gloss * 0.3) + specCol * spec * shadow + specCol * envCol * gloss * 0.6 * shadow;
 
-    vec3 shaded = mix(lit, color.rgb, u_unlit) + emis * u_emissiveStrength;
+    // Unlit (eye toggle) = flat albedo view — emissive pixels still show
+    // as their authored color (folded in like a painted layer), just
+    // without the strength multiplier; the bloom prepass emits nothing
+    // while unlit so no glow survives the toggle either.
+    vec3 emisLit = emis * u_emissiveStrength;
+    vec3 shaded = mix(lit + emisLit, color.rgb + emis, u_unlit);
     // u_emisOnly — the selective-bloom prepass renders the scene a second
     // time with this set, emitting only the emissive channel; the bloom
     // chain therefore picks up emission and nothing else (bright albedo,
     // spec highlights stay out of the glow). Early-out skips the
     // backface/inpaint overrides so they can't leak into the mask.
-    if (u_emisOnly > 0.5) { gl_FragColor = vec4(emis * u_emissiveStrength, 1.0); return; }
+    if (u_emisOnly > 0.5) { gl_FragColor = vec4(emisLit * (1.0 - u_unlit), 1.0); return; }
     // Backfaces render as checkerboard dimmed 70% — a viewing aid so
     // polys facing away are unmistakable. u_dimBackface goes to 0
     // during image captures so generated inputs keep the real texture.
@@ -990,7 +1066,14 @@ export const LAYER_COMBINED_FRAGMENT = `
       // albedo's coverage is the right weight here too.
       // Map alpha = has-data (layers' masks already folded in by the CPU
       // composite). No-data texels keep whatever accumulated below.
-      if (u_hasCombOrm > 0.5) { vec4 co = texture2D(u_combOrm, vUv); orm = mix(orm, co.rgb, co.a); }
+      if (u_hasCombOrm > 0.5) {
+        vec4 co = texture2D(u_combOrm, vUv);
+        // Split coverage — G = roughness alpha, A = metallic alpha.
+        // g==0 under a>0 = pre-split file: the shared alpha covered both.
+        float coR = co.g < 0.001 ? co.a : co.g;
+        orm.r = mix(orm.r, co.r, coR);
+        orm.b = mix(orm.b, co.b, co.a);
+      }
       if (u_hasCombEmis > 0.5) { vec4 ce = texture2D(u_combEmis, vUv); emis = mix(emis, ce.rgb, ce.a); }
     }
 ${LAYER_SHADER_TAIL}`;
@@ -1015,7 +1098,7 @@ export function buildLiveLayerFragment(ops) {
       // Baked orm/emis were composited with each source layer's mask —
       // their alpha carries the accumulated has-data coverage, so texels
       // with no map data keep whatever the layers below produced.
-      body.push(`if (u_hasBake${s} > 0.5) { vec4 c${s} = texture2D(u_bake${s}, vUv); color.rgb = mix(color.rgb, c${s}.rgb, c${s}.a); color.a = max(color.a, c${s}.a); vec4 bo${s} = u_hasBakeOrm${s} > 0.5 ? texture2D(u_bakeOrm${s}, vUv) : vec4(0.0); orm = mix(orm, bo${s}.rgb, bo${s}.a); vec4 be${s} = u_hasBakeEmis${s} > 0.5 ? texture2D(u_bakeEmis${s}, vUv) : vec4(0.0); emis = mix(emis, be${s}.rgb, be${s}.a); }`);
+      body.push(`if (u_hasBake${s} > 0.5) { vec4 c${s} = texture2D(u_bake${s}, vUv); color.rgb = mix(color.rgb, c${s}.rgb, c${s}.a); color.a = max(color.a, c${s}.a); vec4 bo${s} = u_hasBakeOrm${s} > 0.5 ? texture2D(u_bakeOrm${s}, vUv) : vec4(0.0); orm.r = mix(orm.r, bo${s}.r, bo${s}.g < 0.001 ? bo${s}.a : bo${s}.g); orm.b = mix(orm.b, bo${s}.b, bo${s}.a); vec4 be${s} = u_hasBakeEmis${s} > 0.5 ? texture2D(u_bakeEmis${s}, vUv) : vec4(0.0); emis = mix(emis, be${s}.rgb, be${s}.a); }`);
     } else {
       const s = liveN++;
       slotFor.push({ kind: 'live', s });
@@ -1027,7 +1110,7 @@ export function buildLiveLayerFragment(ops) {
       // NOT the albedo alpha: a roughness stroke on a transparent-albedo
       // texel still owns the surface there. A layer without map data
       // lets lower layers' maps through.
-      body.push(`{ vec4 lc${s} = texture2D(layer${s}, vUv); float cm${s} = mix(step(0.01, length(lc${s}.rgb)), 1.0, hasMask${s}); float pm${s} = mix(1.0, texture2D(mask${s}, vUv).r, hasMask${s}); float a${s} = mix(0.0, lc${s}.a, pm${s}); float cov${s} = cm${s} * a${s}; color.rgb = mix(color.rgb, lc${s}.rgb, cov${s}); color.a = max(color.a, a${s} * cm${s}); vec4 ot${s} = texture2D(orm${s}, vUv); orm = mix(orm, ot${s}.rgb, pm${s} * ot${s}.a); vec4 et${s} = texture2D(emis${s}, vUv); emis = mix(emis, et${s}.rgb, pm${s} * et${s}.a); }`);
+      body.push(`{ vec4 lc${s} = texture2D(layer${s}, vUv); float cm${s} = mix(step(0.01, length(lc${s}.rgb)), 1.0, hasMask${s}); float pm${s} = mix(1.0, texture2D(mask${s}, vUv).r, hasMask${s}); float a${s} = mix(0.0, lc${s}.a, pm${s}); float cov${s} = cm${s} * a${s}; color.rgb = mix(color.rgb, lc${s}.rgb, cov${s}); color.a = max(color.a, a${s} * cm${s}); vec4 ot${s} = texture2D(orm${s}, vUv); orm.r = mix(orm.r, ot${s}.r, pm${s} * (ot${s}.g < 0.001 ? ot${s}.a : ot${s}.g)); orm.b = mix(orm.b, ot${s}.b, pm${s} * ot${s}.a); vec4 et${s} = texture2D(emis${s}, vUv); emis = mix(emis, et${s}.rgb, pm${s} * et${s}.a); }`);
     }
   }
   const fragmentShader = `

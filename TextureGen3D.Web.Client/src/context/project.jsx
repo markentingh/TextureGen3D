@@ -1184,11 +1184,18 @@ export function ProjectProvider({ children }) {
         x.drawImage(img, 0, 0, SIZE, SIZE);
         const d = x.getImageData(0, 0, SIZE, SIZE);
         for (const [key, ch] of [['rough', 0], ['metal', 2]]) {
+          // Split coverage — orm.png: G = roughness alpha, A = metallic
+          // alpha. g==0 under a>0 = pre-split file → shared alpha covers
+          // both channels.
           const chan = x.createImageData(SIZE, SIZE);
           for (let i = 0; i < d.data.length; i += 4) {
+            const a = d.data[i + 3];
+            const g = d.data[i + 1];
+            const cov = key === 'rough' ? (g === 0 ? a : g) : a;
+            if (cov === 0) continue;
             const v = d.data[i + ch];
             chan.data[i] = chan.data[i + 1] = chan.data[i + 2] = v;
-            chan.data[i + 3] = d.data[i + 3];
+            chan.data[i + 3] = cov;
           }
           const cc = mk();
           cc.getContext('2d').putImageData(chan, 0, 0);
@@ -1241,9 +1248,15 @@ export function ProjectProvider({ children }) {
     const ch = mapKey === 'rough' ? 0 : 2;
     const out = x.createImageData(w, h);
     for (let i = 0; i < d.data.length; i += 4) {
+      // G = roughness coverage, A = metallic coverage; g==0 under a>0 =
+      // pre-split file → shared alpha covers both channels.
+      const a = d.data[i + 3];
+      const g = d.data[i + 1];
+      const cov = mapKey === 'rough' ? (g === 0 ? a : g) : a;
+      if (cov === 0) continue;
       const v = d.data[i + ch];
       out.data[i] = out.data[i + 1] = out.data[i + 2] = v;
-      out.data[i + 3] = d.data[i + 3];
+      out.data[i + 3] = cov;
     }
     const oc = document.createElement('canvas');
     oc.width = w;

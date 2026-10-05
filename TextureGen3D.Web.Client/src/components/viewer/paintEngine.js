@@ -250,11 +250,16 @@ export function createPaintEngine(ctx) {
   // coverage where they land. The layer's own mask still gates the map
   // in the compositor shader on top of that.
   const FULL_CHANNEL_MASK = new THREE.Vector4(1, 1, 1, 1);
+  // orm targets include .g in the mask — coverage is split per channel:
+  // G = roughness alpha, A = metallic alpha (a rough dab also floors A
+  // so premultiplied PNG saves don't destroy R/G; a metal dab floors G
+  // so metal-only texels stay distinguishable from pre-split files).
   const CHANNEL_MASKS = {
-    rough: new THREE.Vector4(1, 0, 0, 1),
-    metal: new THREE.Vector4(0, 0, 1, 1),
+    rough: new THREE.Vector4(1, 1, 0, 1),
+    metal: new THREE.Vector4(0, 1, 1, 1),
     emissive: new THREE.Vector4(1, 1, 1, 1),
   };
+  const MAP_ORM_CHANNEL = { rough: 1, metal: 2, emissive: 0 };
   const MAP_KINDS = { rough: 'orm', metal: 'orm', emissive: 'emissive' };
   // Generated default rgb — written under every texel (visible or not) so
   // channel-masked strokes always see sane values in unwritten channels:
@@ -729,6 +734,7 @@ export function createPaintEngine(ctx) {
     cu.u_mode.value = mode;
     cu.u_opacity.value = opacity;
     cu.u_channelMask.value.copy(opts.channelMask || FULL_CHANNEL_MASK);
+    cu.u_ormChannel.value = opts.ormChannel || 0;
     if (opts.color) cu.u_paintColor.value.copy(opts.color);
     cu.u_blurTexture.value = opts.blurTex || null;
     hideAllRtt(rtt);
@@ -830,6 +836,7 @@ export function createPaintEngine(ctx) {
                 color: s.tool === 'eraser' ? MAP_DEFAULTS[kind] : (target === 'emissive' ? paintColor : channelColor),
                 blurTex,
                 channelMask: s.tool === 'eraser' ? FULL_CHANNEL_MASK : channelMask,
+                ormChannel: MAP_ORM_CHANNEL[target] || 0,
               });
               bleedBackToFront(rtt, entry);
               alphaFillFront(rtt, entry);
@@ -933,7 +940,7 @@ export function createPaintEngine(ctx) {
         const channelMask = CHANNEL_MASKS[target] || FULL_CHANNEL_MASK;
         ensureLayerMapEntry(layerId, kind, cfg).then((entry) => {
           if (!entry || !stroke || stroke.tool !== 'stamp') return;
-          const tex = compositeStroke(entry, 4, opacity, { channelMask });
+          const tex = compositeStroke(entry, 4, opacity, { channelMask, ormChannel: MAP_ORM_CHANNEL[target] || 0 });
           meshMapTexRef.current.set(layerMapKey(layerId, kind), tex);
           bindLayerMapTexture(layerId, kind, tex);
           cfg.markLayerMapModified?.(layerId, kind);
@@ -995,6 +1002,7 @@ export function createPaintEngine(ctx) {
           const tex = compositeStroke(entry, erase ? 7 : 0, opacity, {
             color: strokeColor,
             channelMask,
+            ormChannel: MAP_ORM_CHANNEL[target] || 0,
           });
           meshMapTexRef.current.set(layerMapKey(layerId, kind), tex);
           bindLayerMapTexture(layerId, kind, tex);
@@ -1104,7 +1112,7 @@ export function createPaintEngine(ctx) {
         ensureLayerMapEntry(layerId, kind, cfg).then((entry) => {
           if (!entry || !stroke || stroke.tool !== 'blur') return;
           const blurTex = blurLayerIntoScratch(entry, stroke.blurTexels);
-          const tex = compositeStroke(entry, 5, strength, { blurTex, channelMask });
+          const tex = compositeStroke(entry, 5, strength, { blurTex, channelMask, ormChannel: MAP_ORM_CHANNEL[target] || 0 });
           meshMapTexRef.current.set(layerMapKey(layerId, kind), tex);
           bindLayerMapTexture(layerId, kind, tex);
           cfg.markLayerMapModified?.(layerId, kind);
@@ -1421,6 +1429,7 @@ export function createPaintEngine(ctx) {
     fu.u_baseTexture.value = entry.front.texture;
     fu.u_fill.value.set(r, g, b, a);
     fu.u_channelMask.value.copy(CHANNEL_MASKS[map] || FULL_CHANNEL_MASK);
+    fu.u_ormChannel.value = MAP_ORM_CHANNEL[map] || 0;
     rtt.fillCompQuad.visible = true;
     renderer.setRenderTarget(back);
     renderer.render(rtt.scene, rtt.cam);
