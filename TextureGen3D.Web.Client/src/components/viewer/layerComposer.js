@@ -80,13 +80,42 @@ export function createLayerComposer(ctx) {
     return kind === 'orm' ? getDefaultOrmTex() : getDefaultEmisTex();
   };
 
+  // Composite cache — CPU bakes are the expensive part of a mesh/layer
+  // switch (per-pixel mask+blend over every layer). Blob urls are re-minted
+  // on every save and data urls carry content, so a compact signature of
+  // each item's urls is effectively content-addressed: unchanged segments
+  // hit, edited ones miss. LRU-capped — each entry holds ~3 ImageData.
+  const COMP_CACHE_MAX = 8;
+  const compCache = new Map();
+  const urlSig = (u) => (u ? `${u.length}:${u.slice(-48)}` : '');
+  const compSig = (items) =>
+    items
+      .map((i) => `${i.layerId || ''}~${urlSig(i.url)}~${urlSig(i.maskDataUrl)}~${urlSig(i.ormUrl)}~${urlSig(i.emisUrl)}`)
+      .join(';');
+  const compFor = (items) => {
+    const key = compSig(items);
+    if (compCache.has(key)) {
+      const comp = compCache.get(key);
+      compCache.delete(key);
+      compCache.set(key, comp); // recency bump
+      return Promise.resolve(comp);
+    }
+    return compositeLayerImages(items).then((comp) => {
+      compCache.set(key, comp);
+      while (compCache.size > COMP_CACHE_MAX) {
+        compCache.delete(compCache.keys().next().value);
+      }
+      return comp;
+    });
+  };
+
   /**
    * Composite layer images into a single canvas using the same math as the
    * on-mesh shader composite. items: [{ url, maskDataUrl }], ordered
    * top → bottom. Returns a canvas (or null when empty).
    */
   const compositeLayersToCanvas = (items) =>
-    compositeLayerImages(items || []).then((r) => (r ? r.canvas : null));
+    compFor(items || []).then((r) => (r ? r.canvas : null));
 
   /**
    * Update the mesh material from the layer stack. Layers are baked into
@@ -222,7 +251,7 @@ export function createLayerComposer(ctx) {
 
           await Promise.all(ops.map(async (op) => {
             if (op.type === 'bake') {
-              const comp = await compositeLayerImages(op.items);
+              const comp = await compFor(op.items);
               // DataTexture — canvas/PNG would zero the flooded a==0 rgb
               op.tex = comp ? { tex: imageDataToLayerTexture(comp.imgData), url: null } : null;
               // Per-layer orm/emis baked with the same masks + stack order.
@@ -310,7 +339,7 @@ export function createLayerComposer(ctx) {
             }
           });
         } else {
-          const comp = await compositeLayerImages(items);
+          const comp = await compFor(items);
           if (buildId !== layerBuildIdRef.current) { bail(); return; }
           const combinedTex = comp ? imageDataToLayerTexture(comp.imgData) : null;
           if (!combinedTex) { setGreyMaterial(); return; }
@@ -373,5 +402,5 @@ export function createLayerComposer(ctx) {
     })();
   };
 
-  return { updateLayerTextures, compositeLayersToCanvas, compositeLayerImages };
+  return { updateLayerTextures, compositeLayersToCanvas, compositeLayerImages: compFor };
 }

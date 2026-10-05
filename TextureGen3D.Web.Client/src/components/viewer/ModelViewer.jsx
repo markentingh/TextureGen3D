@@ -403,6 +403,20 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
     return true;
   };
 
+  // Reposition a kept aux for a NEW selected mesh's frame — aux transforms
+  // are only scale (the selected mesh's normalization) + relative offset,
+  // so a mesh switch doesn't need to rebuild the object or its textures.
+  const setAuxMeshTransform = (key, offset) => {
+    const entry = auxMeshesRef.current.get(key);
+    const s = currentMeshRef.current?.scale.x;
+    if (!entry || !s) return false;
+    const o = offset || { x: 0, y: 0, z: 0 };
+    entry.root.scale.setScalar(s);
+    entry.root.position.set(o.x * s, o.y * s, o.z * s);
+    entry.root.updateMatrixWorld(true);
+    return true;
+  };
+
   // Eyedropper over the whole canvas: raycasts the selected mesh AND every
   // aux mesh, takes the nearest surface. Aux hits sample their composited
   // uvmap pixels directly ({aux, hex}); selected-mesh hits return the UV so
@@ -1530,6 +1544,10 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
       return auxMeshesRef.current.has(key);
     },
 
+    setAuxMeshTransform(key, offset) {
+      return setAuxMeshTransform(key, offset);
+    },
+
     pickColorAt(clientX, clientY) {
       return pickColorAt(clientX, clientY);
     },
@@ -1542,9 +1560,10 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
     const controls = controlsRef.current;
     if (!scene || !camera || !controls) return;
 
-    // Aux meshes belong to the outgoing selected mesh's coordinate frame —
-    // the context rebuilds them from onMeshLoaded for the new selection.
-    clearAuxMeshes();
+    // Aux meshes that survive the selection change keep their objects —
+    // onMeshLoaded → syncAuxMeshes drops the ones no longer visible and
+    // repositions the rest into the new mesh's frame, so textures and
+    // composites aren't rebuilt on every switch.
 
     // Remove and dispose previous mesh
     if (currentMeshRef.current) {

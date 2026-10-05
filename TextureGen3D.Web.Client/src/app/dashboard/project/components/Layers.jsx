@@ -10,6 +10,7 @@ import { useModal } from '@/context/modal';
 import StitchLayersModal from './StitchLayersModal';
 import MaskThumb, { CHECKERBOARD_BG } from './MaskThumb';
 import ColorPicker from '@/components/ui/ColorPicker';
+import { imgDataToPngBytes, downloadZip } from '@/helpers/textures';
 import { useHubGeneration } from './useHubGeneration';
 
 const loadImage = (src) => new Promise((resolve, reject) => {
@@ -255,6 +256,7 @@ export default function Layers() {
     layerMapThumbs,
     saveLayerMapFile,
     getLayerMapPreviewUrl,
+    bakeMeshTextures,
   } = useProject();
   const { showModal, hideModal } = useModal();
   const { generateViaHub, removeBackground } = useHubGeneration();
@@ -392,31 +394,34 @@ export default function Layers() {
     return items;
   };
 
-  // Download the combined uvmap.png — every visible layer's uvmap with its
-  // mask applied to the alpha channel, flattened via the same compositor the
-  // shader path uses.
+  // Download the baked textures zip — every visible layer's uvmap, orm,
+  // and emissive maps composited via the same CPU compositor the shader
+  // path uses. orm.png/emissive.png are skipped when no layer contributes
+  // map data.
   const handleDownloadUvmap = async () => {
     if (!selectedMesh || downloadingUvmap || !viewerRef.current) return;
     const meshDbId = meshDbIds[selectedMesh.key];
     if (!meshDbId) return;
     setDownloadingUvmap(true);
-    const items = [];
     try {
-      items.push(...await gatherVisibleLayerItems());
-      const canvas = await viewerRef.current.compositeLayersToCanvas?.(items);
-      if (!canvas) return;
-      const pngBlob = await new Promise((res) => canvas.toBlob(res, 'image/png'));
-      if (!pngBlob) return;
+      const comp = await bakeMeshTextures(meshDbId);
+      if (!comp) return;
+      const files = {};
+      const uvmap = await imgDataToPngBytes(comp.imgData);
+      if (uvmap) files['uvmap.png'] = uvmap;
+      if (comp.ormImgData) {
+        const orm = await imgDataToPngBytes(comp.ormImgData);
+        if (orm) files['orm.png'] = orm;
+      }
+      if (comp.emisImgData) {
+        const emis = await imgDataToPngBytes(comp.emisImgData);
+        if (emis) files['emissive.png'] = emis;
+      }
       const meshName = (selectedMesh.name || 'mesh').replace(/[^\w.-]+/g, '_');
-      const a = document.createElement('a');
-      a.href = URL.createObjectURL(pngBlob);
-      a.download = `${meshName}_uvmap.png`;
-      a.click();
-      setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+      downloadZip(files, `${meshName}_textures.zip`);
     } catch (err) {
-      console.error('Failed to download combined uvmap:', err);
+      console.error('Failed to download baked textures:', err);
     } finally {
-      items.forEach((it) => URL.revokeObjectURL(it.url));
       setDownloadingUvmap(false);
     }
   };
@@ -1367,8 +1372,8 @@ export default function Layers() {
                 onClick={handleDownloadUvmap}
                 disabled={!selectedMesh || meshLayers.length === 0 || downloadingUvmap}
                 className="p-1 rounded text-gray-500 hover:text-purple-600 dark:hover:text-purple-400 disabled:opacity-30 disabled:cursor-not-allowed transition"
-                aria-label="Download combined uvmap"
-                title="Download combined uvmap.png"
+                aria-label="Download baked textures"
+                title="Download baked uvmap.png, orm.png, and emissive.png as a zip"
               >
                 {downloadingUvmap ? (
                   <Spinner className="text-lg" />

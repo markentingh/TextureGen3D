@@ -1,9 +1,11 @@
-import React, { useRef, useCallback, useEffect } from 'react';
+import React, { useRef, useCallback, useEffect, useState } from 'react';
 import { GLTFExporter } from 'three/examples/jsm/exporters/GLTFExporter.js';
 import { generateAngleThumbnails } from '@/helpers/camera-angle';
+import { imgDataToPngBytes, downloadZip } from '@/helpers/textures';
 import { useProject } from '@/context/project';
 import { ProjectMeshes } from '@/api/user/projectMeshes';
 import Icon from '@/components/ui/icon';
+import Spinner from '@/components/ui/spinner';
 import { useModal } from '@/context/modal';
 
 export default function MeshList() {
@@ -35,8 +37,43 @@ export default function MeshList() {
     loadProject,
     meshesCollapsed,
     setMeshesCollapsed,
+    bakeMeshTextures,
   } = useProject();
   const { showModal, hideModal } = useModal();
+  const [downloadingTextures, setDownloadingTextures] = useState(false);
+
+  // ── handleDownloadAllTextures ──
+  // Bakes every mesh's uvmap/orm/emissive maps (same CPU compositor the
+  // shader path uses) into /{mesh.name}/*.png folders inside one zip.
+  const handleDownloadAllTextures = async () => {
+    if (downloadingTextures) return;
+    setDownloadingTextures(true);
+    try {
+      const files = {};
+      for (const mesh of allMeshes) {
+        const dbId = meshDbIds[mesh.key];
+        if (!dbId) continue;
+        const comp = await bakeMeshTextures(dbId);
+        if (!comp) continue;
+        const folder = (mesh.name || 'mesh').replace(/[^\w.-]+/g, '_');
+        const uvmap = await imgDataToPngBytes(comp.imgData);
+        if (uvmap) files[`${folder}/uvmap.png`] = uvmap;
+        if (comp.ormImgData) {
+          const orm = await imgDataToPngBytes(comp.ormImgData);
+          if (orm) files[`${folder}/orm.png`] = orm;
+        }
+        if (comp.emisImgData) {
+          const emis = await imgDataToPngBytes(comp.emisImgData);
+          if (emis) files[`${folder}/emissive.png`] = emis;
+        }
+      }
+      downloadZip(files, 'textures.zip');
+    } catch (err) {
+      console.error('Failed to download all mesh textures:', err);
+    } finally {
+      setDownloadingTextures(false);
+    }
+  };
 
   // ── handleMeshDownload ──
   const handleMeshDownload = useCallback(
@@ -243,18 +280,33 @@ export default function MeshList() {
           Settings; collapsed state persists in ui:{projectId} */}
       <div className="flex items-center justify-between p-4 border-b border-gray-200 dark:border-gray-700">
         <h3 className="text-sm font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-400">Meshes</h3>
-        <button
-          onClick={() => setMeshesCollapsed((v) => !v)}
-          className="p-1 rounded hover:bg-gray-100 dark:hover:bg-gray-700 text-gray-500 dark:text-gray-400"
-          aria-label={meshesCollapsed ? 'Expand meshes' : 'Collapse meshes'}
-        >
-          <svg
-            className={`w-4 h-4 transition-transform ${meshesCollapsed ? 'rotate-180' : ''}`}
-            fill="none" stroke="currentColor" viewBox="0 0 24 24"
+        <div className="flex items-center gap-1">
+          <button
+            onClick={handleDownloadAllTextures}
+            disabled={allMeshes.length === 0 || downloadingTextures}
+            className="p-1 rounded text-gray-500 hover:text-purple-600 dark:hover:text-purple-400 disabled:opacity-30 disabled:cursor-not-allowed transition"
+            aria-label="Download all mesh textures"
+            title="Download baked uvmap.png, orm.png, and emissive.png for every mesh as a zip"
           >
-            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
-          </svg>
-        </button>
+            {downloadingTextures ? (
+              <Spinner className="text-lg" />
+            ) : (
+              <Icon name="download" className="text-lg" />
+            )}
+          </button>
+          <button
+            onClick={() => setMeshesCollapsed((v) => !v)}
+            className="p-1 rounded hover:bg-gray-100 dark:hover:bg-gray-700 text-gray-500 dark:text-gray-400"
+            aria-label={meshesCollapsed ? 'Expand meshes' : 'Collapse meshes'}
+          >
+            <svg
+              className={`w-4 h-4 transition-transform ${meshesCollapsed ? 'rotate-180' : ''}`}
+              fill="none" stroke="currentColor" viewBox="0 0 24 24"
+            >
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+            </svg>
+          </button>
+        </div>
       </div>
       {/* Meshes list */}
       {meshesCollapsed ? null : allMeshes.length === 0 ? (

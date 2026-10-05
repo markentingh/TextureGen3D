@@ -15,8 +15,9 @@ export default function ViewportSection() {
     if (pendingLayersRef.current) {
       refreshRef.current(pendingLayersRef.current, meshMeta?.key);
     }
-    // loadMesh cleared the aux set — rebuild it for the new selected mesh
-    auxSyncRef.current?.(true);
+    // loadMesh keeps aux objects across a selection change — reconcile:
+    // drop auxes outside the new set, reposition the rest, load new ones.
+    auxSyncRef.current?.();
   }, [pendingLayersRef]);
 
   return (

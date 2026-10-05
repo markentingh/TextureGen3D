@@ -292,6 +292,12 @@ export function ProjectProvider({ children }) {
   // pointer tool's click-to-select (samples uvmap alpha at the hit UV).
   // Keyed alongside the asset cache — invalidated by invalidateLayerAssets.
   const layerPickDataRef = useRef(new Map()); // layerId -> ImageData
+  // Gathered layer entries per mesh — meshDbId → {layers, entries}. A mesh
+  // reselection replays the urls/masks/maps without refetching or GPU
+  // readbacks. Validity = the layers array reference (stack mutations
+  // produce a new array → automatic miss); content dirties (paint, saves)
+  // clear the whole map via the dirty-marker functions below.
+  const layerEntriesCacheRef = useRef(new Map());
 
   // Write bytes we just saved to the server straight into the shared cache
   // — no invalidate→refetch round-trip. Malformed input drops the entry so
@@ -314,6 +320,7 @@ export function ProjectProvider({ children }) {
       // Decoded pick data describes the old uvmap — rebuild lazily.
       layerPickDataRef.current.delete(layerId);
     }
+    layerEntriesCacheRef.current.clear();
   }, []);
 
   const invalidateLayerAssets = useCallback((layerIds = null) => {
@@ -333,8 +340,10 @@ export function ProjectProvider({ children }) {
         entry.b.dispose();
       }
       layerMasksRef.current.clear();
+      layerEntriesCacheRef.current.clear();
       return;
     }
+    layerEntriesCacheRef.current.clear();
     for (const layerId of [].concat(layerIds)) {
       const e = layerAssetCacheRef.current.get(layerId);
       if (e?.url) URL.revokeObjectURL(e.url);
@@ -663,6 +672,7 @@ export function ProjectProvider({ children }) {
   }, [sampleLayerColorAt]);
 
   const markMaskModified = useCallback((layerId) => {
+    layerEntriesCacheRef.current.clear();
     const meshDbId = selectedMeshRef.current ? meshDbIdsRef.current[selectedMeshRef.current.key] : null;
     const prev = modifiedLayerIdsRef.current.get(layerId);
     if (prev) return; // already tracked with a valid meshId
@@ -1057,6 +1067,7 @@ export function ProjectProvider({ children }) {
   // 5s bounce — stroke-end adds the touched layers and resets the timer, so
   // only a 5s gap in drawing actually saves (masks use scheduleMaskSave).
   const scheduleUvmapSave = useCallback((layerIds) => {
+    layerEntriesCacheRef.current.clear();
     const meshDbId = selectedMeshRef.current ? meshDbIdsRef.current[selectedMeshRef.current.key] : null;
     for (const layerId of layerIds || []) {
       if (!pendingUvmapLayerIdsRef.current.has(layerId)) {
@@ -1099,6 +1110,7 @@ export function ProjectProvider({ children }) {
   const [layerMapThumbs, setLayerMapThumbs] = useState({}); // layerId → {rough, metal, emissive}
 
   const invalidateLayerMapAsset = useCallback((meshDbId, layerId = null, kind = null) => {
+    layerEntriesCacheRef.current.clear();
     if (layerId && kind) {
       layerMapAssetCacheRef.current.delete(`${meshDbId}|${layerId}|${kind}`);
       return;
@@ -1116,6 +1128,11 @@ export function ProjectProvider({ children }) {
   // doesn't exist yet.
   const ensureLayerMapAsset = useCallback(async (meshDbId, layerId, kind) => {
     const key = `${meshDbId}|${layerId}|${kind}`;
+    // A pending-save stash holds the newest pixels — a map RT reset
+    // (mesh swap) would otherwise read back the stale saved file until
+    // the debounced save lands.
+    const stashed = stashedLayerMapsRef.current.get(key);
+    if (stashed) return { blob: null, url: stashed };
     const cached = layerMapAssetCacheRef.current.get(key);
     if (cached) return cached;
     let flight = layerMapFlightRef.current.get(key);
@@ -1304,6 +1321,7 @@ export function ProjectProvider({ children }) {
   }, [id, layerApi, invalidateLayerMapAsset, refreshLayerMapThumbs]);
 
   const markLayerMapModified = useCallback((layerId, kind) => {
+    layerEntriesCacheRef.current.clear();
     const meshDbId = selectedMeshRef.current ? meshDbIdsRef.current[selectedMeshRef.current.key] : null;
     if (!meshDbId) return;
     const key = `${meshDbId}|${layerId}`;
@@ -1323,6 +1341,7 @@ export function ProjectProvider({ children }) {
   // modified map's pixels into the stash first so the debounced save can
   // still upload them.
   const stashLayerMap = useCallback((layerId, kind, dataUrl) => {
+    layerEntriesCacheRef.current.clear();
     const meshDbId = selectedMeshRef.current ? meshDbIdsRef.current[selectedMeshRef.current.key] : null;
     if (!meshDbId || !dataUrl) return;
     const key = `${meshDbId}|${layerId}`;
@@ -1645,8 +1664,16 @@ export function ProjectProvider({ children }) {
       if (!meshDbId) return;
       const layerList = layers || meshLayersRef.current;
       const visibleLayers = layerList.filter((l) => l.visible !== false);
-      const entries = [];
-      for (const layer of visibleLayers) {
+      // Per-mesh entries cache — reselecting a mesh replays the gathered
+      // urls/masks/maps with zero fetches or GPU readbacks. Validity =
+      // the layers array reference (mutations produce a new array);
+      // content dirties clear the map in the marker functions.
+      let entries = layerEntriesCacheRef.current.get(meshDbId)?.layers === layerList
+        ? layerEntriesCacheRef.current.get(meshDbId).entries
+        : null;
+      if (!entries) {
+        entries = [];
+        for (const layer of visibleLayers) {
         // A newer refresh was queued while gathering — bail; the trailing
         // run rebuilds from the latest args/state anyway.
         if (refreshQueuedRef.current) return;
@@ -1692,14 +1719,16 @@ export function ProjectProvider({ children }) {
         try { ormUrl = viewerRef.current?.getLayerMapDataUrl?.(layer.id, 'orm') || null; } catch { /* no RT */ }
         try { emisUrl = viewerRef.current?.getLayerMapDataUrl?.(layer.id, 'emissive') || null; } catch { /* no RT */ }
 
-        entries.push({
-          url,
-          maskTexture,
-          maskDataUrl,
-          layerId: layer.id,
-          ormUrl: ormUrl || ormAsset?.url || null,
-          emisUrl: emisUrl || emisAsset?.url || null,
-        });
+          entries.push({
+            url,
+            maskTexture,
+            maskDataUrl,
+            layerId: layer.id,
+            ormUrl: ormUrl || ormAsset?.url || null,
+            emisUrl: emisUrl || emisAsset?.url || null,
+          });
+        }
+        layerEntriesCacheRef.current.set(meshDbId, { layers: layerList, entries });
       }
       if (refreshQueuedRef.current) return; // superseded mid-gather
       const hasAny = entries.some((e) => e.url !== null);
@@ -1860,6 +1889,81 @@ export function ProjectProvider({ children }) {
   // masked by its mask.png) composited into a single texture, then the mesh
   // placed at its stored world offset relative to the selected mesh (which
   // sits at the origin).
+  // Gather a mesh's visible layers into composite items — uvmap + mask +
+  // orm/emissive URLs per layer. Live render-target readbacks win (unsaved
+  // strokes still inside the save debounce), shared blob caches second.
+  const gatherMeshLayerItems = useCallback(
+    async (dbId, layers) => {
+      const viewer = viewerRef.current;
+      const items = [];
+      for (const layer of (layers || []).filter((l) => l.visible !== false)) {
+        // uvmap — live stamp RT readback first (catches strokes still
+        // inside the 5s save debounce), else the shared blob cache; a
+        // warm hit means this mesh's files were already loaded while it
+        // was selected or aux — no API call at all.
+        let url = viewer?.getStampCanvasDataUrl?.(layer.id) || null;
+        if (!url) {
+          const asset = await ensureLayerImage(layer.id, dbId, 'uvmap');
+          url = asset?.url || null;
+        }
+        // mask — live RT readback first (unsaved mask edits), else the
+        // shared mask blob cache. asset.url works directly as the
+        // composite's mask source.
+        let maskDataUrl = null;
+        const maskEntry = layerMasksRef.current.get(layer.id);
+        if (maskEntry?.initialized) {
+          try {
+            maskDataUrl = viewer?.maskToDataURL?.(maskEntry) || null;
+          } catch {
+            /* readback failed — composite unmasked */
+          }
+        }
+        if (!maskDataUrl) {
+          const maskAsset = await ensureLayerImage(layer.id, dbId, 'mask');
+          maskDataUrl = maskAsset?.url || null;
+        }
+        // Per-layer PBR maps — same rule as the selected mesh's
+        // composite: live RT readback (unsaved strokes) first, saved
+        // file second. Layers without a file contribute no PBR data.
+        let ormUrl = viewer?.getLayerMapDataUrl?.(layer.id, 'orm') || null;
+        if (!ormUrl) {
+          ormUrl = (await ensureLayerMapAsset(dbId, layer.id, 'orm'))?.url || null;
+        }
+        let emisUrl = viewer?.getLayerMapDataUrl?.(layer.id, 'emissive') || null;
+        if (!emisUrl) {
+          emisUrl = (await ensureLayerMapAsset(dbId, layer.id, 'emissive'))?.url || null;
+        }
+        if (!url && !ormUrl && !emisUrl) continue;
+        items.push({ url, maskDataUrl, ormUrl, emisUrl });
+      }
+      return items;
+    },
+    [ensureLayerImage, ensureLayerMapAsset]
+  );
+
+  // Bake a mesh's layer stack into ImageData maps — the same CPU composite
+  // that feeds the shaders, so downloads match the on-mesh render. orm /
+  // emis are null when no layer contributed map data.
+  const bakeMeshTextures = useCallback(
+    async (dbId) => {
+      const viewer = viewerRef.current;
+      if (!viewer?.compositeLayers) return null;
+      const items = await gatherMeshLayerItems(dbId, allMeshLayersRef.current[dbId]);
+      return items.length ? viewer.compositeLayers(items) : null;
+    },
+    [gatherMeshLayerItems]
+  );
+
+  // aux offset = its world offset minus the selected mesh's — the selected
+  // mesh always renders at 0,0,0.
+  const auxOffsetFor = (dbId) => {
+    const sel = selectedMeshRef.current;
+    const selDbId = sel ? meshDbIdsRef.current[sel.key] : null;
+    const selOff = resolveMeshOffset(meshByDbIdRef.current[selDbId]);
+    const auxOff = resolveMeshOffset(meshByDbIdRef.current[dbId]);
+    return { x: auxOff.x - selOff.x, y: auxOff.y - selOff.y, z: auxOff.z - selOff.z };
+  };
+
   const buildAuxMesh = useCallback(
     async (dbId) => {
       const viewer = viewerRef.current;
@@ -1871,10 +1975,7 @@ export function ProjectProvider({ children }) {
 
       // aux position = its world offset minus the selected mesh's — the
       // selected mesh always renders at 0,0,0
-      const selEntry = meshByDbIdRef.current[selDbId];
-      const selOff = resolveMeshOffset(selEntry);
-      const auxOff = resolveMeshOffset(entry);
-      const offset = { x: auxOff.x - selOff.x, y: auxOff.y - selOff.y, z: auxOff.z - selOff.z };
+      const offset = auxOffsetFor(dbId);
 
       // Reuse the cached composite unless the source object or the layer
       // list changed — viewer rebuilds alone don't re-download the uvmaps.
@@ -1883,58 +1984,20 @@ export function ProjectProvider({ children }) {
       let comp = cached && cached.entry === entry && cached.layers === layers ? cached.comp : undefined;
 
       if (comp === undefined) {
-        const items = [];
-        for (const layer of layers.filter((l) => l.visible !== false)) {
-          // uvmap — live stamp RT readback first (catches strokes still
-          // inside the 5s save debounce), else the shared blob cache; a
-          // warm hit means this mesh's files were already loaded while it
-          // was selected or aux — no API call at all.
-          let url = viewer.getStampCanvasDataUrl?.(layer.id) || null;
-          if (!url) {
-            const asset = await ensureLayerImage(layer.id, dbId, 'uvmap');
-            url = asset?.url || null;
-          }
-          // mask — live RT readback first (unsaved mask edits), else the
-          // shared mask blob cache. asset.url works directly as the
-          // composite's mask source.
-          let maskDataUrl = null;
-          const maskEntry = layerMasksRef.current.get(layer.id);
-          if (maskEntry?.initialized) {
-            try {
-              maskDataUrl = viewer.maskToDataURL?.(maskEntry) || null;
-            } catch {
-              /* readback failed — composite unmasked */
-            }
-          }
-          if (!maskDataUrl) {
-            const maskAsset = await ensureLayerImage(layer.id, dbId, 'mask');
-            maskDataUrl = maskAsset?.url || null;
-          }
-          // Per-layer PBR maps — same rule as the selected mesh's
-          // composite: live RT readback (unsaved strokes) first, saved
-          // file second. Layers without a file contribute no PBR data.
-          let ormUrl = viewer.getLayerMapDataUrl?.(layer.id, 'orm') || null;
-          if (!ormUrl) {
-            ormUrl = (await ensureLayerMapAsset(dbId, layer.id, 'orm'))?.url || null;
-          }
-          let emisUrl = viewer.getLayerMapDataUrl?.(layer.id, 'emissive') || null;
-          if (!emisUrl) {
-            emisUrl = (await ensureLayerMapAsset(dbId, layer.id, 'emissive'))?.url || null;
-          }
-          if (!url && !ormUrl && !emisUrl) continue;
-          items.push({ url, maskDataUrl, ormUrl, emisUrl });
-        }
+        const items = await gatherMeshLayerItems(dbId, layers);
         comp = items.length ? await viewer.compositeLayers(items) : null;
         auxCanvasCacheRef.current.set(dbId, { entry, layers, comp });
       }
       return viewer.setAuxMesh(dbId, { object: entry.object, comp, offset, matrix: settingsWorldMatrix(entry.settings) }) !== false;
     },
-    [id, ensureLayerImage, ensureLayerMapAsset]
+    [id, ensureLayerImage, ensureLayerMapAsset, gatherMeshLayerItems]
   );
 
   // Reconciles the viewer's aux meshes with the stored set for the current
-  // selected mesh. rebuild=true after the viewer cleared everything (mesh
-  // swap) — otherwise only missing meshes are added and stale ones removed.
+  // selected mesh. Auxes that stay in the set across a mesh switch aren't
+  // rebuilt — only repositioned into the new mesh's frame. rebuild=true
+  // after the viewer cleared everything (unmount/null selection) —
+  // otherwise only missing meshes are added and stale ones removed.
   const syncAuxMeshes = useCallback(
     async (rebuild = false) => {
       const viewer = viewerRef.current;
@@ -1959,7 +2022,11 @@ export function ProjectProvider({ children }) {
         }
       }
       for (const mid of ids) {
-        if (auxLoadedRef.current.has(mid)) continue;
+        if (auxLoadedRef.current.has(mid)) {
+          // Kept across a selection change — only the frame moved.
+          viewer?.setAuxMeshTransform?.(mid, auxOffsetFor(mid));
+          continue;
+        }
         if (await buildAuxMesh(mid)) auxLoadedRef.current.set(mid, meshByDbIdRef.current[mid]);
       }
       setAuxVisibleIds(ids);
@@ -2722,6 +2789,7 @@ export function ProjectProvider({ children }) {
     invalidateLayerAssets,
     updateLayerImageCache,
     refreshMeshRefView,
+    bakeMeshTextures,
     // utils
     formatTriangleCount,
   };
