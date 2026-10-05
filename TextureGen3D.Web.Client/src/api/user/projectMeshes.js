@@ -13,6 +13,11 @@ const ProjectMeshes = (args) => Api({ ...args }).endpoints(({ api }) => {
     syncBatch: (projectId, modelId, meshes) => api.post(`${apiPath}/${projectId}/sync`, { modelId, meshes }),
     delete: (projectId, meshId) => api.post(`${apiPath}/${projectId}/${meshId}/delete`),
     updatePrompt: (projectId, meshId, prompt) => api.post(`${apiPath}/${projectId}/${meshId}/update-prompt`, { prompt }),
+    // Mesh-level texture files shared by the whole mesh — orm.png
+    // (roughness R / metallic B) + emissive.png.
+    fileUrl: (projectId, meshId, fileName) => `${apiPath}/${projectId}/${meshId}/file/${fileName}`,
+    saveFile: (projectId, meshId, fileName, base64Image) =>
+      api.post(`${apiPath}/${projectId}/${meshId}/save-file`, { fileName, base64Image }),
   };
 });
 

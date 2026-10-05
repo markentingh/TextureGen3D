@@ -1,5 +1,6 @@
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
+using TextureGen3D.API.Helpers;
 using TextureGen3D.API.Models;
 using TextureGen3D.API.Services;
 using TextureGen3D.Data.Entities.Projects;
@@ -235,6 +236,67 @@ namespace TextureGen3D.API.Controllers
                 // folder (uvmaps, masks, layer images) needs explicit removal
                 await _imageService.DeleteProjectMeshFolderAsync(projectId, meshId);
                 await _meshRepo.DeleteAsync(meshId, projectId);
+                return Json(new ApiResponse { success = true });
+            }
+            catch (Exception ex)
+            {
+                return Json(new ApiResponse { success = false, message = ex.Message });
+            }
+        }
+
+        // Mesh-level texture files shared by the whole mesh — orm.png
+        // (roughness R / metallic B) and emissive.png live beside the
+        // per-layer folders under the mesh's directory.
+        [HttpGet("{projectId}/{meshId}/file/{fileName}")]
+        public async Task<IActionResult> GetMeshFile(Guid projectId, Guid meshId, string fileName)
+        {
+            var userId = GetUserId();
+            if (userId == Guid.Empty) return Unauthorized();
+
+            // Plain file names only — no path traversal
+            if (fileName.Length == 0 || fileName.Length > 128 ||
+                fileName != Path.GetFileName(fileName) ||
+                !System.Text.RegularExpressions.Regex.IsMatch(fileName, @"^[a-zA-Z0-9_.\-]+$"))
+                return BadRequest();
+
+            var project = await _projectRepo.GetByIdAsync(projectId, userId);
+            if (project == null) return NotFound();
+
+            var data = await _imageService.GetProjectMeshFileAsync(projectId, meshId, fileName);
+            if (data == null || data.Length == 0) return NotFound();
+            return this.CachedFile(data, "image/png");
+        }
+
+        public class SaveMeshFileRequest
+        {
+            public string FileName { get; set; } = "";
+            public string Base64Image { get; set; } = "";
+        }
+
+        [HttpPost("{projectId}/{meshId}/save-file")]
+        public async Task<IActionResult> SaveMeshFile(Guid projectId, Guid meshId, [FromBody] SaveMeshFileRequest request)
+        {
+            try
+            {
+                var userId = GetUserId();
+                if (userId == Guid.Empty)
+                    return Json(new ApiResponse { success = false, message = "Could not find user" });
+
+                var project = await _projectRepo.GetByIdAsync(projectId, userId);
+                if (project == null)
+                    return Json(new ApiResponse { success = false, message = "Project not found" });
+
+                var fileName = request.FileName ?? "";
+                if (fileName.Length == 0 || fileName.Length > 128 ||
+                    fileName != Path.GetFileName(fileName) ||
+                    !System.Text.RegularExpressions.Regex.IsMatch(fileName, @"^[a-zA-Z0-9_.\-]+$"))
+                    return Json(new ApiResponse { success = false, message = "Invalid file name" });
+
+                var base64 = request.Base64Image;
+                if (base64.StartsWith("data:")) base64 = base64.Substring(base64.IndexOf(',') + 1);
+                var imageBytes = Convert.FromBase64String(base64);
+
+                await _imageService.SaveProjectMeshFileAsync(projectId, meshId, fileName, imageBytes);
                 return Json(new ApiResponse { success = true });
             }
             catch (Exception ex)

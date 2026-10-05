@@ -24,9 +24,28 @@ const yieldToMain = () =>
 // imageDataToLayerTexture (preserves the flooded hidden rgb).
 export const compositeLayerImages = async (items) => {
   if (!items.length) return null;
-  const imgs = await Promise.all(items.map((e) => loadImgEl(e.url)));
-  const w = imgs[0].naturalWidth || imgs[0].width;
-  const h = imgs[0].naturalHeight || imgs[0].height;
+  // Map-only layers are legal (orm/emissive painted with no uvmap) —
+  // missing albedo loads as null and composites as fully transparent.
+  const imgs = await Promise.all(items.map((e) => (e.url ? loadImgEl(e.url) : Promise.resolve(null))));
+
+  // Per-layer PBR maps — orm.png (roughness R / metallic B) + emissive.png
+  // composite like the uvmaps but with an extra gate: a layer's map only
+  // contributes where the map itself has data (its own alpha marks painted
+  // coverage — layers without a map file contribute nothing and let the
+  // layers below show through). Weight = layer mask × map alpha, and
+  // the accumulated alpha records total coverage for the shader.
+  const needOrm = items.some((e) => e.ormUrl);
+  const needEmis = items.some((e) => e.emisUrl);
+  const ormImgs = needOrm ? await Promise.all(items.map((e) => (e.ormUrl ? loadImgEl(e.ormUrl) : Promise.resolve(null)))) : null;
+  const emisImgs = needEmis ? await Promise.all(items.map((e) => (e.emisUrl ? loadImgEl(e.emisUrl) : Promise.resolve(null)))) : null;
+  // Canvas dims — first image that exists across albedo or either map
+  // (a stack of map-only layers has no albedo image to size from).
+  const firstImg = [...imgs, ...(ormImgs || []), ...(emisImgs || [])].find(Boolean);
+  if (!firstImg) return null;
+  const w = firstImg.naturalWidth || firstImg.width;
+  const h = firstImg.naturalHeight || firstImg.height;
+  const np = w * h * 4;
+
   const canvas = document.createElement('canvas');
   canvas.width = w;
   canvas.height = h;
@@ -40,11 +59,23 @@ export const compositeLayerImages = async (items) => {
   mc.height = h;
   const mctx = mc.getContext('2d', { willReadFrequently: true });
 
+  const ormAcc = needOrm ? new Uint8ClampedArray(np) : null;
+  const emisAcc = needEmis ? new Uint8ClampedArray(np) : null;
+  // rgb seeds = the generated defaults (rough 1 / metal 0 / no emission);
+  // alpha starts 0 — source-over accumulation of each layer's weight.
+  if (ormAcc) for (let p = 0; p < np; p += 4) ormAcc[p] = 255;
+
   for (let i = items.length - 1; i >= 0; i--) { // bottom → top
     await yieldToMain();
-    tctx.clearRect(0, 0, w, h);
-    tctx.drawImage(imgs[i], 0, 0, w, h);
-    const imgData = tctx.getImageData(0, 0, w, h);
+    // Map-only layer (no uvmap) — fully transparent albedo; its mask and
+    // maps still apply through the PBR composite below.
+    const imgData = imgs[i]
+      ? (() => {
+          tctx.clearRect(0, 0, w, h);
+          tctx.drawImage(imgs[i], 0, 0, w, h);
+          return tctx.getImageData(0, 0, w, h);
+        })()
+      : new ImageData(w, h);
     let md = null;
     if (items[i].maskDataUrl) {
       const maskImg = await loadImgEl(items[i].maskDataUrl);
@@ -77,6 +108,42 @@ export const compositeLayerImages = async (items) => {
         d[p + 3] = Math.round((d[p + 3] * md[p]) / 255);
       }
     }
+
+    // PBR channels — weight = this layer's mask × the map's own has-data
+    // alpha (mask-less → 1). NOT the albedo alpha: the maps carry their
+    // own coverage, so a roughness stroke on a transparent-albedo texel
+    // still applies. Layers without a map file contribute nothing at all.
+    const maskW = (p) => (md ? md[p] / 255 : 1);
+    if (ormAcc || emisAcc) {
+      if (ormAcc && ormImgs[i]) {
+        mctx.clearRect(0, 0, w, h);
+        mctx.drawImage(ormImgs[i], 0, 0, w, h);
+        const ormD = mctx.getImageData(0, 0, w, h).data;
+        for (let p = 0; p < np; p += 4) {
+          const wt = maskW(p) * (ormD[p + 3] / 255);
+          if (wt === 0) continue;
+          ormAcc[p] += (ormD[p] - ormAcc[p]) * wt;
+          ormAcc[p + 1] += (ormD[p + 1] - ormAcc[p + 1]) * wt;
+          ormAcc[p + 2] += (ormD[p + 2] - ormAcc[p + 2]) * wt;
+          ormAcc[p + 3] += (255 - ormAcc[p + 3]) * wt; // source-over coverage
+        }
+      }
+      if (emisAcc && emisImgs[i]) {
+        tctx.clearRect(0, 0, w, h);
+        tctx.drawImage(emisImgs[i], 0, 0, w, h);
+        const emisD = tctx.getImageData(0, 0, w, h).data;
+        for (let p = 0; p < np; p += 4) {
+          const wt = maskW(p) * (emisD[p + 3] / 255);
+          if (wt === 0) continue;
+          emisAcc[p] += (emisD[p] - emisAcc[p]) * wt;
+          emisAcc[p + 1] += (emisD[p + 1] - emisAcc[p + 1]) * wt;
+          emisAcc[p + 2] += (emisD[p + 2] - emisAcc[p + 2]) * wt;
+          emisAcc[p + 3] += (255 - emisAcc[p + 3]) * wt;
+        }
+      }
+    }
+
+    tctx.clearRect(0, 0, w, h);
     tctx.putImageData(imgData, 0, 0);
     ctx.drawImage(tmp, 0, 0);
   }
@@ -94,7 +161,11 @@ export const compositeLayerImages = async (items) => {
   }
   fillTransparentRgb(cdData, w, h, visible);
   ctx.putImageData(cd, 0, 0);
-  return { canvas, imgData: cd };
+
+  const out = { canvas, imgData: cd };
+  if (ormAcc) out.ormImgData = new ImageData(ormAcc, w, h);
+  if (emisAcc) out.emisImgData = new ImageData(emisAcc, w, h);
+  return out;
 };
 
 // Upload raw RGBA pixels as a mipmapped texture via DataTexture — NOT

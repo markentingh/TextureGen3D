@@ -29,8 +29,8 @@ function getGreyCheckerTex() {
 export function makeGreyMeshMaterial() {
   const mat = new THREE.MeshStandardMaterial({
     color: 0x9ca3af,
-    metalness: 0.1,
-    roughness: 0.8,
+    metalness: 0.0,
+    roughness: 1.0,
     side: THREE.DoubleSide,
   });
   mat.userData.uDimBackface = { value: 1 };
@@ -606,6 +606,8 @@ export function createPaintRtt() {
   //   4 stamp  : source-over stroke.rgb at stroke.a * opacity
   //   5 blur   : mix(base, blurred base, stroke.a * strength)
   //   6 reveal : mask.r = max(mask.r, stroke.a * 4) — unmask painted area
+  //   7 map-erase   : rgb = u_paintColor defaults, alpha -= stroke
+  //   8 map-normalize: rgb = defaults under alpha==0 (PNG loses hidden rgb)
   const strokeCompMat = new THREE.ShaderMaterial({
     uniforms: {
       u_baseTexture: { value: null },        // layer snapshot (front buffer)
@@ -614,6 +616,10 @@ export function createPaintRtt() {
       u_paintColor: { value: new THREE.Color(1, 0, 0) },
       u_opacity: { value: 1.0 },             // slider value 0..1 (no pressure)
       u_mode: { value: 0.0 },
+      // Per-channel write gate — (1,1,1,1) normally; mesh-map painting
+      // restricts to the target channel ((1,0,0,0) = orm roughness R,
+      // (0,0,1,0) = metallic B, (1,1,1,0) = emissive RGB).
+      u_channelMask: { value: new THREE.Vector4(1, 1, 1, 1) },
     },
     vertexShader: `
       varying vec2 vUv;
@@ -629,36 +635,48 @@ export function createPaintRtt() {
       uniform vec3 u_paintColor;
       uniform float u_opacity;
       uniform float u_mode;
+      uniform vec4 u_channelMask;
       varying vec2 vUv;
       void main() {
         vec4 b = texture2D(u_baseTexture, vUv);
         vec4 s = texture2D(u_stroke, vUv);
         int m = int(u_mode + 0.5);
+        vec4 res;
         if (m == 1) {
-          gl_FragColor = vec4(b.rgb, b.a * (1.0 - s.a * u_opacity));
-          return;
-        }
-        if (m == 2 || m == 3) {
+          res = vec4(b.rgb, b.a * (1.0 - s.a * u_opacity));
+        } else if (m == 2 || m == 3) {
           float sign = m == 2 ? 1.0 : -1.0;
           float v = clamp(b.r + sign * s.a * u_opacity, 0.0, 1.0);
-          gl_FragColor = vec4(v, v, v, 1.0);
-          return;
-        }
-        if (m == 5) {
+          res = vec4(v, v, v, 1.0);
+        } else if (m == 5) {
           vec4 blur = texture2D(u_blurTexture, vUv);
-          gl_FragColor = mix(b, blur, s.a * u_opacity);
-          return;
-        }
-        if (m == 6) {
+          res = mix(b, blur, s.a * u_opacity);
+        } else if (m == 6) {
           float v = max(b.r, min(1.0, s.a * 4.0));
-          gl_FragColor = vec4(v, v, v, 1.0);
-          return;
+          res = vec4(v, v, v, 1.0);
+        } else if (m == 7) {
+          // Layer-map erase — restore the file's generated default rgb AND
+          // clear alpha so the texel carries no map data again (lower
+          // layers' maps show through, then the global defaults). Both
+          // must be gated by the stroke: writing u_paintColor unmasked
+          // would reset rgb over the WHOLE texture on every dab.
+          float t = s.a * u_opacity;
+          res = vec4(mix(b.rgb, u_paintColor, t), b.a * (1.0 - t));
+        } else if (m == 8) {
+          // Layer-map normalize — PNG round-trips lose rgb under alpha=0,
+          // so a loaded file can carry garbage channels under transparent
+          // texels. Restore the generated defaults there so future
+          // channel-masked strokes see sane values (orm.R must read 1, not
+          // the lost black → accidental glossy).
+          res = vec4(b.a > 0.001 ? b.rgb : u_paintColor, b.a);
+        } else {
+          vec3 srcC = m == 4 ? s.rgb : u_paintColor;
+          float srcA = s.a * u_opacity;
+          float outA = srcA + b.a * (1.0 - srcA);
+          vec3 outRgb = (srcC * srcA + b.rgb * b.a * (1.0 - srcA)) / max(outA, 1e-5);
+          res = vec4(outRgb, outA);
         }
-        vec3 srcC = m == 4 ? s.rgb : u_paintColor;
-        float srcA = s.a * u_opacity;
-        float outA = srcA + b.a * (1.0 - srcA);
-        vec3 outRgb = (srcC * srcA + b.rgb * b.a * (1.0 - srcA)) / max(outA, 1e-5);
-        gl_FragColor = vec4(outRgb, outA);
+        gl_FragColor = mix(b, res, u_channelMask);
       }
     `,
     depthTest: false,
@@ -669,7 +687,40 @@ export function createPaintRtt() {
   strokeCompQuad.frustumCulled = false;
   strokeCompQuad.visible = false;
 
-  scene.add(paintGroup, blitQuad, bleedQuad, copyQuad, alphaFillQuad, blurQuad, strokeCompQuad);
+  // Channel-masked fill — writes u_fill into only the channels selected by
+  // u_channelMask (Fill Roughness/Metallic touch one channel of orm.png).
+  const fillCompMat = new THREE.ShaderMaterial({
+    uniforms: {
+      u_baseTexture: { value: null },
+      u_fill: { value: new THREE.Vector4(1, 0, 0, 1) },
+      u_channelMask: { value: new THREE.Vector4(1, 1, 1, 1) },
+    },
+    vertexShader: `
+      varying vec2 vUv;
+      void main() {
+        vUv = uv;
+        gl_Position = vec4(position.xy, 0.0, 1.0);
+      }
+    `,
+    fragmentShader: `
+      uniform sampler2D u_baseTexture;
+      uniform vec4 u_fill;
+      uniform vec4 u_channelMask;
+      varying vec2 vUv;
+      void main() {
+        vec4 b = texture2D(u_baseTexture, vUv);
+        gl_FragColor = mix(b, u_fill, u_channelMask);
+      }
+    `,
+    depthTest: false,
+    depthWrite: false,
+    blending: THREE.NoBlending,
+  });
+  const fillCompQuad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), fillCompMat);
+  fillCompQuad.frustumCulled = false;
+  fillCompQuad.visible = false;
+
+  scene.add(paintGroup, blitQuad, bleedQuad, copyQuad, alphaFillQuad, blurQuad, strokeCompQuad, fillCompQuad);
   return {
     scene, cam, mat, paintGroup, blitQuad,
     coverageMat, coverageRT, coverageMesh: null,
@@ -679,6 +730,7 @@ export function createPaintRtt() {
     blurMat, blurQuad, blurMixMat,
     colorPaintMat,
     strokeDabMat, strokeCompMat, strokeCompQuad,
+    fillCompMat, fillCompQuad,
   };
 }
 
@@ -833,7 +885,55 @@ const LAYER_SHADER_TAIL = `
       }
     }
 
-    vec3 shaded = mix(color.rgb * shadow, color.rgb, u_unlit);
+    // PBR surface maps — orm/emis were accumulated per-layer in the ops
+    // body: each layer's orm.png (roughness R / metallic B) and
+    // emissive.png are gated by that layer's coverage (mask × alpha) and
+    // mixed in stack order before reaching here. Initialized to the
+    // generated defaults: fully rough, non-metal, no emission.
+    float rough = clamp(orm.r, 0.0, 1.0);
+    float metal = clamp(orm.b, 0.0, 1.0);
+
+    // Specular + emission — Blinn lobe driven by roughness (tight/bright when
+    // smooth), tinted toward albedo and boosted as metallic rises (metals
+    // also lose diffuse). Emission adds raw color, unaffected by light.
+    vec3 viewDir = normalize(cameraPosition - vWorldPos);
+    vec3 halfDir = normalize(lightDir + viewDir);
+    float specPow = mix(256.0, 4.0, rough);
+    // Roughness gates the highlight, not just its tightness — pow(…,4) is
+    // broad enough to sheen the whole surface, so without the (1-rough)
+    // attenuation a fully-rough mesh still looks shiny. rough=1 → matte.
+    // Dielectric spec sits at 0.4 (vs the realistic ~0.04) so painted
+    // low-roughness strokes read as an obvious gloss rather than a faint
+    // dot that's easy to miss outside the highlight's path.
+    float specAmt = mix(0.4, 1.0, metal) * (1.0 - rough);
+    vec3 specCol = mix(vec3(1.0), color.rgb, metal);
+    // Blinn lobe + fresnel rim — the pow-256 lobe alone only shows in a
+    // narrow band around the highlight; smooth surfaces also reflect at
+    // grazing angles, so the rim term makes painted rough=0 regions read
+    // as a sheen across the whole stroke, not just under the light.
+    float spec = (
+      pow(max(dot(normal, halfDir), 0.0), specPow) +
+      pow(1.0 - max(dot(normal, viewDir), 0.0), 4.0)
+    ) * specAmt;
+    vec3 diffuse = mix(color.rgb, color.rgb * 0.35, metal);
+    // Fake environment reflection — the lobe + rim vanish on flat,
+    // front-facing geometry (ndh < 1 everywhere → pow256 ≈ 0, no rim in
+    // view), leaving painted gloss completely invisible. A sky-gradient
+    // env term weighted by smoothness adds the missing ambient sheen:
+    // brighter overhead, dimmer below — which is exactly what a
+    // reflective surface does. Diffuse also darkens a little (energy
+    // conservation cheat) so the painted region reads as denser.
+    float gloss = (1.0 - rough) * specAmt;
+    vec3 envCol = mix(vec3(0.15), vec3(0.9, 0.95, 1.0), normal.y * 0.5 + 0.5);
+    vec3 lit = diffuse * shadow * (1.0 - gloss * 0.3) + specCol * spec * shadow + specCol * envCol * gloss * 0.6 * shadow;
+
+    vec3 shaded = mix(lit, color.rgb, u_unlit) + emis * u_emissiveStrength;
+    // u_emisOnly — the selective-bloom prepass renders the scene a second
+    // time with this set, emitting only the emissive channel; the bloom
+    // chain therefore picks up emission and nothing else (bright albedo,
+    // spec highlights stay out of the glow). Early-out skips the
+    // backface/inpaint overrides so they can't leak into the mask.
+    if (u_emisOnly > 0.5) { gl_FragColor = vec4(emis * u_emissiveStrength, 1.0); return; }
     // Backfaces render as checkerboard dimmed 70% — a viewing aid so
     // polys facing away are unmistakable. u_dimBackface goes to 0
     // during image captures so generated inputs keep the real texture.
@@ -856,6 +956,12 @@ const LAYER_SHADER_TAIL = `
 export const LAYER_COMBINED_FRAGMENT = `
   uniform sampler2D u_combined;
   uniform float u_hasCombined;
+  uniform sampler2D u_combOrm;
+  uniform float u_hasCombOrm;
+  uniform sampler2D u_combEmis;
+  uniform float u_hasCombEmis;
+  uniform float u_emissiveStrength;
+  uniform float u_emisOnly;
   uniform vec3 dir1Pos;
   uniform sampler2D u_checker;
   uniform sampler2D u_inpaintMask;
@@ -874,7 +980,19 @@ export const LAYER_COMBINED_FRAGMENT = `
   varying vec3 vWorldPos;
   void main() {
     vec4 color = vec4(0.0);
-    if (u_hasCombined > 0.5) color = texture2D(u_combined, vUv);
+    vec3 orm = vec3(1.0, 0.0, 0.0);
+    vec3 emis = vec3(0.0);
+    if (u_hasCombined > 0.5) {
+      vec4 c = texture2D(u_combined, vUv);
+      color = c;
+      // CPU-composited per-layer orm/emissive — each source layer's map
+      // was already gated by its own mask before combining, so the
+      // albedo's coverage is the right weight here too.
+      // Map alpha = has-data (layers' masks already folded in by the CPU
+      // composite). No-data texels keep whatever accumulated below.
+      if (u_hasCombOrm > 0.5) { vec4 co = texture2D(u_combOrm, vUv); orm = mix(orm, co.rgb, co.a); }
+      if (u_hasCombEmis > 0.5) { vec4 ce = texture2D(u_combEmis, vUv); emis = mix(emis, ce.rgb, ce.a); }
+    }
 ${LAYER_SHADER_TAIL}`;
 
 /**
@@ -893,15 +1011,23 @@ export function buildLiveLayerFragment(ops) {
     if (op.type === 'bake') {
       const s = bakeN++;
       slotFor.push({ kind: 'bake', s });
-      decls.push(`uniform sampler2D u_bake${s}; uniform float u_hasBake${s};`);
-      body.push(`if (u_hasBake${s} > 0.5) { vec4 c${s} = texture2D(u_bake${s}, vUv); color.rgb = mix(color.rgb, c${s}.rgb, c${s}.a); color.a = max(color.a, c${s}.a); }`);
+      decls.push(`uniform sampler2D u_bake${s}; uniform float u_hasBake${s}; uniform sampler2D u_bakeOrm${s}; uniform float u_hasBakeOrm${s}; uniform sampler2D u_bakeEmis${s}; uniform float u_hasBakeEmis${s};`);
+      // Baked orm/emis were composited with each source layer's mask —
+      // their alpha carries the accumulated has-data coverage, so texels
+      // with no map data keep whatever the layers below produced.
+      body.push(`if (u_hasBake${s} > 0.5) { vec4 c${s} = texture2D(u_bake${s}, vUv); color.rgb = mix(color.rgb, c${s}.rgb, c${s}.a); color.a = max(color.a, c${s}.a); vec4 bo${s} = u_hasBakeOrm${s} > 0.5 ? texture2D(u_bakeOrm${s}, vUv) : vec4(0.0); orm = mix(orm, bo${s}.rgb, bo${s}.a); vec4 be${s} = u_hasBakeEmis${s} > 0.5 ? texture2D(u_bakeEmis${s}, vUv) : vec4(0.0); emis = mix(emis, be${s}.rgb, be${s}.a); }`);
     } else {
       const s = liveN++;
       slotFor.push({ kind: 'live', s });
-      decls.push(`uniform sampler2D layer${s}; uniform sampler2D mask${s}; uniform float hasMask${s};`);
+      decls.push(`uniform sampler2D layer${s}; uniform sampler2D mask${s}; uniform float hasMask${s}; uniform sampler2D orm${s}; uniform sampler2D emis${s};`);
       // With a mask bound, mask defines visibility — the near-black
       // "empty" heuristic would wrongly cull stamped dark content.
-      body.push(`{ vec4 lc${s} = texture2D(layer${s}, vUv); float cm${s} = mix(step(0.01, length(lc${s}.rgb)), 1.0, hasMask${s}); float pm${s} = mix(1.0, texture2D(mask${s}, vUv).r, hasMask${s}); float a${s} = mix(0.0, lc${s}.a, pm${s}); color.rgb = mix(color.rgb, lc${s}.rgb, cm${s} * a${s}); color.a = max(color.a, a${s} * cm${s}); }`);
+      // orm{s}/emis{s} hold this layer's own maps (transparent 1x1 when
+      // it has none). Contribution = layer mask × the map's own alpha —
+      // NOT the albedo alpha: a roughness stroke on a transparent-albedo
+      // texel still owns the surface there. A layer without map data
+      // lets lower layers' maps through.
+      body.push(`{ vec4 lc${s} = texture2D(layer${s}, vUv); float cm${s} = mix(step(0.01, length(lc${s}.rgb)), 1.0, hasMask${s}); float pm${s} = mix(1.0, texture2D(mask${s}, vUv).r, hasMask${s}); float a${s} = mix(0.0, lc${s}.a, pm${s}); float cov${s} = cm${s} * a${s}; color.rgb = mix(color.rgb, lc${s}.rgb, cov${s}); color.a = max(color.a, a${s} * cm${s}); vec4 ot${s} = texture2D(orm${s}, vUv); orm = mix(orm, ot${s}.rgb, pm${s} * ot${s}.a); vec4 et${s} = texture2D(emis${s}, vUv); emis = mix(emis, et${s}.rgb, pm${s} * et${s}.a); }`);
     }
   }
   const fragmentShader = `
@@ -918,12 +1044,16 @@ export function buildLiveLayerFragment(ops) {
   uniform float u_shadowBias;
   uniform float u_shadowRadius;
   uniform float u_hasShadow;
+  uniform float u_emissiveStrength;
+  uniform float u_emisOnly;
   ${decls.join('\n        ')}
   varying vec2 vUv;
   varying vec3 vNormal;
   varying vec3 vWorldPos;
   void main() {
     vec4 color = vec4(0.0);
+    vec3 orm = vec3(1.0, 0.0, 0.0);
+    vec3 emis = vec3(0.0);
     ${body.join('\n          ')}
 ${LAYER_SHADER_TAIL}`;
   return { fragmentShader, slotFor };

@@ -13,6 +13,7 @@ import {
   serializeUVMapData,
   deserializeMeshData,
   deserializeUVMapData,
+  extractEmbeddedTextures,
 } from '@/utils/modelParser';
 
 const ProjectContext = createContext(null);
@@ -176,6 +177,7 @@ export function ProjectProvider({ children }) {
   const [brushPicker, setBrushPicker] = useState(false);   // brush tool eyedropper — click samples uvmap color
   const [showPanel, setShowPanel] = useState(true);        // Generate Images panel expanded
   const [settingsCollapsed, setSettingsCollapsed] = useState(false); // Project Settings accordion collapsed
+  const [meshesCollapsed, setMeshesCollapsed] = useState(false); // Meshes list accordion collapsed
   const [stampInvertX, setStampInvertX] = useState(false); // mirror stamped content horizontally
   const [stampInvertY, setStampInvertY] = useState(false); // mirror stamped content vertically
   const [inpaintPrompt, setInpaintPrompt] = useState('');
@@ -193,6 +195,8 @@ export function ProjectProvider({ children }) {
   const [brushSpread, setBrushSpread] = useState(0);   // 0-100 (screen px between stamps)
   const [brushOpacity, setBrushOpacity] = useState(100); // 1-100 (stamp alpha %)
   const [blurStrength, setBlurStrength] = useState(50);  // 1-100 (blur tool mix %)
+  const [emissiveStrength, setEmissiveStrength] = useState(50); // 0-500 → shader multiplier (50 = ×1, 500 = ×10)
+  const [bloom, setBloom] = useState(0);               // 0-100 → UnrealBloomPass strength/radius
   const [selectedLayerId, setSelectedLayerIdRaw] = useState(null);
   const [selectedLayerIds, setSelectedLayerIds] = useState([]);
   const [modifiedLayerIds, setModifiedLayerIds] = useState(new Set());
@@ -784,15 +788,52 @@ export function ProjectProvider({ children }) {
     }
   }, [id]);
 
+  // Mesh-map (orm/emissive) pagehide stash — refs live here so the flush
+  // effect can see the callback before the rest of the layer-map plumbing.
+  // modifiedLayerMapsRef: `${meshDbId}|${layerId}` → Set(kind)
+  // stashedLayerMapsRef:  `${meshDbId}|${layerId}|${kind}` → dataUrl
+  const modifiedLayerMapsRef = useRef(new Map());
+  const stashedLayerMapsRef = useRef(new Map());
+  const layerMapSaveTimerRef = useRef(null);
+
+  const stashUnsavedLayerMaps = useCallback(() => {
+    const key = `pendingLayerMaps:${id}`;
+    try {
+      const stash = {};
+      for (const [meshLayerKey, kinds] of modifiedLayerMapsRef.current.entries()) {
+        for (const kind of kinds) {
+          let dataUrl = stashedLayerMapsRef.current.get(`${meshLayerKey}|${kind}`);
+          if (!dataUrl) {
+            const layerId = meshLayerKey.split('|')[1];
+            // Only the selected mesh's layers can still have live RTs —
+            // readback returns null once the engine reset them.
+            try { dataUrl = viewerRef.current?.getLayerMapDataUrl?.(layerId, kind); } catch { /* skip */ }
+          }
+          if (!dataUrl) continue;
+          const [meshDbId, layerId] = meshLayerKey.split('|');
+          ((stash[meshDbId] = stash[meshDbId] || {})[layerId] =
+            stash[meshDbId][layerId] || {})[kind] = dataUrl;
+        }
+      }
+      if (Object.keys(stash).length > 0) {
+        localStorage.setItem(key, JSON.stringify(stash));
+      } else {
+        localStorage.removeItem(key);
+      }
+    } catch {
+      /* storage full/blocked */
+    }
+  }, [id]);
+
   useEffect(() => {
-    const flush = () => { stashUnsavedMasks(); stashUnsavedUvmaps(); };
+    const flush = () => { stashUnsavedMasks(); stashUnsavedUvmaps(); stashUnsavedLayerMaps(); };
     window.addEventListener('pagehide', flush);
     window.addEventListener('beforeunload', flush);
     return () => {
       window.removeEventListener('pagehide', flush);
       window.removeEventListener('beforeunload', flush);
     };
-  }, [stashUnsavedMasks]);
+  }, [stashUnsavedMasks, stashUnsavedUvmaps, stashUnsavedLayerMaps]);
 
   // Replay stashed masks once the project is loaded (POST before the mask
   // fetch in refreshLayerTextures reads mask.png from disk).
@@ -878,6 +919,51 @@ export function ProjectProvider({ children }) {
         /* ignore */
       }
       if (bumped) setLayerThumbVersion((v) => v + 1);
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [id, token]);
+
+  // Replay stashed layer maps — unsaved orm/emissive edits POST straight
+  // to each layer's file endpoint.
+  useEffect(() => {
+    if (!id || !token) return;
+    const key = `pendingLayerMaps:${id}`;
+    try { localStorage.removeItem(`pendingMeshMaps:${id}`); } catch { /* legacy key */ }
+    let stash = null;
+    try {
+      stash = JSON.parse(localStorage.getItem(key) || 'null');
+    } catch {
+      stash = null;
+    }
+    if (!stash || Object.keys(stash).length === 0) return;
+    (async () => {
+      const remaining = {};
+      for (const [meshDbId, layers] of Object.entries(stash)) {
+        const failedLayers = {};
+        for (const [layerId, maps] of Object.entries(layers)) {
+          if (typeof maps === 'string') continue; // legacy mesh-level stash — maps are per-layer now
+          const failed = {};
+          for (const [kind, dataUrl] of Object.entries(maps)) {
+            try {
+              await layerApi.saveFile(id, layerId, meshDbId, `${kind}.png`, dataUrl);
+              invalidateLayerMapAsset(meshDbId, layerId, kind);
+            } catch {
+              failed[kind] = dataUrl;
+            }
+          }
+          if (Object.keys(failed).length > 0) failedLayers[layerId] = failed;
+        }
+        if (Object.keys(failedLayers).length > 0) remaining[meshDbId] = failedLayers;
+      }
+      try {
+        if (Object.keys(remaining).length > 0) {
+          localStorage.setItem(key, JSON.stringify(remaining));
+        } else {
+          localStorage.removeItem(key);
+        }
+      } catch {
+        /* ignore */
+      }
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id, token]);
@@ -981,6 +1067,276 @@ export function ProjectProvider({ children }) {
     uvmapSaveTimerRef.current = setTimeout(savePendingUvmaps, 5000);
   }, [cancelUvmapSaveTimer, savePendingUvmaps]);
 
+  // ── Mesh PBR maps — orm.png (roughness R / metallic B) + emissive.png ──
+  // These are mesh-level files shared by all layers; each layer's carousel
+  // picks which map the drawing tools write into (getPaintMap). The viewer
+  // owns the ping-pong RTs; context owns fetch caching, save scheduling,
+  // and the channel thumbnails the carousel renders.
+
+  // Per-layer paint target: 'base' | 'rough' | 'metal' | 'emissive'
+  const [layerPaintTargets, setLayerPaintTargets] = useState({});
+  const layerPaintTargetsRef = useRef({});
+  const setLayerPaintMap = useCallback((layerId, map) => {
+    layerPaintTargetsRef.current = { ...layerPaintTargetsRef.current, [layerId]: map };
+    setLayerPaintTargets(layerPaintTargetsRef.current);
+    // Persist per-mesh under mesh:{meshDbId} — loadMeshLayers restores each
+    // layer's carousel selection on the next page load.
+    const meshDbId = selectedMeshRef.current ? meshDbIdsRef.current[selectedMeshRef.current.key] : null;
+    if (!meshDbId) return;
+    try {
+      const saved = JSON.parse(localStorage.getItem(`mesh:${meshDbId}`) || '{}');
+      saved[layerId] = map;
+      localStorage.setItem(`mesh:${meshDbId}`, JSON.stringify(saved));
+    } catch { /* storage unavailable — non-fatal */ }
+  }, []);
+  const getLayerPaintMap = useCallback(
+    (layerId) => layerPaintTargetsRef.current[layerId] || 'base',
+    []
+  );
+
+  const layerMapAssetCacheRef = useRef(new Map());   // `${meshDbId}|${layerId}|${kind}` → {blob,url}
+  const layerMapFlightRef = useRef(new Map());
+  const [layerMapThumbs, setLayerMapThumbs] = useState({}); // layerId → {rough, metal, emissive}
+
+  const invalidateLayerMapAsset = useCallback((meshDbId, layerId = null, kind = null) => {
+    if (layerId && kind) {
+      layerMapAssetCacheRef.current.delete(`${meshDbId}|${layerId}|${kind}`);
+      return;
+    }
+    for (const k of Array.from(layerMapAssetCacheRef.current.keys())) {
+      const [m, l] = k.split('|');
+      if (m !== meshDbId) continue;
+      if (layerId && l !== layerId) continue;
+      layerMapAssetCacheRef.current.delete(k);
+    }
+  }, []);
+
+  // Fetch a layer map through the shared auth'd cache — returns the
+  // cached {blob,url} (url owned by the cache) or null when the file
+  // doesn't exist yet.
+  const ensureLayerMapAsset = useCallback(async (meshDbId, layerId, kind) => {
+    const key = `${meshDbId}|${layerId}|${kind}`;
+    const cached = layerMapAssetCacheRef.current.get(key);
+    if (cached) return cached;
+    let flight = layerMapFlightRef.current.get(key);
+    if (!flight) {
+      flight = (async () => {
+        try {
+          const res = await fetch(`${layerApi.fileUrl(id, meshDbId, layerId, `${kind}.png`)}?r=${Math.floor(Math.random() * 2147483647)}`, {
+            headers: token ? { Authorization: `Bearer ${token}` } : {},
+          });
+          const blob = res.ok ? await res.blob() : null;
+          const asset = blob && blob.size > 0
+            ? { blob, url: URL.createObjectURL(blob) }
+            : { blob: null, url: null };
+          layerMapAssetCacheRef.current.set(key, asset);
+          return asset;
+        } catch {
+          return null; // uncached — a later refresh retries
+        } finally {
+          layerMapFlightRef.current.delete(key);
+        }
+      })();
+      layerMapFlightRef.current.set(key, flight);
+    }
+    return flight;
+  }, [id, token, layerApi]);
+
+  // cfg.loadLayerMap — resolves a layer's map file to an object URL, or
+  // null so ensureLayerMapEntry seeds the generated default.
+  const loadLayerMap = useCallback(async (layerId, kind) => {
+    const meshDbId = selectedMeshRef.current ? meshDbIdsRef.current[selectedMeshRef.current.key] : null;
+    if (!meshDbId) return null;
+    const asset = await ensureLayerMapAsset(meshDbId, layerId, kind);
+    return asset?.url || null;
+  }, [ensureLayerMapAsset]);
+
+  // Per-layer channel thumbs for the carousel — prefers the live RT
+  // readback (holds unsaved strokes); falls back to the cached file.
+  const refreshLayerMapThumbs = useCallback(async (layerId) => {
+    const SIZE = 64;
+    const decode = (url) => new Promise((res) => {
+      const img = new Image();
+      img.onload = () => res(img);
+      img.onerror = () => res(null);
+      img.src = url;
+    });
+    const mk = () => {
+      const c = document.createElement('canvas');
+      c.width = c.height = SIZE;
+      return c;
+    };
+    // Missing file → fully transparent thumb (no data, not black).
+    const transparentThumb = () => mk().toDataURL();
+    const meshDbId = selectedMeshRef.current ? meshDbIdsRef.current[selectedMeshRef.current.key] : null;
+    const thumbs = {};
+    // orm.png is transparent where unpainted — the thumbs show each
+    // channel's grayscale with the file's own alpha preserved (same view
+    // as the preview modal): roughness = R, metallic = B. Unpainted texels
+    // stay transparent so the checkerboard reads through.
+    let ormUrl = viewerRef.current?.getLayerMapDataUrl?.(layerId, 'orm');
+    if (!ormUrl && meshDbId) ormUrl = (await ensureLayerMapAsset(meshDbId, layerId, 'orm'))?.url;
+    if (ormUrl) {
+      const img = await decode(ormUrl);
+      if (img) {
+        const c = mk();
+        const x = c.getContext('2d', { willReadFrequently: true });
+        x.drawImage(img, 0, 0, SIZE, SIZE);
+        const d = x.getImageData(0, 0, SIZE, SIZE);
+        for (const [key, ch] of [['rough', 0], ['metal', 2]]) {
+          const chan = x.createImageData(SIZE, SIZE);
+          for (let i = 0; i < d.data.length; i += 4) {
+            const v = d.data[i + ch];
+            chan.data[i] = chan.data[i + 1] = chan.data[i + 2] = v;
+            chan.data[i + 3] = d.data[i + 3];
+          }
+          const cc = mk();
+          cc.getContext('2d').putImageData(chan, 0, 0);
+          thumbs[key] = cc.toDataURL();
+        }
+      }
+    }
+    // No orm.png → no map data anywhere → transparent thumbs.
+    if (!thumbs.rough) { thumbs.rough = transparentThumb(); thumbs.metal = transparentThumb(); }
+    let emisUrl = viewerRef.current?.getLayerMapDataUrl?.(layerId, 'emissive');
+    if (!emisUrl && meshDbId) emisUrl = (await ensureLayerMapAsset(meshDbId, layerId, 'emissive'))?.url;
+    if (emisUrl) {
+      const img = await decode(emisUrl);
+      if (img) {
+        const c = mk();
+        c.getContext('2d').drawImage(img, 0, 0, SIZE, SIZE);
+        thumbs.emissive = c.toDataURL();
+      }
+    }
+    if (!thumbs.emissive) thumbs.emissive = transparentThumb(); // no file → no data
+    setLayerMapThumbs((prev) => ({ ...prev, [layerId]: thumbs }));
+  }, [ensureLayerMapAsset]);
+
+  // Full-size map image for the preview modal — live RT first, then the
+  // cached file. Rough/metal render as the channel's grayscale with the
+  // map alpha preserved (transparent = no data); emissive returns its
+  // rgb+alpha as-is. Null when the layer has no map data at all.
+  const getLayerMapPreviewUrl = useCallback(async (layerId, mapKey) => {
+    const meshDbId = selectedMeshRef.current ? meshDbIdsRef.current[selectedMeshRef.current.key] : null;
+    const kind = mapKey === 'emissive' ? 'emissive' : 'orm';
+    let url = viewerRef.current?.getLayerMapDataUrl?.(layerId, kind);
+    if (!url && meshDbId) url = (await ensureLayerMapAsset(meshDbId, layerId, kind))?.url;
+    if (!url) return null;
+    if (mapKey === 'emissive') return url;
+    const img = await new Promise((res) => {
+      const i = new Image();
+      i.onload = () => res(i);
+      i.onerror = () => res(null);
+      i.src = url;
+    });
+    if (!img) return null;
+    const w = img.naturalWidth || img.width;
+    const h = img.naturalHeight || img.height;
+    const c = document.createElement('canvas');
+    c.width = w;
+    c.height = h;
+    const x = c.getContext('2d', { willReadFrequently: true });
+    x.drawImage(img, 0, 0);
+    const d = x.getImageData(0, 0, w, h);
+    const ch = mapKey === 'rough' ? 0 : 2;
+    const out = x.createImageData(w, h);
+    for (let i = 0; i < d.data.length; i += 4) {
+      const v = d.data[i + ch];
+      out.data[i] = out.data[i + 1] = out.data[i + 2] = v;
+      out.data[i + 3] = d.data[i + 3];
+    }
+    const oc = document.createElement('canvas');
+    oc.width = w;
+    oc.height = h;
+    oc.getContext('2d').putImageData(out, 0, 0);
+    return oc.toDataURL();
+  }, [ensureLayerMapAsset]);
+
+  // 5s debounce — modified layer maps upload as orm.png/emissive.png
+  // inside each layer's folder. Stashed dataUrls win (the RT may have
+  // been reset on a layer-stack change); otherwise read the live front
+  // buffer.
+  const saveModifiedLayerMaps = useCallback(async () => {
+    const savedLayers = new Set();
+    for (const [meshLayerKey, kinds] of Array.from(modifiedLayerMapsRef.current.entries())) {
+      const [meshDbId, layerId] = meshLayerKey.split('|');
+      for (const kind of Array.from(kinds)) {
+        const stashKey = `${meshLayerKey}|${kind}`;
+        let dataUrl = stashedLayerMapsRef.current.get(stashKey);
+        if (!dataUrl) {
+          try { dataUrl = viewerRef.current?.getLayerMapDataUrl?.(layerId, kind); } catch { /* readback failed */ }
+        }
+        if (!dataUrl) continue; // stays marked — retried on the next save
+        try {
+          await layerApi.saveFile(id, layerId, meshDbId, `${kind}.png`, dataUrl);
+          modifiedLayerMapsRef.current.get(meshLayerKey)?.delete(kind);
+          stashedLayerMapsRef.current.delete(stashKey);
+          invalidateLayerMapAsset(meshDbId, layerId, kind);
+          savedLayers.add(layerId);
+        } catch (err) {
+          console.error(`Failed to save ${kind}.png for layer ${layerId}:`, err);
+        }
+      }
+      if (!modifiedLayerMapsRef.current.get(meshLayerKey)?.size) {
+        modifiedLayerMapsRef.current.delete(meshLayerKey);
+      }
+    }
+    for (const layerId of savedLayers) refreshLayerMapThumbs(layerId);
+    // Rebuild the composite — baked/combined layers re-read the freshly
+    // saved files (the asset cache entries were invalidated above), so
+    // painted maps show up the moment the save lands, not on the next
+    // unrelated refresh.
+    if (savedLayers.size) refreshLayerTextures();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [id, layerApi, invalidateLayerMapAsset, refreshLayerMapThumbs]);
+
+  const markLayerMapModified = useCallback((layerId, kind) => {
+    const meshDbId = selectedMeshRef.current ? meshDbIdsRef.current[selectedMeshRef.current.key] : null;
+    if (!meshDbId) return;
+    const key = `${meshDbId}|${layerId}`;
+    let set = modifiedLayerMapsRef.current.get(key);
+    if (!set) modifiedLayerMapsRef.current.set(key, (set = new Set()));
+    set.add(kind);
+    if (layerMapSaveTimerRef.current) clearTimeout(layerMapSaveTimerRef.current);
+    layerMapSaveTimerRef.current = setTimeout(saveModifiedLayerMaps, 5000);
+  }, [saveModifiedLayerMaps]);
+
+  const isLayerMapModified = useCallback((layerId, kind) => {
+    const meshDbId = selectedMeshRef.current ? meshDbIdsRef.current[selectedMeshRef.current.key] : null;
+    return meshDbId ? !!modifiedLayerMapsRef.current.get(`${meshDbId}|${layerId}`)?.has(kind) : false;
+  }, []);
+
+  // The viewer resets its map RTs on layer-stack/mesh changes — capture a
+  // modified map's pixels into the stash first so the debounced save can
+  // still upload them.
+  const stashLayerMap = useCallback((layerId, kind, dataUrl) => {
+    const meshDbId = selectedMeshRef.current ? meshDbIdsRef.current[selectedMeshRef.current.key] : null;
+    if (!meshDbId || !dataUrl) return;
+    const key = `${meshDbId}|${layerId}`;
+    stashedLayerMapsRef.current.set(`${key}|${kind}`, dataUrl);
+    let set = modifiedLayerMapsRef.current.get(key);
+    if (!set) modifiedLayerMapsRef.current.set(key, (set = new Set()));
+    set.add(kind);
+    if (layerMapSaveTimerRef.current) clearTimeout(layerMapSaveTimerRef.current);
+    layerMapSaveTimerRef.current = setTimeout(saveModifiedLayerMaps, 5000);
+  }, [saveModifiedLayerMaps]);
+
+  // Immediate save for the Fill flows — reads back and POSTs now.
+  const saveLayerMapFile = useCallback(async (layerId, kind) => {
+    const meshDbId = selectedMeshRef.current ? meshDbIdsRef.current[selectedMeshRef.current.key] : null;
+    if (!meshDbId) return;
+    const dataUrl = viewerRef.current?.getLayerMapDataUrl?.(layerId, kind);
+    if (!dataUrl) return;
+    await layerApi.saveFile(id, layerId, meshDbId, `${kind}.png`, dataUrl);
+    const key = `${meshDbId}|${layerId}`;
+    modifiedLayerMapsRef.current.get(key)?.delete(kind);
+    stashedLayerMapsRef.current.delete(`${key}|${kind}`);
+    invalidateLayerMapAsset(meshDbId, layerId, kind);
+    refreshLayerMapThumbs(layerId);
+    refreshLayerTextures();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [id, layerApi, invalidateLayerMapAsset, refreshLayerMapThumbs]);
+
   // Keep the paint config current — ModelViewer reads this ref in its
   // pointer handlers so brush changes never re-create the Three.js scene.
   useEffect(() => {
@@ -1009,6 +1365,10 @@ export function ProjectProvider({ children }) {
       stampInvertX,
       stampInvertY,
       textureResolution: project?.textureResolution ?? 1024,
+      // Viewer-level render settings — read every frame in animate(), no
+      // imperative setter needed.
+      emissiveStrength,
+      bloom,
       getSelectedLayerId: () => selectedLayerIdRef.current,
       getSelectedLayerIds: () => selectedLayerIdsRef.current,
       // Stamp targets: generated/inpainted layers are off-limits — stamping
@@ -1019,6 +1379,13 @@ export function ProjectProvider({ children }) {
       },
       getOrCreateLayerMask,
       markMaskModified,
+      // Layer PBR maps — the layer's carousel picks which map the tools
+      // write into; 'base' (or unset) targets the layer's own uvmap.png.
+      getPaintMap: getLayerPaintMap,
+      loadLayerMap,
+      markLayerMapModified,
+      isLayerMapModified,
+      stashLayerMap,
       // Stroke start cancels both pending saves — a 5s timer must not fire
       // its RT readback in the middle of a new stroke.
       onStrokeStart: () => { cancelMaskSaveTimer(); cancelUvmapSaveTimer(); },
@@ -1030,7 +1397,7 @@ export function ProjectProvider({ children }) {
       // layer displaying a pixel at that UV.
       onPointerPick: pickTopLayerAt,
     };
-  }, [maskTool, inpaintSign, ctrlHeld, altHeld, brushSize, brushHardness, brushSpread, brushOpacity, blurStrength, brushColor, penPressure, penPressureTargets, brushPicker, sampleLayerColorAt, handlePickColor, maskMode, stampMode, stampInvertX, stampInvertY, project?.textureResolution, getOrCreateLayerMask, markMaskModified, cancelMaskSaveTimer, cancelUvmapSaveTimer, scheduleMaskSave, loadStampLayerImage, scheduleUvmapSave, pickTopLayerAt]);
+  }, [maskTool, inpaintSign, ctrlHeld, altHeld, brushSize, brushHardness, brushSpread, brushOpacity, blurStrength, brushColor, penPressure, penPressureTargets, brushPicker, sampleLayerColorAt, handlePickColor, maskMode, stampMode, stampInvertX, stampInvertY, project?.textureResolution, emissiveStrength, bloom, getOrCreateLayerMask, markMaskModified, cancelMaskSaveTimer, cancelUvmapSaveTimer, scheduleMaskSave, loadStampLayerImage, scheduleUvmapSave, pickTopLayerAt, getLayerPaintMap, loadLayerMap, markLayerMapModified, isLayerMapModified, stashLayerMap]);
 
   // Inpainting mode — activate the mesh-wide overlay when the tool is selected,
   // tear it down whenever another tool takes over (Cancel, pointer, etc.)
@@ -1083,9 +1450,12 @@ export function ProjectProvider({ children }) {
       if (typeof saved.color === 'string' && /^#[0-9a-fA-F]{6}$/.test(saved.color)) setBrushColor(saved.color);
       if (typeof saved.generatePanel === 'boolean') setShowPanel(saved.generatePanel);
       if (typeof saved.settingsCollapsed === 'boolean') setSettingsCollapsed(saved.settingsCollapsed);
+      if (typeof saved.meshesCollapsed === 'boolean') setMeshesCollapsed(saved.meshesCollapsed);
       if (typeof saved.stampInvert === 'boolean') setStampInvertX(saved.stampInvert); // legacy key → X
       if (typeof saved.stampInvertX === 'boolean') setStampInvertX(saved.stampInvertX);
       if (typeof saved.stampInvertY === 'boolean') setStampInvertY(saved.stampInvertY);
+      if (typeof saved.emissiveStrength === 'number') setEmissiveStrength(Math.min(500, Math.max(0, saved.emissiveStrength)));
+      if (typeof saved.bloom === 'number') setBloom(Math.min(100, Math.max(0, saved.bloom)));
       // Restore the last active tool — stamp may immediately fall back to
       // pointer if the restored layer selection is generated/inpainted.
       if (['pointer', 'brush', 'eraser', 'mask', 'inpaint', 'stamp', 'blur'].includes(saved.tool)) setMaskTool(saved.tool);
@@ -1135,9 +1505,12 @@ export function ProjectProvider({ children }) {
       penPressureTargets,
       generatePanel: showPanel,
       settingsCollapsed,
+      meshesCollapsed,
       stampInvertX,
       stampInvertY,
       lightPosition: lightPos,
+      emissiveStrength,
+      bloom,
     };
     const st = uiPersistRef.current;
     st.pending = snapshot;
@@ -1145,7 +1518,7 @@ export function ProjectProvider({ children }) {
     // Continuously-adjusted fields (sliders, wheel, color picker) debounce
     // together — a drag that only touches these writes once, 2s after the
     // last change. Discrete fields always write immediately.
-    const SLIDER_KEYS = new Set(['size', 'hardness', 'spread', 'opacity', 'strength', 'color']);
+    const SLIDER_KEYS = new Set(['size', 'hardness', 'spread', 'opacity', 'strength', 'color', 'emissiveStrength', 'bloom']);
     const sliderOnly = prev
       && Object.keys(snapshot).some((k) => SLIDER_KEYS.has(k) && JSON.stringify(snapshot[k]) !== JSON.stringify(prev[k]))
       && Object.keys(snapshot).every((k) => SLIDER_KEYS.has(k) || JSON.stringify(snapshot[k]) === JSON.stringify(prev[k]));
@@ -1166,7 +1539,7 @@ export function ProjectProvider({ children }) {
     } catch {
       /* storage full/blocked — non-fatal */
     }
-  }, [id, maskTool, unlit, brushSize, brushHardness, brushSpread, brushOpacity, blurStrength, brushColor, penPressure, penPressureTargets, showPanel, settingsCollapsed, stampInvertX, stampInvertY, lightPos]);
+  }, [id, maskTool, unlit, brushSize, brushHardness, brushSpread, brushOpacity, blurStrength, brushColor, penPressure, penPressureTargets, showPanel, settingsCollapsed, meshesCollapsed, stampInvertX, stampInvertY, lightPos, emissiveStrength, bloom]);
 
   // Flush a pending debounced slider write on page hide so the last
   // wheel/drag ticks aren't lost.
@@ -1294,7 +1667,26 @@ export function ProjectProvider({ children }) {
           }
         }
 
-        entries.push({ url, maskTexture, maskDataUrl, layerId: layer.id });
+        // Per-layer PBR maps — orm.png/emissive.png composited with the
+        // same mask + stack order as the uvmaps (live slots bind the file
+        // directly; baked runs CPU-composite them with the masks). The
+        // live render target wins when it exists — it holds unsaved
+        // strokes the debounced save hasn't uploaded yet.
+        const ormAsset = await ensureLayerMapAsset(meshDbId, layer.id, 'orm');
+        const emisAsset = await ensureLayerMapAsset(meshDbId, layer.id, 'emissive');
+        let ormUrl = null;
+        let emisUrl = null;
+        try { ormUrl = viewerRef.current?.getLayerMapDataUrl?.(layer.id, 'orm') || null; } catch { /* no RT */ }
+        try { emisUrl = viewerRef.current?.getLayerMapDataUrl?.(layer.id, 'emissive') || null; } catch { /* no RT */ }
+
+        entries.push({
+          url,
+          maskTexture,
+          maskDataUrl,
+          layerId: layer.id,
+          ormUrl: ormUrl || ormAsset?.url || null,
+          emisUrl: emisUrl || emisAsset?.url || null,
+        });
       }
       if (refreshQueuedRef.current) return; // superseded mid-gather
       const hasAny = entries.some((e) => e.url !== null);
@@ -1305,8 +1697,12 @@ export function ProjectProvider({ children }) {
       // Stamp targets can be empty layers (no uvmap yet) — still give them a
       // live shader slot so stamped pixels render in real time.
       viewerRef.current.updateLayerTextures(hasAny || paintLayerIds?.length ? entries : [], { paintLayerIds });
+
+      // Carousel map thumbs per layer — decodes the cached files (or live
+      // RT when one exists) into rough/metal/emissive thumbnails.
+      for (const layer of visibleLayers) refreshLayerMapThumbs(layer.id);
     },
-    [ensureLayerAsset, ensureLayerMaskLoaded]
+    [ensureLayerAsset, ensureLayerMaskLoaded, ensureLayerMapAsset, refreshLayerMapThumbs]
   );
 
   const refreshLayerTextures = useCallback(
@@ -1336,6 +1732,8 @@ export function ProjectProvider({ children }) {
   // Mesh switches reuse the warm cache; only a project change clears it.
   useEffect(() => {
     invalidateLayerAssets();
+    layerMapAssetCacheRef.current.clear();
+    setLayerMapThumbs({});
   }, [id, invalidateLayerAssets]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const loadMeshLayers = useCallback(
@@ -1351,6 +1749,21 @@ export function ProjectProvider({ children }) {
       const layers = allMeshLayersRef.current[meshDbId] || [];
       setMeshLayers(layers);
       pendingLayersRef.current = layers;
+      // Restore each layer's carousel paint-map selection — persisted per
+      // mesh under mesh:{meshDbId} by setLayerPaintMap.
+      try {
+        const saved = JSON.parse(localStorage.getItem(`mesh:${meshDbId}`) || '{}');
+        const next = { ...layerPaintTargetsRef.current };
+        let changed = false;
+        for (const l of layers) {
+          const map = saved[l.id];
+          if (map && next[l.id] !== map) { next[l.id] = map; changed = true; }
+        }
+        if (changed) {
+          layerPaintTargetsRef.current = next;
+          setLayerPaintTargets(next);
+        }
+      } catch { /* corrupt/missing storage — keep defaults */ }
       return layers;
     },
     []
@@ -1392,7 +1805,20 @@ export function ProjectProvider({ children }) {
     }
     modifiedLayerIdsRef.current.delete(layerId);
     invalidateLayerAssets(layerId);
-  }, [invalidateLayerAssets]);
+    // Per-layer PBR maps — drop cached assets, pending saves, and thumbs.
+    // The engine's RTs orphan harmlessly until the next layer-map reset.
+    invalidateLayerMapAsset(meshDbId, layerId);
+    modifiedLayerMapsRef.current.delete(`${meshDbId}|${layerId}`);
+    for (const kind of ['orm', 'emissive']) {
+      stashedLayerMapsRef.current.delete(`${meshDbId}|${layerId}|${kind}`);
+    }
+    setLayerMapThumbs((prev) => {
+      if (!(layerId in prev)) return prev;
+      const next = { ...prev };
+      delete next[layerId];
+      return next;
+    });
+  }, [invalidateLayerAssets, invalidateLayerMapAsset]);
 
   // ── Aux (multi-mesh) visibility ──
 
@@ -1441,9 +1867,9 @@ export function ProjectProvider({ children }) {
       // list changed — viewer rebuilds alone don't re-download the uvmaps.
       const layers = allMeshLayersRef.current[dbId] || [];
       const cached = auxCanvasCacheRef.current.get(dbId);
-      let canvas = cached && cached.entry === entry && cached.layers === layers ? cached.canvas : undefined;
+      let comp = cached && cached.entry === entry && cached.layers === layers ? cached.comp : undefined;
 
-      if (canvas === undefined) {
+      if (comp === undefined) {
         const items = [];
         for (const layer of layers.filter((l) => l.visible !== false)) {
           // uvmap — live stamp RT readback first (catches strokes still
@@ -1455,7 +1881,6 @@ export function ProjectProvider({ children }) {
             const asset = await ensureLayerImage(layer.id, dbId, 'uvmap');
             url = asset?.url || null;
           }
-          if (!url) continue;
           // mask — live RT readback first (unsaved mask edits), else the
           // shared mask blob cache. asset.url works directly as the
           // composite's mask source.
@@ -1472,14 +1897,26 @@ export function ProjectProvider({ children }) {
             const maskAsset = await ensureLayerImage(layer.id, dbId, 'mask');
             maskDataUrl = maskAsset?.url || null;
           }
-          items.push({ url, maskDataUrl });
+          // Per-layer PBR maps — same rule as the selected mesh's
+          // composite: live RT readback (unsaved strokes) first, saved
+          // file second. Layers without a file contribute no PBR data.
+          let ormUrl = viewer.getLayerMapDataUrl?.(layer.id, 'orm') || null;
+          if (!ormUrl) {
+            ormUrl = (await ensureLayerMapAsset(dbId, layer.id, 'orm'))?.url || null;
+          }
+          let emisUrl = viewer.getLayerMapDataUrl?.(layer.id, 'emissive') || null;
+          if (!emisUrl) {
+            emisUrl = (await ensureLayerMapAsset(dbId, layer.id, 'emissive'))?.url || null;
+          }
+          if (!url && !ormUrl && !emisUrl) continue;
+          items.push({ url, maskDataUrl, ormUrl, emisUrl });
         }
-        canvas = items.length ? await viewer.compositeLayersToCanvas(items) : null;
-        auxCanvasCacheRef.current.set(dbId, { entry, layers, canvas });
+        comp = items.length ? await viewer.compositeLayers(items) : null;
+        auxCanvasCacheRef.current.set(dbId, { entry, layers, comp });
       }
-      return viewer.setAuxMesh(dbId, { object: entry.object, canvas, offset, matrix: settingsWorldMatrix(entry.settings) }) !== false;
+      return viewer.setAuxMesh(dbId, { object: entry.object, comp, offset, matrix: settingsWorldMatrix(entry.settings) }) !== false;
     },
-    [id, ensureLayerImage]
+    [id, ensureLayerImage, ensureLayerMapAsset]
   );
 
   // Reconciles the viewer's aux meshes with the stored set for the current
@@ -1641,6 +2078,48 @@ export function ProjectProvider({ children }) {
     [id, token]
   );
 
+  // Extract embedded diffuse textures from freshly parsed meshes and seed
+  // them as each mesh's layer uvmap.png — only when the mesh record is new
+  // or has no layers, so re-uploads never touch existing layers.
+  // pairs: [{ record, parsed }] — record = saved mesh DB row, parsed = the
+  // matching result.meshes[i] entry (carries the live THREE.Mesh).
+  const seedEmbeddedTextureLayers = useCallback(
+    async (pairs) => {
+      const res = project?.textureResolution ?? 1024;
+      for (const { record, parsed } of pairs) {
+        if (!record?.id || !parsed?.object) continue;
+        if ((allMeshLayersRef.current[record.id] || []).length > 0) continue;
+        try {
+          const textures = await extractEmbeddedTextures(parsed.object, res);
+          for (const tex of textures) {
+            const createRes = await layerApi.create(id, record.id, tex.name, null, 0, null);
+            if (!createRes.data?.success) break;
+            const layer = createRes.data.data;
+            await layerApi.saveUvMap(id, layer.id, record.id, tex.uvmap);
+            updateLayerImageCache(layer.id, tex.uvmap, 'uvmap');
+            if (tex.mask) {
+              await layerApi.saveMasks(id, record.id, [{ layerId: layer.id, base64Mask: tex.mask }]);
+              updateLayerImageCache(layer.id, tex.mask, 'mask');
+            }
+            const updated = {
+              ...allMeshLayersRef.current,
+              [record.id]: [...(allMeshLayersRef.current[record.id] || []), layer],
+            };
+            allMeshLayersRef.current = updated;
+            setAllMeshLayers(updated);
+            const sel = selectedMeshRef.current;
+            if (sel && meshDbIdsRef.current[sel.key] === record.id) {
+              setMeshLayers(updated[record.id]);
+            }
+          }
+        } catch (err) {
+          console.warn(`Embedded texture extraction failed for mesh "${parsed.name}":`, err);
+        }
+      }
+    },
+    [id, layerApi, project?.textureResolution, updateLayerImageCache]
+  );
+
   const parseUploadedFile = useCallback(
     async (modelId, file) => {
       setParsingModels((prev) => ({ ...prev, [modelId]: true }));
@@ -1675,6 +2154,10 @@ export function ProjectProvider({ children }) {
               });
               return next;
             });
+            // New mesh records — seed embedded textures as layers.
+            await seedEmbeddedTextureLayers(
+              savedMeshes.map((record, idx) => ({ record, parsed: result.meshes[idx] }))
+            );
           }
         }
       } catch (err) {
@@ -1690,7 +2173,7 @@ export function ProjectProvider({ children }) {
         });
       }
     },
-    [id, token]
+    [id, token, seedEmbeddedTextureLayers]
   );
 
   // Re-upload a newer version of an existing model file. Mesh records are
@@ -1793,6 +2276,22 @@ export function ProjectProvider({ children }) {
           return next;
         });
 
+        // Seed embedded textures for brand-new mesh records (matched to the
+        // parsed meshes by name) and for existing records that have no
+        // layers — seedEmbeddedTextureLayers skips any mesh with layers.
+        const consumed = new Set();
+        const pairs = records
+          .map((record) => {
+            const idx = result.meshes.findIndex(
+              (m, i) => !consumed.has(i) && m.name === record.name
+            );
+            if (idx < 0) return null;
+            consumed.add(idx);
+            return { record, parsed: result.meshes[idx] };
+          })
+          .filter(Boolean);
+        await seedEmbeddedTextureLayers(pairs);
+
         // If the selected mesh belongs to this model its object is stale —
         // re-select the same-named mesh so the viewer reloads the rebuilt
         // geometry. Its record id (and layers/angles) is unchanged by sync.
@@ -1832,7 +2331,7 @@ export function ProjectProvider({ children }) {
         });
       }
     },
-    [id, token, models]
+    [id, token, models, seedEmbeddedTextureLayers]
   );
 
   const loadProject = useCallback(async () => {
@@ -2141,6 +2640,10 @@ export function ProjectProvider({ children }) {
     setBrushOpacity,
     blurStrength,
     setBlurStrength,
+    emissiveStrength,
+    setEmissiveStrength,
+    bloom,
+    setBloom,
     brushColor,
     setBrushColor,
     brushPicker,
@@ -2149,6 +2652,8 @@ export function ProjectProvider({ children }) {
     setShowPanel,
     settingsCollapsed,
     setSettingsCollapsed,
+    meshesCollapsed,
+    setMeshesCollapsed,
     maskMode,
     setMaskMode,
     selectedLayerId,
@@ -2171,6 +2676,16 @@ export function ProjectProvider({ children }) {
     saveModifiedMasks,
     scheduleMaskSave,
     cancelMaskSaveTimer,
+    // layer PBR maps — per-layer paint targets + per-layer orm/emissive
+    layerPaintTargets,
+    setLayerPaintMap,
+    getLayerPaintMap,
+    layerMapThumbs,
+    refreshLayerMapThumbs,
+    getLayerMapPreviewUrl,
+    saveLayerMapFile,
+    saveModifiedLayerMaps,
+    markLayerMapModified,
     // refs
     viewerRef,
     pendingLayersRef,

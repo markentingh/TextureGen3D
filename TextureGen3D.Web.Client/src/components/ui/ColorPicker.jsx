@@ -1,8 +1,9 @@
 import { useState, useEffect, useRef } from 'react';
 import Input from '@/components/forms/input';
 import Button from '@/components/ui/button';
+import Icon from '@/components/ui/icon';
 
-function ColorPicker({ color, h, s, l, onChange, onOk, onClose }) {
+function ColorPicker({ color, h, s, l, onChange, onOk, onClose, projectId }) {
   const [hue, setHue] = useState(h !== undefined ? h : 0);
   const [saturation, setSaturation] = useState(s !== undefined ? s : 100);
   const [lightness, setLightness] = useState(l !== undefined ? l : 50);
@@ -18,6 +19,59 @@ function ColorPicker({ color, h, s, l, onChange, onOk, onClose }) {
   const [isDraggingSat, setIsDraggingSat] = useState(false);
   const hueBarRef = useRef(null);
   const satBarRef = useRef(null);
+  // Floating panel — restores its last dragged position from
+  // localStorage "colorPicker:{projectId}", falling back to centered.
+  const clampPos = (x, y) => ({
+    x: Math.max(0, Math.min(x, window.innerWidth - 384)),
+    y: Math.max(0, Math.min(y, window.innerHeight - 80)),
+  });
+  const [pos, setPos] = useState(() => {
+    if (projectId) {
+      try {
+        const saved = JSON.parse(localStorage.getItem(`colorPicker:${projectId}`));
+        if (saved && typeof saved.x === 'number' && typeof saved.y === 'number') {
+          return clampPos(saved.x, saved.y);
+        }
+      } catch { /* corrupt/absent — fall back to centered */ }
+    }
+    return clampPos((window.innerWidth - 384) / 2, (window.innerHeight - 640) / 2);
+  });
+  const posRef = useRef(pos);
+  const dragOffsetRef = useRef(null);
+  const [isDraggingPanel, setIsDraggingPanel] = useState(false);
+
+  const startPanelDrag = (e) => {
+    dragOffsetRef.current = { dx: e.clientX - pos.x, dy: e.clientY - pos.y };
+    setIsDraggingPanel(true);
+    e.preventDefault();
+  };
+
+  useEffect(() => {
+    if (!isDraggingPanel) return;
+    const move = (e) => {
+      const d = dragOffsetRef.current;
+      if (!d) return;
+      const next = clampPos(e.clientX - d.dx, e.clientY - d.dy);
+      posRef.current = next;
+      setPos(next);
+    };
+    const up = () => {
+      dragOffsetRef.current = null;
+      setIsDraggingPanel(false);
+      if (projectId) {
+        try { localStorage.setItem(`colorPicker:${projectId}`, JSON.stringify(posRef.current)); }
+        catch { /* storage full/blocked — non-fatal */ }
+      }
+    };
+    document.addEventListener('pointermove', move);
+    document.addEventListener('pointerup', up);
+    document.addEventListener('pointercancel', up);
+    return () => {
+      document.removeEventListener('pointermove', move);
+      document.removeEventListener('pointerup', up);
+      document.removeEventListener('pointercancel', up);
+    };
+  }, [isDraggingPanel]);
 
   useEffect(() => {
     if (color) {
@@ -219,10 +273,25 @@ function ColorPicker({ color, h, s, l, onChange, onOk, onClose }) {
   }, [isDraggingWheel, isDraggingHue, isDraggingSat, lightness, hue, saturation]);
 
   return (
-    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50" onClick={onClose}>
-      <div className="bg-gray-800 rounded-lg p-6 w-96 border border-gray-700 shadow-2xl select-none" onClick={(e) => e.stopPropagation()}>
-        <h3 className="text-lg font-semibold text-white mb-4">Color Picker</h3>
-
+    <div
+      className="fixed z-50 bg-gray-800 rounded-lg w-96 border border-gray-700 shadow-2xl select-none"
+      style={{ left: pos.x, top: pos.y }}
+    >
+      <div
+        className="flex items-center justify-between px-4 py-2 cursor-move border-b border-gray-700 rounded-t-lg bg-gray-900 touch-none"
+        onPointerDown={startPanelDrag}
+      >
+        <h3 className="text-lg font-semibold text-white">Color Picker</h3>
+        <button
+          onClick={onClose}
+          className="text-gray-400 hover:text-white transition"
+          aria-label="Close color picker"
+          title="Close"
+        >
+          <Icon name="close" className="text-base" />
+        </button>
+      </div>
+      <div className="p-6">
         <div className="space-y-4">
           <div className="flex gap-4">
             <div

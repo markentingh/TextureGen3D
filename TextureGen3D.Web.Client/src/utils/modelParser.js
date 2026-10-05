@@ -377,6 +377,176 @@ function bufferToText(buffer) {
   return decoder.decode(buffer);
 }
 
+// ─── Embedded texture extraction ──────────────────────────────────
+
+/**
+ * A texture image source is drawable once it has pixel dimensions.
+ * Loaders (FBX, USDZ) create textures whose <img>/blob-url sources decode
+ * asynchronously after parse() returns, so callers must wait for this.
+ * @param {*} img
+ * @returns {boolean}
+ */
+function textureImageReady(img) {
+  if (!img) return false;
+  if (typeof HTMLImageElement !== 'undefined' && img instanceof HTMLImageElement) {
+    return img.complete && img.naturalWidth > 0;
+  }
+  return (img.width || 0) > 0 && (img.height || 0) > 0;
+}
+
+/**
+ * Poll a THREE.Texture until its image becomes drawable (or timeout).
+ * @param {THREE.Texture} tex
+ * @param {number} timeoutMs
+ * @returns {Promise<*>} the image, or null
+ */
+async function waitForTextureImage(tex, timeoutMs = 8000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const img = tex.image || tex.source?.data;
+    if (textureImageReady(img)) return img;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  return null;
+}
+
+/**
+ * Rasterize a texture image into a PNG data URL, capped at maxSize on the
+ * long edge. flip should be true when the source texture used flipY=false
+ * (its v=0 maps to the image's top row); PNGs reloaded by THREE get
+ * flipY=true, so we must bake the flip into the pixels.
+ * @param {*} img - HTMLImageElement | ImageBitmap | canvas | ImageData
+ * @param {boolean} flip - draw vertically flipped
+ * @param {number} maxSize
+ * @returns {string|null} PNG data URL
+ */
+function imageToPngDataUrl(img, flip, maxSize) {
+  let src = img;
+  if (typeof ImageData !== 'undefined' && img instanceof ImageData) {
+    const c = document.createElement('canvas');
+    c.width = img.width;
+    c.height = img.height;
+    c.getContext('2d').putImageData(img, 0, 0);
+    src = c;
+  }
+  const sw = src.naturalWidth || src.width || 0;
+  const sh = src.naturalHeight || src.height || 0;
+  if (!sw || !sh) return null;
+  const scale = Math.min(1, maxSize / Math.max(sw, sh));
+  const w = Math.max(1, Math.round(sw * scale));
+  const h = Math.max(1, Math.round(sh * scale));
+  const canvas = document.createElement('canvas');
+  canvas.width = w;
+  canvas.height = h;
+  const ctx = canvas.getContext('2d');
+  if (flip) {
+    ctx.translate(0, h);
+    ctx.scale(1, -1);
+  }
+  ctx.drawImage(src, 0, 0, w, h);
+  return canvas.toDataURL('image/png');
+}
+
+/**
+ * Rasterize the UV-space triangle coverage of geometry index ranges into a
+ * white-on-transparent PNG mask (white = covered). Used to restrict a
+ * material's texture layer to the islands that material actually owns on
+ * multi-material meshes. Output is square because UV space is 0..1.
+ * @param {THREE.BufferGeometry} geometry
+ * @param {Array<{start:number,count:number}>} ranges - index-space ranges
+ * @param {number} res
+ * @returns {string|null} PNG data URL
+ */
+function rasterizeUvMask(geometry, ranges, res) {
+  const uv = geometry?.attributes?.uv;
+  if (!uv) return null;
+  const canvas = document.createElement('canvas');
+  canvas.width = res;
+  canvas.height = res;
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = '#fff';
+  ctx.strokeStyle = '#fff';
+  ctx.lineWidth = 1;
+  const index = geometry.index;
+  const vert = (n) => (index ? index.getX(n) : n);
+  for (const r of ranges) {
+    const tris = Math.floor(r.count / 3);
+    for (let t = 0; t < tris; t++) {
+      const i0 = vert(r.start + t * 3);
+      const i1 = vert(r.start + t * 3 + 1);
+      const i2 = vert(r.start + t * 3 + 2);
+      ctx.beginPath();
+      ctx.moveTo(uv.getX(i0) * res, (1 - uv.getY(i0)) * res);
+      ctx.lineTo(uv.getX(i1) * res, (1 - uv.getY(i1)) * res);
+      ctx.lineTo(uv.getX(i2) * res, (1 - uv.getY(i2)) * res);
+      ctx.closePath();
+      ctx.fill();
+      ctx.stroke();
+    }
+  }
+  return canvas.toDataURL('image/png');
+}
+
+/**
+ * Extract the embedded diffuse/base-color textures from a parsed mesh.
+ * Returns one entry per material that has a usable `map` image:
+ *   { name, uvmap, mask }
+ * `uvmap`/`mask` are PNG data URLs; `mask` is null for single-material
+ * meshes (the texture applies to the whole mesh). Meshes without UVs or
+ * without embedded texture images return an empty array.
+ * @param {THREE.Mesh} mesh - a parsed mesh object (result.meshes[i].object)
+ * @param {number} maxSize - max texture dimension (project textureResolution)
+ * @returns {Promise<Array<{name:string, uvmap:string, mask:string|null}>>}
+ */
+export async function extractEmbeddedTextures(mesh, maxSize = 1024) {
+  const results = [];
+  if (!mesh?.isMesh || !mesh.geometry?.attributes?.uv) return results;
+
+  const materials = Array.isArray(mesh.material)
+    ? mesh.material
+    : mesh.material
+      ? [mesh.material]
+      : [];
+  if (!materials.length) return results;
+
+  const geometry = mesh.geometry;
+  const totalCount = geometry.index
+    ? geometry.index.count
+    : geometry.attributes.position?.count || 0;
+  const groups =
+    geometry.groups && geometry.groups.length
+      ? geometry.groups
+      : [{ start: 0, count: totalCount, materialIndex: 0 }];
+
+  // Merge group ranges per material index.
+  const byMaterial = new Map();
+  for (const g of groups) {
+    const mi = materials.length > 1 ? (g.materialIndex ?? 0) : 0;
+    if (!byMaterial.has(mi)) byMaterial.set(mi, []);
+    byMaterial.get(mi).push(g);
+  }
+
+  const multi = materials.length > 1;
+  for (const [mi, ranges] of byMaterial) {
+    const mat = materials[mi] || materials[0];
+    const tex = mat?.map;
+    if (!tex) continue;
+    const img = await waitForTextureImage(tex);
+    if (!img) continue;
+    // THREE textures with flipY=false map v=0 to the image's top row; baked
+    // PNGs reload with flipY=true, so pre-flip the pixels to compensate.
+    const uvmap = imageToPngDataUrl(img, tex.flipY === false, maxSize);
+    if (!uvmap) continue;
+    const mask = multi ? rasterizeUvMask(geometry, ranges, maxSize) : null;
+    results.push({
+      name: mat.name || tex.name || `Texture ${results.length + 1}`,
+      uvmap,
+      mask,
+    });
+  }
+  return results;
+}
+
 /**
  * Format a triangle count for display (e.g. 12,345 → "12.3K").
  * @param {number} count

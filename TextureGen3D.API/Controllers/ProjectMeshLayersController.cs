@@ -303,6 +303,29 @@ namespace TextureGen3D.API.Controllers
             }
         }
 
+        // Per-layer PBR map files — orm.png (roughness R / metallic B) and
+        // emissive.png live inside the layer's folder alongside uvmap.png.
+        [HttpGet("{projectId}/mesh/{meshId}/{layerId}/file/{fileName}")]
+        public async Task<IActionResult> GetLayerFile(Guid projectId, Guid meshId, Guid layerId, string fileName)
+        {
+            // Plain file names only — no path traversal
+            if (fileName.Length == 0 || fileName.Length > 128 ||
+                fileName != Path.GetFileName(fileName) ||
+                !System.Text.RegularExpressions.Regex.IsMatch(fileName, @"^[a-zA-Z0-9_.\-]+$"))
+                return BadRequest();
+
+            try
+            {
+                var data = await _imageService.GetProjectMeshLayerFileAsync(projectId, meshId, layerId, fileName);
+                if (data == null || data.Length == 0) return NotFound();
+                return this.CachedFile(data, "image/png");
+            }
+            catch
+            {
+                return NotFound();
+            }
+        }
+
         public class SaveAngleThumbRequest
         {
             public Guid MeshId { get; set; }

@@ -44,6 +44,9 @@ const ProjectMeshLayers = (args) => Api({ ...args }).endpoints(({ api }) => {
     maskUrl: (projectId, meshId, layerId) => `${apiPath}/${projectId}/mesh/${meshId}/${layerId}/mask`,
     maskThumbUrl: (projectId, meshId, layerId) => `${apiPath}/${projectId}/mesh/${meshId}/${layerId}/mask-thumb`,
     angleThumbUrl: (projectId, meshId, layerId) => `${apiPath}/${projectId}/mesh/${meshId}/${layerId}/angle-thumb`,
+    // Per-layer PBR map files — orm.png (roughness R / metallic B) +
+    // emissive.png, saved via saveFile above.
+    fileUrl: (projectId, meshId, layerId, fileName) => `${apiPath}/${projectId}/mesh/${meshId}/${layerId}/file/${fileName}`,
   };
 });
 

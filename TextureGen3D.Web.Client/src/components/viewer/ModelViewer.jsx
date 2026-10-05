@@ -1,6 +1,10 @@
 import React, { useRef, useEffect, useState, useCallback, forwardRef, useImperativeHandle, memo } from 'react';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
+import { EffectComposer } from 'three/examples/jsm/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPass.js';
+import { ShaderPass } from 'three/examples/jsm/postprocessing/ShaderPass.js';
 import Icon from '@/components/ui/icon';
 import { SCENE_OFFSET_PX } from './viewerUtils';
 import { makeGreyMeshMaterial, LAYER_VERTEX_SHADER, LAYER_COMBINED_FRAGMENT } from './materials';
@@ -108,9 +112,24 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
   });
   const [unlit, setUnlit] = useState(false); // eye toggle on the light gizmo — flat shading
   const unlitRef = useRef(false);
+  // Shared uniform object — every layer material gets this same {value}
+  // entry so one write per frame drives all emissive output.
+  const emisStrengthUniformRef = useRef({ value: 1.0 });
+  // Selective-bloom flag — shared like emisStrength; set to 1 only during
+  // the emissive-only prepass that feeds UnrealBloomPass.
+  const emisOnlyUniformRef = useRef({ value: 0 });
+  // Lazy — created the first frame bloom > 0 so the default render path
+  // stays a plain renderer.render with zero post-processing cost.
+  const bloomComposerRef = useRef(null);
 
   // Inpainting overlay — mesh-wide mask + repeating tile texture
   const inpaintMaskRef = useRef(null);    // { a, b, front, initialized }
+  // Mesh PBR maps — 'orm' (roughness R / metallic B) + 'emissive' (RGB),
+  // mesh-level ping-pong RTs mirroring the per-layer stamp entries.
+  const meshMapRtRef = useRef(new Map());     // `${layerId}|${kind}` → { a, b, front }
+  const meshMapTexRef = useRef(new Map());    // `${layerId}|${kind}` → front texture (live shader bind)
+  const meshMapLoadRef = useRef(new Map());   // `${layerId}|${kind}` → in-flight ensure promise
+  const meshMapCanvasRef = useRef(new Map()); // `${layerId}|${kind}` → readback canvas
   const inpaintTileTexRef = useRef(null);
   const checkerTexRef = useRef(null);
   const inpaintActiveRef = useRef(false);
@@ -146,6 +165,8 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
       shadowUniformsRef,
       unlitRef, inpaintMaskRef, inpaintTileTexRef, checkerTexRef,
       inpaintActiveRef, inpaintVisibleRef, layerGpuRef,
+      emisStrengthUniformRef, emisOnlyUniformRef, bloomComposerRef,
+      meshMapRtRef, meshMapTexRef, meshMapLoadRef, meshMapCanvasRef,
       sceneOffsetXRef, sceneOffsetYRef, lastOrthoZoomRef,
       // Late-bound by the init effect to a rect-cached version; the fallback
       // reads fresh so helpers work before the first frame.
@@ -310,14 +331,31 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
     const white = whiteMaskTexRef.current;
     let material = null;
     let imgData = null;
-    if (meta.canvas) {
-      imgData = meta.canvas.getContext('2d').getImageData(0, 0, meta.canvas.width, meta.canvas.height);
+    if (meta.comp) {
+      // imgData straight from the CPU composite — a canvas readback would
+      // lose the flooded hidden rgb (premultiplied storage zeroes it).
+      imgData = meta.comp.imgData;
       const combined = imageDataToLayerTexture(imgData);
       textures.push(combined);
+      // The aux mesh's own layer stack composited its orm/emissive maps
+      // (each source layer's mask already folded in — alpha is the
+      // has-data flag). No map files → comp fields are null → flags stay
+      // 0 and orm/emis keep the generated defaults (rough 1 / metal 0 /
+      // no emission).
+      const combOrm = meta.comp.ormImgData ? imageDataToLayerTexture(meta.comp.ormImgData) : null;
+      const combEmis = meta.comp.emisImgData ? imageDataToLayerTexture(meta.comp.emisImgData) : null;
+      if (combOrm) textures.push(combOrm);
+      if (combEmis) textures.push(combEmis);
       material = new THREE.ShaderMaterial({
         uniforms: {
           u_combined: { value: combined },
           u_hasCombined: { value: 1 },
+          // Always bound (never left undefined — an unbound sampler2D can
+          // alias texture unit 0) with has-flags gating the actual use.
+          u_combOrm: { value: combOrm || white },
+          u_combEmis: { value: combEmis || white },
+          u_hasCombOrm: { value: combOrm ? 1 : 0 },
+          u_hasCombEmis: { value: combEmis ? 1 : 0 },
           dir1Pos: { value: dir1Pos },
           u_checker: { value: checkerTexRef.current || white },
           u_inpaintMask: { value: white },
@@ -326,6 +364,8 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
           u_hasInpaint: { value: 0 },
           u_unlit: { value: unlitRef.current ? 1 : 0 },
           u_dimBackface: { value: 1 },
+          u_emissiveStrength: emisStrengthUniformRef.current,
+          u_emisOnly: emisOnlyUniformRef.current,
         },
         vertexShader: LAYER_VERTEX_SHADER,
         fragmentShader: LAYER_COMBINED_FRAGMENT,
@@ -349,6 +389,8 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
           cu.u_shadowBias = shadowUniformsRef.current.bias;
           cu.u_shadowRadius = shadowUniformsRef.current.radius;
           cu.u_hasShadow = shadowUniformsRef.current.has;
+          cu.u_emissiveStrength = emisStrengthUniformRef.current;
+          cu.u_emisOnly = emisOnlyUniformRef.current;
         }
         child.castShadow = true;
         child.receiveShadow = true;
@@ -451,11 +493,13 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
     perspCamera.updateProjectionMatrix();
 
     // Orthographic camera (default) — frustum shifted right by initOffsetX
-    // (at zoom=1; the animation loop re-applies with /zoom when zoom changes)
+    // (at zoom=1; the animation loop re-applies with /zoom when zoom changes).
+    // Negative near: nothing in front of the camera ever clips, no matter
+    // how far in the user zooms.
     const camera = new THREE.OrthographicCamera(
       -orthoSize * aspect - initOffsetX, orthoSize * aspect - initOffsetX,
       orthoSize, -orthoSize,
-      0.001, 10000
+      -10000, 10000
     );
     camera.position.set(0, 0, 8);
     camera.lookAt(0, 0, 0);
@@ -613,6 +657,21 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
       }
       controlsRef.current?.update();
 
+      // No fixed near-plane clipping — the perspective camera's near plane
+      // tracks the camera's distance to the orbit target (0.1% of it), so
+      // it shrinks to nothing as the user zooms in while keeping enough
+      // depth precision to avoid z-fighting. Ortho's near is already -inf.
+      const pc = perspCameraRef.current;
+      const ctrlsCam = controlsRef.current;
+      if (pc && ctrlsCam && cameraRef.current === pc) {
+        const dist = Math.max(1e-4, pc.position.distanceTo(ctrlsCam.target));
+        const near = Math.max(1e-6, dist * 1e-3);
+        if (Math.abs(pc.near - near) / near > 0.001) {
+          pc.near = near;
+          pc.updateProjectionMatrix();
+        }
+      }
+
       // Gizmo axis sync + lightbulb position (skipped when nothing moved)
       gizmos.syncFrame();
 
@@ -637,12 +696,97 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
         su.has.value = 1;
       }
 
+      // Emissive strength — the slider lives in the paint config so a
+      // change lands here without rebuilding any materials. The shared
+      // uniform object fans it out to every layer/aux shader at once.
+      const cfgNow = maskPaintCfgRef.current?.current;
+      const esMul = (typeof cfgNow?.emissiveStrength === 'number' ? cfgNow.emissiveStrength : 50) / 50;
+      emisStrengthUniformRef.current.value = esMul;
+
       // Clear and render main scene full screen
       renderer.setScissorTest(false);
       renderer.setViewport(0, 0, w, h);
       renderer.setScissor(0, 0, w, h);
       renderer.clear();
-      renderer.render(scene, cameraRef.current);
+      const bloomVal = typeof cfgNow?.bloom === 'number' ? cfgNow.bloom : 0;
+      if (bloomVal > 0) {
+        // Selective bloom — emissive only. The bloom composer renders the
+        // scene with u_emisOnly=1 (every layer shader emits just
+        // emis×strength; non-shader materials like the grid and grey
+        // fallbacks are hidden outright), so the luminance chain sees
+        // emission and nothing else. The final composer then renders the
+        // scene normally and adds the blurred bloom texture on top.
+        if (!bloomComposerRef.current) {
+          const bloomComposer = new EffectComposer(renderer);
+          bloomComposer.renderToScreen = false;
+          bloomComposer.setPixelRatio(renderer.getPixelRatio());
+          const bloomRenderPass = new RenderPass(scene, cameraRef.current);
+          const bloomPass = new UnrealBloomPass(new THREE.Vector2(w, h), 0, 0.5, 0.35);
+          bloomComposer.addPass(bloomRenderPass);
+          bloomComposer.addPass(bloomPass);
+
+          const finalComposer = new EffectComposer(renderer);
+          finalComposer.setPixelRatio(renderer.getPixelRatio());
+          const finalRenderPass = new RenderPass(scene, cameraRef.current);
+          // NO OutputPass — it would apply ACES + sRGB transfer to the
+          // whole frame, which the layer shaders already emit
+          // display-ready (the plain renderer.render path never
+          // post-processes them). mixPass is last → renders raw
+          // base+bloom to screen, byte-identical to bloom=0 when the
+          // bloom texture is black. Alpha stays base's — the bloom
+          // prepass writes a≈1 everywhere it blurs, which would make the
+          // transparent canvas opaque and hide the CSS gradient behind it.
+          const mixPass = new ShaderPass(
+            new THREE.ShaderMaterial({
+              uniforms: {
+                baseTexture: { value: null },
+                bloomTexture: { value: bloomComposer.renderTarget2.texture },
+              },
+              vertexShader: `
+                varying vec2 vUv;
+                void main() { vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }
+              `,
+              fragmentShader: `
+                uniform sampler2D baseTexture;
+                uniform sampler2D bloomTexture;
+                varying vec2 vUv;
+                void main() {
+                  vec4 base = texture2D(baseTexture, vUv);
+                  gl_FragColor = vec4(base.rgb + texture2D(bloomTexture, vUv).rgb, base.a);
+                }
+              `,
+            }),
+            'baseTexture'
+          );
+          finalComposer.addPass(finalRenderPass);
+          finalComposer.addPass(mixPass);
+          bloomComposerRef.current = { bloomComposer, bloomRenderPass, bloomPass, finalComposer, finalRenderPass };
+        }
+        const bc = bloomComposerRef.current;
+        bc.bloomRenderPass.camera = cameraRef.current; // track persp/ortho swaps
+        bc.finalRenderPass.camera = cameraRef.current;
+        const b = bloomVal / 100;
+        bc.bloomPass.strength = b * 3.0;
+        bc.bloomPass.radius = 0.25 + b * 0.65;
+
+        emisOnlyUniformRef.current.value = 1;
+        const bloomHidden = [];
+        scene.traverse((o) => {
+          if (!o.visible || !o.material) return;
+          const mats = Array.isArray(o.material) ? o.material : [o.material];
+          // Only layer ShaderMaterials answer u_emisOnly — hide everything
+          // else (grid lines, grey fallbacks) for the prepass.
+          if (mats.some((m) => m.uniforms && m.uniforms.u_emisOnly)) return;
+          o.visible = false;
+          bloomHidden.push(o);
+        });
+        bc.bloomComposer.render();
+        emisOnlyUniformRef.current.value = 0;
+        for (const o of bloomHidden) o.visible = true;
+        bc.finalComposer.render();
+      } else {
+        renderer.render(scene, cameraRef.current);
+      }
 
       // Overlay gizmos (nav top-right, lighting to its left)
       gizmos.renderOverlays(w, h);
@@ -675,6 +819,8 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
       orthoCameraRef.current.updateProjectionMatrix();
       lastOrthoZoomRef.current = z;
       renderer.setSize(w, h);
+      bloomComposerRef.current?.bloomComposer.setSize(w, h);
+      bloomComposerRef.current?.finalComposer.setSize(w, h);
       // Refresh the cached rect/dims read by pointer handlers and animate()
       syncCanvasMetrics();
     };
@@ -1257,6 +1403,12 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
       return composer.compositeLayersToCanvas(items);
     },
 
+    // Full composite result — { canvas, imgData, ormImgData, emisImgData }.
+    // Aux meshes need the PBR maps too, not just the baked albedo canvas.
+    compositeLayers(items) {
+      return composer.compositeLayerImages(items);
+    },
+
     updateLayerTextures(entries, opts = {}) {
       composer.updateLayerTextures(entries, opts);
     },
@@ -1282,6 +1434,42 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
 
     invalidateStampCanvas(layerId) {
       paint.invalidateStampCanvas(layerId);
+    },
+
+    previewLayerFill(layerId, hex, alpha) {
+      return paint.previewLayerFill(layerId, hex, alpha);
+    },
+
+    cancelLayerFill(layerId) {
+      paint.cancelLayerFill(layerId);
+    },
+
+    commitLayerFill(layerId) {
+      paint.commitLayerFill(layerId);
+    },
+
+    ensureLayerMapEntry(layerId, kind) {
+      return paint.ensureLayerMapEntry(layerId, kind);
+    },
+
+    bindLayerMapTexture(layerId, kind, tex) {
+      paint.bindLayerMapTexture(layerId, kind, tex);
+    },
+
+    getLayerMapDataUrl(layerId, kind) {
+      return paint.getLayerMapDataUrl(layerId, kind);
+    },
+
+    previewLayerMapFill(layerId, map, r, g, b, a) {
+      return paint.previewLayerMapFill(layerId, map, r, g, b, a);
+    },
+
+    cancelLayerMapFill(layerId, map) {
+      paint.cancelLayerMapFill(layerId, map);
+    },
+
+    commitLayerMapFill(layerId, map) {
+      return paint.commitLayerMapFill(layerId, map);
     },
 
     bindLayerMask(layerId, texture) {
@@ -1368,6 +1556,10 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
       });
       currentMeshRef.current = null;
     }
+
+    // Per-layer PBR maps (orm/emissive) belong to the outgoing mesh's
+    // layer files — drop the RTs so the next mesh re-seeds from its own.
+    paint.resetLayerMaps();
 
     // The inpaint mask is UV data tied to the previous mesh — drop it, then
     // recreate a cleared entry if the tool is still active on the new mesh
@@ -1500,6 +1692,7 @@ const ModelViewer = forwardRef(function ModelViewer({ selectedMesh, onMeshLoaded
         for (const u of layerGpuRef.current.blobUrls) URL.revokeObjectURL(u);
         layerGpuRef.current = { textures: [], blobUrls: [] };
         paint.disposeInpaintEntry();
+        paint.resetLayerMaps();
         for (const entry of stampRtRef.current.values()) {
           entry.a.dispose();
           entry.b.dispose();

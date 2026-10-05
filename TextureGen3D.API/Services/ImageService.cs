@@ -36,6 +36,8 @@ namespace TextureGen3D.API.Services
         Task SaveProjectMeshLayerImageAsync(Guid projectId, Guid meshId, Guid layerId, byte[] fileData);
         Task SaveProjectMeshLayerFileAsync(Guid projectId, Guid meshId, Guid layerId, string fileName, byte[] fileData);
         Task<byte[]> GetProjectMeshLayerFileAsync(Guid projectId, Guid meshId, Guid layerId, string fileName);
+        Task SaveProjectMeshFileAsync(Guid projectId, Guid meshId, string fileName, byte[] fileData);
+        Task<byte[]> GetProjectMeshFileAsync(Guid projectId, Guid meshId, string fileName);
         Task DeleteProjectMeshLayerFileAsync(Guid projectId, Guid meshId, Guid layerId, string fileName);
         Task<byte[]> GetProjectMeshLayerImageAsync(Guid projectId, Guid meshId, Guid layerId);
         Task DeleteProjectMeshLayerImageAsync(Guid projectId, Guid meshId, Guid layerId);
@@ -389,6 +391,22 @@ namespace TextureGen3D.API.Services
         public async Task<byte[]> GetProjectMeshLayerFileAsync(Guid projectId, Guid meshId, Guid layerId, string fileName)
         {
             var relativePath = Path.Combine("projects", projectId.ToString(), "meshes", meshId.ToString(), layerId.ToString(), fileName);
+            if (_activeStorage == "azure") return await GetFromAzureBlobAsync(relativePath);
+            return await GetFromFileSystemAsync(relativePath);
+        }
+
+        // Generic mesh-folder file write — sits beside the per-layer folders
+        // (e.g. orm.png / emissive.png shared by the whole mesh).
+        public async Task SaveProjectMeshFileAsync(Guid projectId, Guid meshId, string fileName, byte[] fileData)
+        {
+            var relativePath = Path.Combine("projects", projectId.ToString(), "meshes", meshId.ToString(), fileName);
+            if (_activeStorage == "azure") { await SaveToAzureBlobAsync(relativePath, fileData); return; }
+            await SaveToFileSystemAsync(relativePath, fileData);
+        }
+
+        public async Task<byte[]> GetProjectMeshFileAsync(Guid projectId, Guid meshId, string fileName)
+        {
+            var relativePath = Path.Combine("projects", projectId.ToString(), "meshes", meshId.ToString(), fileName);
             if (_activeStorage == "azure") return await GetFromAzureBlobAsync(relativePath);
             return await GetFromFileSystemAsync(relativePath);
         }

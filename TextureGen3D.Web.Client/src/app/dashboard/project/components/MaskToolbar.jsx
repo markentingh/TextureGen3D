@@ -48,6 +48,7 @@ export default function MaskToolbar() {
     setStampInvertY,
     meshLayers,
     selectedLayerIds,
+    id,
   } = useProject();
 
   // The stamp tool can only draw onto plain layers — generated/inpainted
@@ -348,6 +349,7 @@ export default function MaskToolbar() {
           onChange={(c) => setPickerColor(c.hex)}
           onOk={(c) => setBrushColor(c.hex)}
           onClose={() => setShowColorPicker(false)}
+          projectId={id}
         />
       )}
     </div>

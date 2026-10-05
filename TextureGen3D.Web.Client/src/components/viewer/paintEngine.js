@@ -19,6 +19,7 @@ export function createPaintEngine(ctx) {
     stampCanvasRef, stampRtRef, stampTexRef, stampLoadRef,
     paintRttRef, shaderLayerIdsRef,
     inpaintMaskRef, inpaintTileTexRef, inpaintActiveRef, inpaintVisibleRef,
+    meshMapRtRef, meshMapTexRef, meshMapLoadRef, meshMapCanvasRef,
   } = ctx;
 
   // Pre-allocated temps shared by the raycast/brush helpers
@@ -239,6 +240,197 @@ export function createPaintEngine(ctx) {
     return p;
   };
 
+  // ── Per-layer PBR maps — orm.png (roughness R / metallic B) + emissive.png
+  // One ping-pong entry per (layerId, kind) — keyed `${layerId}|${kind}` —
+  // mirroring the per-layer stamp entries. The carousel picks a paint
+  // target per layer; targets resolve to the layer's two map files.
+  // Map ALPHA is the has-data flag: files seed fully transparent (so a
+  // layer with no painted map contributes nothing — lower layers' maps
+  // show through), and every channel mask includes .w so strokes mark
+  // coverage where they land. The layer's own mask still gates the map
+  // in the compositor shader on top of that.
+  const FULL_CHANNEL_MASK = new THREE.Vector4(1, 1, 1, 1);
+  const CHANNEL_MASKS = {
+    rough: new THREE.Vector4(1, 0, 0, 1),
+    metal: new THREE.Vector4(0, 0, 1, 1),
+    emissive: new THREE.Vector4(1, 1, 1, 1),
+  };
+  const MAP_KINDS = { rough: 'orm', metal: 'orm', emissive: 'emissive' };
+  // Generated default rgb — written under every texel (visible or not) so
+  // channel-masked strokes always see sane values in unwritten channels:
+  // orm.png: rgb(255,0,0) = fully rough, non-metal; emissive.png: black.
+  const MAP_DEFAULTS = {
+    orm: new THREE.Color(1, 0, 0),
+    emissive: new THREE.Color(0, 0, 0),
+  };
+  const layerMapKey = (layerId, kind) => `${layerId}|${kind}`;
+  const ormUniform = (slot) => `orm${slot}`;
+  const emisUniform = (slot) => `emis${slot}`;
+
+  // Push a layer map's texture into its live shader slot (orm{s}/emis{s}).
+  // Slots with no entry keep the default 1x1 textures the compositor
+  // seeds — a layer without a map contributes defaults at its coverage.
+  // Non-live layers (baked ops) have no slot; their maps reach the shader
+  // through the bake's u_bakeOrm{s}/u_bakeEmis{s} textures instead.
+  const mapBindWarned = new Set();
+  const bindLayerMapTexture = (layerId, kind, tex) => {
+    const slot = shaderLayerIdsRef.current.indexOf(layerId);
+    if (slot < 0) {
+      // Layer isn't a live slot right now (combined/baked shader) — the
+      // data is still in the RT and reaches the next build via
+      // meshMapTexRef. Warn once per layer+kind so we can see it.
+      const k = `noslot:${layerId}|${kind}`;
+      if (!mapBindWarned.has(k)) {
+        mapBindWarned.add(k);
+        console.warn(`[paint] map bind skipped — layer ${layerId} ${kind} has no live slot (shaderLayerIds:`, shaderLayerIdsRef.current, ')');
+      }
+      return;
+    }
+    const name = kind === 'orm' ? ormUniform(slot) : emisUniform(slot);
+    let bound = false;
+    currentMeshRef.current?.traverse((child) => {
+      if (!child.isMesh || !child.material) return;
+      const mats = Array.isArray(child.material) ? child.material : [child.material];
+      for (const m of mats) {
+        const u = m.uniforms;
+        if (u && u[name]) { u[name].value = tex; bound = true; }
+      }
+    });
+    if (!bound) {
+      const k = `nouniform:${layerId}|${kind}`;
+      if (!mapBindWarned.has(k)) {
+        mapBindWarned.add(k);
+        console.warn(`[paint] map bind skipped — no ${name} uniform on mesh materials (slot ${slot})`);
+      }
+    }
+  };
+
+  const ensureLayerMapEntry = (layerId, kind, cfg) => {
+    cfg = cfg || maskPaintCfgRef.current?.current;
+    const key = layerMapKey(layerId, kind);
+    const existing = meshMapRtRef.current.get(key);
+    if (existing) return Promise.resolve(existing);
+    let p = meshMapLoadRef.current.get(key);
+    if (p) return p;
+    p = (async () => {
+      const renderer = rendererRef.current;
+      const res = cfg?.textureResolution || 1024;
+      const mk = () => new THREE.WebGLRenderTarget(res, res, {
+        format: THREE.RGBAFormat,
+        type: THREE.UnsignedByteType,
+        depthBuffer: false,
+      });
+      const entry = { a: mk(), b: mk() };
+      entry.front = entry.a;
+      meshMapRtRef.current.set(key, entry);
+
+      const prevColor = renderer.getClearColor(new THREE.Color());
+      const prevAlpha = renderer.getClearAlpha();
+      try {
+        const url = await cfg?.loadLayerMap?.(layerId, kind);
+        let tex = null;
+        if (url) {
+          try {
+            const img = await loadImgEl(url);
+            tex = new THREE.Texture(img);
+            tex.flipY = true;
+            tex.needsUpdate = true;
+          } catch { /* seed default */ }
+        }
+        const rtt = getPaintRtt();
+        if (tex) {
+          // Normalize while blitting (mode 8): the saved PNG has no rgb
+          // under alpha=0, so restore the generated default rgb there —
+          // a later channel-masked stroke must find rough=1/metal=0, not
+          // premultiplied black.
+          hideAllRtt(rtt);
+          rtt.strokeCompQuad.visible = true;
+          const su = rtt.strokeCompMat.uniforms;
+          su.u_baseTexture.value = tex;
+          su.u_mode.value = 8;
+          su.u_paintColor.value.copy(MAP_DEFAULTS[kind]);
+          su.u_channelMask.value.copy(FULL_CHANNEL_MASK);
+          for (const rt of [entry.a, entry.b]) {
+            renderer.setRenderTarget(rt);
+            renderer.render(rtt.scene, rtt.cam);
+          }
+          rtt.strokeCompQuad.visible = false;
+          su.u_mode.value = 0;
+          tex.dispose();
+        } else {
+          // Generated file — fully transparent (alpha = has-data), with
+          // the default rgb underneath so channel writes start sane:
+          // orm: rgba(255,0,0,0); emissive: rgba(0,0,0,0).
+          renderer.setClearColor(MAP_DEFAULTS[kind], 0);
+          for (const rt of [entry.a, entry.b]) {
+            renderer.setRenderTarget(rt);
+            renderer.clear(true, true, false);
+          }
+        }
+      } finally {
+        renderer.setRenderTarget(null);
+        renderer.setClearColor(prevColor, prevAlpha);
+      }
+      meshMapTexRef.current.set(key, entry.front.texture);
+      bindLayerMapTexture(layerId, kind, entry.front.texture);
+      return entry;
+    })();
+    // A rejected init must not sit in the cache forever — every later dab
+    // awaiting it would silently no-op. Log + evict so the next dab retries.
+    p.catch((err) => {
+      console.error('Layer map init failed:', layerId, kind, err);
+      meshMapLoadRef.current.delete(key);
+    });
+    meshMapLoadRef.current.set(key, p);
+    return p;
+  };
+
+  // Layer-stack or mesh switch — the entries belong to the previous
+  // selection's layers. Capture unsaved edits into the context stash
+  // first so the debounced save can still upload them after the RTs are
+  // gone.
+  const resetLayerMaps = () => {
+    const cfg = maskPaintCfgRef.current?.current;
+    for (const key of meshMapRtRef.current.keys()) {
+      const [layerId, kind] = key.split('|');
+      if (cfg?.isLayerMapModified?.(layerId, kind)) {
+        const dataUrl = getLayerMapDataUrl(layerId, kind);
+        if (dataUrl) cfg?.stashLayerMap?.(layerId, kind, dataUrl);
+      }
+    }
+    for (const entry of meshMapRtRef.current.values()) {
+      entry.a.dispose();
+      entry.b.dispose();
+    }
+    meshMapRtRef.current.clear();
+    meshMapTexRef.current.clear();
+    meshMapLoadRef.current.clear();
+    meshMapCanvasRef.current.clear();
+  };
+
+  const getLayerMapDataUrl = (layerId, kind) => {
+    const key = layerMapKey(layerId, kind);
+    const entry = meshMapRtRef.current.get(key);
+    const renderer = rendererRef.current;
+    if (!entry || !renderer) return null;
+    const res = entry.front.width;
+    const buf = new Uint8Array(res * res * 4);
+    renderer.readRenderTargetPixels(entry.front, 0, 0, res, res, buf);
+    let canvas = meshMapCanvasRef.current.get(key);
+    if (!canvas || canvas.width !== res) {
+      canvas = document.createElement('canvas');
+      canvas.width = canvas.height = res;
+      meshMapCanvasRef.current.set(key, canvas);
+    }
+    const c2 = canvas.getContext('2d');
+    const img = c2.createImageData(res, res);
+    for (let y = 0; y < res; y++) {
+      img.data.set(buf.subarray((res - 1 - y) * res * 4, (res - y) * res * 4), y * res * 4);
+    }
+    c2.putImageData(img, 0, 0);
+    return canvas.toDataURL('image/png');
+  };
+
   // Mesh-wide inpaint mask — same ping-pong pair as layer masks, but cleared
   // to black (0 = not marked) and never persisted.
   const getInpaintEntry = () => {
@@ -431,6 +623,7 @@ export function createPaintEngine(ctx) {
     rtt.alphaFillQuad.visible = false;
     rtt.blurQuad.visible = false;
     rtt.strokeCompQuad.visible = false;
+    rtt.fillCompQuad.visible = false;
   };
 
   // Parse cfg.color into raw sRGB components — Color.set() would convert to
@@ -535,6 +728,7 @@ export function createPaintEngine(ctx) {
     cu.u_stroke.value = strokeRts.front.texture;
     cu.u_mode.value = mode;
     cu.u_opacity.value = opacity;
+    cu.u_channelMask.value.copy(opts.channelMask || FULL_CHANNEL_MASK);
     if (opts.color) cu.u_paintColor.value.copy(opts.color);
     cu.u_blurTexture.value = opts.blurTex || null;
     hideAllRtt(rtt);
@@ -598,6 +792,10 @@ export function createPaintEngine(ctx) {
       const opacity = Math.min(1, Math.max(0.01, (cfg.opacity ?? 100) / 100));
       const strength = Math.min(1, Math.max(0.01, (cfg.blurStrength ?? 50) / 100));
       const paintColor = parseBrushColor();
+      // Same luminance conversion as the per-dab path — the commit must
+      // write what the preview showed.
+      const lum = 0.2126 * paintColor.r + 0.7152 * paintColor.g + 0.0722 * paintColor.b;
+      const channelColor = new THREE.Color(lum, lum, lum);
       for (const layerId of s.layerIds) {
         if (s.tool === 'mask' || s.tool === 'inpaint') {
           const isInpaint = s.tool === 'inpaint';
@@ -612,6 +810,35 @@ export function createPaintEngine(ctx) {
           if (isInpaint) bindInpaintTexture(tex);
           else { syncMaskUniform(layerId, tex); cfg.markMaskModified?.(layerId); }
         } else {
+          // Layer-map target — commit into that layer's orm/emissive
+          // entry, channel-masked so the stroke only writes its map's
+          // channels.
+          const target = cfg.getPaintMap?.(layerId) || 'base';
+          if (target !== 'base') {
+            const kind = MAP_KINDS[target];
+            const key = layerMapKey(layerId, kind);
+            const channelMask = CHANNEL_MASKS[target] || FULL_CHANNEL_MASK;
+            pending.push(ensureLayerMapEntry(layerId, kind, cfg).then((entry) => {
+              if (!entry) return;
+              ensureMaskCoverage(rtt);
+              let blurTex = null;
+              // Mode 7 (map erase) resets rgb to the file defaults and
+              // clears alpha — the texel carries no map data again.
+              const mode = s.tool === 'eraser' ? 7 : s.tool === 'stamp' ? 4 : s.tool === 'blur' ? 5 : 0;
+              if (s.tool === 'blur') blurTex = blurLayerIntoScratch(entry, s.blurTexels);
+              compositeStroke(entry, mode, s.tool === 'blur' ? strength : opacity, {
+                color: s.tool === 'eraser' ? MAP_DEFAULTS[kind] : (target === 'emissive' ? paintColor : channelColor),
+                blurTex,
+                channelMask: s.tool === 'eraser' ? FULL_CHANNEL_MASK : channelMask,
+              });
+              bleedBackToFront(rtt, entry);
+              alphaFillFront(rtt, entry);
+              meshMapTexRef.current.set(key, entry.front.texture);
+              bindLayerMapTexture(layerId, kind, entry.front.texture);
+              cfg.markLayerMapModified?.(layerId, kind);
+            }));
+            continue;
+          }
           // Stamp entries initialize asynchronously — commit inside the
           // promise so a stroke ending before first-init still lands.
           pending.push(ensureStampEntry(layerId, cfg).then((entry) => {
@@ -699,6 +926,20 @@ export function createPaintEngine(ctx) {
     const opacity = Math.min(1, Math.max(0.01, (cfg.opacity ?? 100) / 100));
     const rtt = getPaintRtt();
     for (const layerId of layerIds) {
+      // Layer-map target — sample into the channel instead of the uvmap.
+      const target = cfg.getPaintMap?.(layerId) || 'base';
+      if (target !== 'base') {
+        const kind = MAP_KINDS[target];
+        const channelMask = CHANNEL_MASKS[target] || FULL_CHANNEL_MASK;
+        ensureLayerMapEntry(layerId, kind, cfg).then((entry) => {
+          if (!entry || !stroke || stroke.tool !== 'stamp') return;
+          const tex = compositeStroke(entry, 4, opacity, { channelMask });
+          meshMapTexRef.current.set(layerMapKey(layerId, kind), tex);
+          bindLayerMapTexture(layerId, kind, tex);
+          cfg.markLayerMapModified?.(layerId, kind);
+        });
+        continue;
+      }
       ensureStampEntry(layerId, cfg).then((entry) => {
         if (!entry || !stroke || stroke.tool !== 'stamp') return;
         const tex = compositeStroke(entry, 4, opacity);
@@ -732,8 +973,35 @@ export function createPaintEngine(ctx) {
     strokeDab(hit, false);
     const opacity = Math.min(1, Math.max(0.01, (cfg.opacity ?? 100) / 100));
     const paintColor = parseBrushColor();
+    // Single-channel mesh maps (rough/metal) take the brush color's
+    // luminance — same 709 weights as the fill path. Writing the raw
+    // channel (e.g. R of a red brush → orm.R) leaves the value at ~1
+    // so the stroke is invisible.
+    const lum = 0.2126 * paintColor.r + 0.7152 * paintColor.g + 0.0722 * paintColor.b;
+    const channelColor = new THREE.Color(lum, lum, lum);
 
     for (const layerId of layerIds) {
+      // Layer-map target — brush writes the picked color into the
+      // channel (mask includes alpha so the stroke marks coverage);
+      // eraser (mode 7) resets rgb to the file defaults and clears
+      // alpha so the texel carries no map data again.
+      const target = cfg.getPaintMap?.(layerId) || 'base';
+      if (target !== 'base') {
+        const kind = MAP_KINDS[target];
+        const channelMask = erase ? FULL_CHANNEL_MASK : (CHANNEL_MASKS[target] || FULL_CHANNEL_MASK);
+        const strokeColor = erase ? MAP_DEFAULTS[kind] : (target === 'emissive' ? paintColor : channelColor);
+        ensureLayerMapEntry(layerId, kind, cfg).then((entry) => {
+          if (!entry || !stroke || (stroke.tool !== 'brush' && stroke.tool !== 'eraser')) return;
+          const tex = compositeStroke(entry, erase ? 7 : 0, opacity, {
+            color: strokeColor,
+            channelMask,
+          });
+          meshMapTexRef.current.set(layerMapKey(layerId, kind), tex);
+          bindLayerMapTexture(layerId, kind, tex);
+          cfg.markLayerMapModified?.(layerId, kind);
+        });
+        continue;
+      }
       ensureStampEntry(layerId, cfg).then((entry) => {
         if (!entry || !stroke || (stroke.tool !== 'brush' && stroke.tool !== 'eraser')) return;
         const tex = compositeStroke(entry, erase ? 1 : 0, opacity, { color: paintColor });
@@ -827,6 +1095,22 @@ export function createPaintEngine(ctx) {
       uvPerWorld > 0 ? R * uvPerWorld * res * 0.4 : res * 0.015));
 
     for (const layerId of layerIds) {
+      // Layer-map target — blur the channel the same way, masked so
+      // roughness blurs never smear the metallic channel (or vice versa).
+      const target = cfg.getPaintMap?.(layerId) || 'base';
+      if (target !== 'base') {
+        const kind = MAP_KINDS[target];
+        const channelMask = CHANNEL_MASKS[target] || FULL_CHANNEL_MASK;
+        ensureLayerMapEntry(layerId, kind, cfg).then((entry) => {
+          if (!entry || !stroke || stroke.tool !== 'blur') return;
+          const blurTex = blurLayerIntoScratch(entry, stroke.blurTexels);
+          const tex = compositeStroke(entry, 5, strength, { blurTex, channelMask });
+          meshMapTexRef.current.set(layerMapKey(layerId, kind), tex);
+          bindLayerMapTexture(layerId, kind, tex);
+          cfg.markLayerMapModified?.(layerId, kind);
+        });
+        continue;
+      }
       ensureStampEntry(layerId, cfg).then((entry) => {
         if (!entry || !stroke || stroke.tool !== 'blur') return;
         const blurTex = blurLayerIntoScratch(entry, stroke.blurTexels);
@@ -1060,6 +1344,123 @@ export function createPaintEngine(ctx) {
     });
   };
 
+  // Fill Layer — fills the layer's back buffer with a solid color and binds
+  // it for live preview. front is left untouched until commit, so canceling
+  // is just a rebind of the committed texture. fillSession makes the latest
+  // preview win and lets cancel/commit drop previews still awaiting
+  // ensureStampEntry.
+  let fillSession = 0;
+  const previewLayerFill = async (layerId, hex, alpha = 1) => {
+    const cfg = maskPaintCfgRef.current?.current;
+    const session = ++fillSession;
+    const entry = await ensureStampEntry(layerId, cfg);
+    const renderer = rendererRef.current;
+    if (session !== fillSession || !entry || !renderer) return;
+    const back = entry.front === entry.a ? entry.b : entry.a;
+    const pc = renderer.getClearColor(new THREE.Color());
+    const pa = renderer.getClearAlpha();
+    // Raw byte values — new THREE.Color('#..') would convert sRGB→linear and
+    // push dark fills under the layer shader's black=transparent threshold
+    // (and darken every fill ~2.2x vs. the raw sRGB bytes textures store).
+    const fillColor = new THREE.Color(
+      parseInt(hex.slice(1, 3), 16) / 255,
+      parseInt(hex.slice(3, 5), 16) / 255,
+      parseInt(hex.slice(5, 7), 16) / 255
+    );
+    renderer.setRenderTarget(back);
+    renderer.setClearColor(fillColor, alpha);
+    renderer.clear(true, true, false);
+    renderer.setRenderTarget(null);
+    renderer.setClearColor(pc, pa);
+    bindLayerTexture(layerId, back.texture);
+  };
+
+  // Cancel the fill preview — rebind the committed front texture.
+  const cancelLayerFill = (layerId) => {
+    fillSession++;
+    const entry = stampRtRef.current.get(layerId);
+    if (entry) bindLayerTexture(layerId, entry.front.texture);
+  };
+
+  // Bake the previewed fill (already in back) into front permanently.
+  const commitLayerFill = (layerId) => {
+    fillSession++;
+    const entry = stampRtRef.current.get(layerId);
+    const renderer = rendererRef.current;
+    if (!entry || !renderer) return;
+    const back = entry.front === entry.a ? entry.b : entry.a;
+    const rtt = getPaintRtt();
+    rtt.paintGroup.visible = false;
+    rtt.blitQuad.visible = false;
+    rtt.copyQuad.visible = true;
+    rtt.copyMat.uniforms.u_tex.value = back.texture;
+    renderer.setRenderTarget(entry.front);
+    renderer.render(rtt.scene, rtt.cam);
+    renderer.setRenderTarget(null);
+    rtt.copyQuad.visible = false;
+    bindLayerTexture(layerId, entry.front.texture);
+  };
+
+  // Layer-map fill (Fill Roughness / Fill Metallic / Fill Emissive) —
+  // same preview/commit/cancel pattern as previewLayerFill, but rendered
+  // through fillCompMat so only the map's channels are written. `map` is
+  // the carousel selection: 'rough' | 'metal' | 'emissive'.
+  let mapFillSession = 0;
+  const previewLayerMapFill = async (layerId, map, r, g, b, a = 1) => {
+    const cfg = maskPaintCfgRef.current?.current;
+    const session = ++mapFillSession;
+    const kind = MAP_KINDS[map];
+    if (!kind) return;
+    const entry = await ensureLayerMapEntry(layerId, kind, cfg);
+    const renderer = rendererRef.current;
+    if (session !== mapFillSession || !entry || !renderer) return;
+    const back = entry.front === entry.a ? entry.b : entry.a;
+    const rtt = getPaintRtt();
+    hideAllRtt(rtt);
+    const fu = rtt.fillCompMat.uniforms;
+    fu.u_baseTexture.value = entry.front.texture;
+    fu.u_fill.value.set(r, g, b, a);
+    fu.u_channelMask.value.copy(CHANNEL_MASKS[map] || FULL_CHANNEL_MASK);
+    rtt.fillCompQuad.visible = true;
+    renderer.setRenderTarget(back);
+    renderer.render(rtt.scene, rtt.cam);
+    renderer.setRenderTarget(null);
+    rtt.fillCompQuad.visible = false;
+    meshMapTexRef.current.set(layerMapKey(layerId, kind), back.texture);
+    bindLayerMapTexture(layerId, kind, back.texture);
+  };
+
+  const cancelLayerMapFill = (layerId, map) => {
+    mapFillSession++;
+    const kind = MAP_KINDS[map];
+    const entry = kind && meshMapRtRef.current.get(layerMapKey(layerId, kind));
+    if (!entry) return;
+    meshMapTexRef.current.set(layerMapKey(layerId, kind), entry.front.texture);
+    bindLayerMapTexture(layerId, kind, entry.front.texture);
+  };
+
+  // Bake the previewed channel fill into front permanently. Returns the
+  // layer-map kind ('orm' | 'emissive') so the caller can persist it.
+  const commitLayerMapFill = (layerId, map) => {
+    mapFillSession++;
+    const kind = MAP_KINDS[map];
+    const entry = kind && meshMapRtRef.current.get(layerMapKey(layerId, kind));
+    const renderer = rendererRef.current;
+    if (!entry || !renderer) return null;
+    const back = entry.front === entry.a ? entry.b : entry.a;
+    const rtt = getPaintRtt();
+    hideAllRtt(rtt);
+    rtt.copyQuad.visible = true;
+    rtt.copyMat.uniforms.u_tex.value = back.texture;
+    renderer.setRenderTarget(entry.front);
+    renderer.render(rtt.scene, rtt.cam);
+    renderer.setRenderTarget(null);
+    rtt.copyQuad.visible = false;
+    meshMapTexRef.current.set(layerMapKey(layerId, kind), entry.front.texture);
+    bindLayerMapTexture(layerId, kind, entry.front.texture);
+    return kind;
+  };
+
   return {
     getPaintRtt,
     clearMaskTarget,
@@ -1085,6 +1486,16 @@ export function createPaintEngine(ctx) {
     paintColorAtHit,
     endStroke,
     getStampCanvasDataUrl,
+    previewLayerFill,
+    cancelLayerFill,
+    commitLayerFill,
+    ensureLayerMapEntry,
+    resetLayerMaps,
+    bindLayerMapTexture,
+    getLayerMapDataUrl,
+    previewLayerMapFill,
+    cancelLayerMapFill,
+    commitLayerMapFill,
     invalidateStampCanvas,
     uploadMaskImage,
     maskToDataURL,
